@@ -1,2 +1,5 @@
 .venv/
-external/Grounded-SAM-2/
+external/
+test_videos/
+Groundsam_outputs/
+frameim_outputs/
