@@ -1,0 +1,3 @@
+[submodule "external/Grounded-SAM-2"]
+	path = external/Grounded-SAM-2
+	url = https://github.com/IDEA-Research/Grounded-SAM-2.git
