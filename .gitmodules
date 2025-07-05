@@ -1,3 +1,6 @@
-[submodule "external/Grounded-SAM-2"]
-	path = external/Grounded-SAM-2
+[submodule "LightGlue"]
+	path = LightGlue
+	url = https://github.com/cvg/LightGlue.git
+[submodule "Grounded-SAM-2"]
+	path = Grounded-SAM-2
 	url = https://github.com/IDEA-Research/Grounded-SAM-2.git
