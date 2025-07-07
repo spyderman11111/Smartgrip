@@ -52,3 +52,11 @@ pip install -r requirements.txt
 cd LightGlue
 python -m pip install -e .
 ```
+
+## vision_part package structure
+
+The **extract_frames** method extracts and saves every N-th frame from a video file or webcam stream to a specified output directory.
+
+The **GroundingDinoPredictor** class performs zero-shot object detection using text prompts and returns bounding boxes and class labels from input images.
+
+## Output Description
