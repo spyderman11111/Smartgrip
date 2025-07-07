@@ -1,81 +1,63 @@
-import copy
 import os
-import sys
-sys.path.append(os.path.abspath("."))
-
 import cv2
 import torch
-import numpy as np
 from PIL import Image
-from your_module import IncrementalObjectTracker  # 替换成你实际的路径
+from detect_with_dino import GroundingDinoPredictor  
+from extract_frames import VideoFrameExtractor        
 
-def main():
-    # ====== 环境设置（放在 main 内，避免非必要全局副作用）======
-    if torch.cuda.is_available():
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-        if torch.cuda.get_device_properties(0).major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-        print("[Info] CUDA environment initialized with TF32 + autocast.")
-    else:
-        print("[Warning] CUDA not available. Running on CPU.")
 
-    # ====== 参数设置 ======
-    output_dir = "./outputs"
-    prompt_text = "hand."
-    detection_interval = 20
-    max_frames = 300
+def extract_and_detect(video_source: str,
+                       frame_interval: int = 10,
+                       max_frames: int = None,
+                       output_dir: str = "cache_frames",
+                       prompt: str = "object"):
+    """
+    Main pipeline: Extract frames from video and run GroundingDINO detection on each.
 
-    os.makedirs(output_dir, exist_ok=True)
-
-    # ====== 初始化检测器和跟踪器 ======
-    tracker = IncrementalObjectTracker(
-        grounding_model_id="IDEA-Research/grounding-dino-tiny",
-        sam2_model_cfg="configs/sam2.1/sam2.1_hiera_l.yaml",
-        sam2_ckpt_path="./checkpoints/sam2.1_hiera_large.pt",
-        device="cuda",
-        prompt_text=prompt_text,
-        detection_interval=detection_interval,
+    Args:
+        video_source (str): Path to video or livestream ID (e.g., '0').
+        frame_interval (int): Interval between saved frames.
+        max_frames (int): Maximum number of frames to process.
+        output_dir (str): Directory to save extracted frames.
+        prompt (str): Text prompt for detection.
+    """
+    # Step 1: Extract frames
+    extractor = VideoFrameExtractor(
+        video_source=video_source,
+        frame_interval=frame_interval,
+        output_dir=output_dir
     )
-    tracker.set_prompt("person.")
+    extractor.extract_frames(max_frames=max_frames)
 
-    # ====== 摄像头读取并实时处理帧 ======
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[Error] Cannot open camera.")
-        return
+    # Step 2: Initialize GroundingDINO predictor
+    predictor = GroundingDinoPredictor(
+        model_id="IDEA-Research/grounding-dino-tiny",
+        device="cuda" if torch.cuda.is_available() else "cpu"
+    )
 
-    print("[Info] Camera opened. Press 'q' to quit.")
-    frame_idx = 0
+    # Step 3: Iterate over extracted frames and run detection
+    frame_files = sorted([f for f in os.listdir(output_dir) if f.endswith(".jpg")])
+    for fname in frame_files:
+        fpath = os.path.join(output_dir, fname)
+        image = Image.open(fpath).convert("RGB")
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("[Warning] Failed to capture frame.")
-                break
+        boxes, labels = predictor.predict(
+            image=image,
+            text_prompts=prompt,
+            box_threshold=0.25,
+            text_threshold=0.25
+        )
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            print(f"[Frame {frame_idx}] Processing live frame...")
-            process_image = tracker.add_image(frame_rgb)
+        print(f"\n[Frame] {fname} | Detected {len(labels)} objects:")
+        for label, box in zip(labels, boxes):
+            print(f"  - {label}: {box.tolist()}")
 
-            if process_image is None or not isinstance(process_image, np.ndarray):
-                print(f"[Warning] Skipped frame {frame_idx} due to empty result.")
-                frame_idx += 1
-                continue
-
-            tracker.save_current_state(output_dir=output_dir, raw_image=frame_rgb)
-            frame_idx += 1
-
-            if frame_idx >= max_frames:
-                print(f"[Info] Reached max_frames {max_frames}. Stopping.")
-                break
-    except KeyboardInterrupt:
-        print("[Info] Interrupted by user (Ctrl+C).")
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-        print("[Done] Live inference complete.")
 
 if __name__ == "__main__":
-    main()
+    extract_and_detect(
+        video_source="0",             # 改为视频路径或摄像头 ID
+        frame_interval=5,             # 每 5 帧取一张
+        max_frames=20,                # 最多处理 20 张图像
+        output_dir="cache_frames",   # 存储帧的目录
+        prompt="red box"              # GroundingDINO 的文本提示
+    )
