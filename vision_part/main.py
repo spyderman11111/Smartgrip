@@ -55,9 +55,9 @@ def extract_and_detect(video_source: str,
 
 if __name__ == "__main__":
     extract_and_detect(
-        video_source="0",             # 改为视频路径或摄像头 ID
-        frame_interval=5,             # 每 5 帧取一张
+        video_source="../test_video/test_ball.mp4",             # 改为视频路径或摄像头 ID
+        frame_interval=20,             # 每 5 帧取一张
         max_frames=20,                # 最多处理 20 张图像
-        output_dir="cache_frames",   # 存储帧的目录
-        prompt="red box"              # GroundingDINO 的文本提示
+        output_dir="../outputs",   # 存储帧的目录
+        prompt="ball"              # GroundingDINO 的文本提示
     )

@@ -52,8 +52,8 @@ class VideoFrameExtractor:
                 saved_count += 1
                 if max_frames and saved_count >= max_frames:
                     break
-            else:
-                print(f"[Skipped] Frame {frame_count} (interval: {self.frame_interval})")
+            #else:
+                #print(f"[Skipped] Frame {frame_count} (interval: {self.frame_interval})")
 
             frame_count += 1
 

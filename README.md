@@ -39,6 +39,7 @@ bash download_ckpts.sh
 ```bash
 pip install -e .
 pip install --no-build-isolation -e grounding_dino
+pip install transformers
 ```
 ## install VGGT
 
