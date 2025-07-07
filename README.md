@@ -40,3 +40,14 @@ bash download_ckpts.sh
 pip install -e .
 pip install --no-build-isolation -e grounding_dino
 ```
+## install VGGT
+
+```bash
+cd vggt
+pip install -r requirements.txt
+```
+## install Lightglue
+```bash
+cd LightGlue
+python -m pip install -e .
+```
