@@ -21,6 +21,11 @@ def extract_and_detect(video_source: str,
         output_dir (str): Directory to save extracted frames.
         prompt (str): Text prompt for detection.
     """
+    # Step 0: Clear old image files in output directory
+    for f in os.listdir(output_dir):
+        if f.endswith(".jpg"):
+            os.remove(os.path.join(output_dir, f))
+
     # Step 1: Extract frames
     extractor = VideoFrameExtractor(
         video_source=video_source,
@@ -48,16 +53,19 @@ def extract_and_detect(video_source: str,
             text_threshold=0.25
         )
 
-        print(f"\n[Frame] {fname} | Detected {len(labels)} objects:")
+        print(f"\n[Frame] {fname} | Detected {len(labels)} {prompt}:")
         for label, box in zip(labels, boxes):
-            print(f"  - {label}: {box.tolist()}")
+            x1, y1, x2, y2 = [int(coord) for coord in box.tolist()]
+            print(f"  - {label}: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
+
+
 
 
 if __name__ == "__main__":
     extract_and_detect(
-        video_source="../test_video/test_ball.mp4",             # 改为视频路径或摄像头 ID
-        frame_interval=20,             # 每 5 帧取一张
-        max_frames=20,                # 最多处理 20 张图像
-        output_dir="../outputs",   # 存储帧的目录
-        prompt="ball"              # GroundingDINO 的文本提示
+        video_source="../test_video/test_ball.mp4",            
+        frame_interval=20,             
+        max_frames=20,                
+        output_dir="../outputs",   
+        prompt="ball"              
     )

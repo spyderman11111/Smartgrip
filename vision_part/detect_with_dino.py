@@ -69,7 +69,9 @@ if __name__ == "__main__":
 
     print("Detected objects:")
     for label, box in zip(labels, boxes):
-        print(f"{label}: {box.tolist()}")
+        int_box = [int(coord) for coord in box.tolist()]
+        print(f"{label}: {int_box}")
+
 
     fig, ax = plt.subplots(1)
     ax.imshow(image)

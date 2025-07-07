@@ -24,7 +24,6 @@ class VideoFrameExtractor:
         if not self.cap.isOpened():
             raise ValueError(f"Failed to open video source: {video_source}")
 
-        # 模式提示
         mode = "Live Stream" if isinstance(self.video_source, int) else "Video File"
         print(f"[Initialized] Mode: {mode}, Source: {video_source}")
         print(f"[Config] Saving every {self.frame_interval} frame(s) to: {self.output_dir}")
@@ -46,12 +45,13 @@ class VideoFrameExtractor:
                 break
 
             if frame_count % self.frame_interval == 0:
-                filename = os.path.join(self.output_dir, f"frame_{saved_count:05d}.jpg")
+                filename = os.path.join(self.output_dir, f"frame_{frame_count:05d}.jpg")
                 cv2.imwrite(filename, frame)
-                print(f"[Saved] Frame {frame_count} → {filename}")
+                print(f"[Saved] {os.path.basename(filename)}")
                 saved_count += 1
                 if max_frames and saved_count >= max_frames:
                     break
+
             #else:
                 #print(f"[Skipped] Frame {frame_count} (interval: {self.frame_interval})")
 
@@ -61,12 +61,10 @@ class VideoFrameExtractor:
         print(f"[Finished] Total saved frames: {saved_count}, Total processed frames: {frame_count}")
 
 
-# 使用示例：
 if __name__ == "__main__":
-    # 使用视频文件（指定路径）
     extractor = VideoFrameExtractor(video_source="test_video.mp4", frame_interval=5)
     extractor.extract_frames()
 
-    # 或使用直播摄像头（如 webcam ID 为 0）
+
     # extractor = VideoFrameExtractor(video_source="0", frame_interval=10)
     # extractor.extract_frames(max_frames=50)
