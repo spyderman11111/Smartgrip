@@ -3,7 +3,9 @@
 ```bash
 conda activate smartgrip
 ```
+
 You can create a new conda environment at will, I am using python version 3.11
+
 ---
 
 ## Git Submodule Setup
@@ -54,9 +56,29 @@ python -m pip install -e .
 
 ## vision_part package Instructions
 
-The **extract_frames** method, implemented in extract_frames.py, supports two modes: video file input (e.g., .mp4) and webcam stream input (e.g., '0'). It uses OpenCV to extract every N-th frame and saves them to a specified directory using the original frame index in the filename.
+**extract_frames** method, implemented in extract_frames.py, supports two modes: video file input (e.g., .mp4) and webcam stream input (e.g., '0'). It uses OpenCV to extract every N-th frame and saves them to a specified directory using the original frame index in the filename.
 
-The **GroundingDinoPredictor** class performs zero-shot object detection using text prompts and returns bounding boxes and class labels from input images.
+**GroundingDinoPredictor** class performs zero-shot object detection using text prompts and returns bounding boxes and class labels from input images.
+
+**SAM2ImagePredictorWrapper** This class wraps Meta AI's SAM2 model to perform segmentation on a specified region of an input image defined by a bounding box.
+
+**Function**
+
+    Loads an RGB image and a bounding box (x1, y1, x2, y2)
+
+    Applies the SAM2 model to predict a fine-grained mask for the specified region
+
+    Saves results including color mask, grayscale mask, and overlay image
+
+**Output**
+
+Returns a dictionary with:
+
+    mask_array (np.ndarray): Binary mask of shape (H, W)
+
+    mask_score (float): IoU score of the predicted mask
+
+    low_res_mask (np.ndarray): Raw low-resolution logits, shape (256, 256)
 
 ## Output Description
 
@@ -72,8 +94,8 @@ frame_<frame_index>.jpg
 
 Each saved frame will output detection info like:
 
-[Frame] frame_00220.jpg | Detected 1 ball:
-  - ball: x1=816, y1=544, x2=1076, y2=803
+    [Frame] frame_00220.jpg | Detected 1 ball:
+      - ball: x1=816, y1=544, x2=1076, y2=803
 
 x1, y1: top-left corner of the bounding box (in pixels)
 
