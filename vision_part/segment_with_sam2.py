@@ -1,106 +1,111 @@
-import sys
-import os
-
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 import os
 import torch
 import numpy as np
 import cv2
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from sam2.build_sam import build_sam2
+from PIL import Image
+from typing import Tuple, Union, Dict
+
 from sam2.sam2_image_predictor import SAM2ImagePredictor
-from hydra import initialize, compose
 
 
-class SAM2ImageSegmentor:
-    """
-    Wrapper class for SAM2-based segmentation given bounding boxes.
-    """
-
-    def __init__(self, config_dir: str, config_name: str, ckpt_path: str, device="cuda"):
+class SAM2ImagePredictorWrapper:
+    def __init__(
+        self,
+        model_id: str = "facebook/sam2.1-hiera-large",
+        device: str = "cuda",
+        mask_threshold: float = 0.0,
+        max_hole_area: float = 0.0,
+        max_sprinkle_area: float = 0.0,
+        multimask_output: bool = False,
+        return_logits: bool = False,
+    ):
         """
-        Args:
-            config_dir (str): Directory containing the SAM2 config file.
-            config_name (str): Filename of the SAM2 config YAML.
-            ckpt_path (str): Path to the SAM2 checkpoint (.pt).
-            device (str): Device to load model on.
+        Initialize the SAM2 wrapper with adjustable parameters.
         """
         self.device = device
-        with initialize(config_path=config_dir, job_name="sam2_segmentor"):
-            model = build_sam2(
-                config_file=config_name,
-                ckpt_path=ckpt_path,
-                device=device,
-                mode="eval",
-                apply_postprocessing=True,
-            )
-        self.predictor = SAM2ImagePredictor(model)
+        self.multimask_output = multimask_output
+        self.return_logits = return_logits
 
-    def set_image(self, image: np.ndarray):
-        """Sets the input image for segmentation."""
+        self.predictor = SAM2ImagePredictor.from_pretrained(
+            model_id=model_id,
+            device=device,
+            mask_threshold=mask_threshold,
+            max_hole_area=max_hole_area,
+            max_sprinkle_area=max_sprinkle_area,
+        )
+
+    def run_inference(
+        self,
+        image_path: str,
+        box: Tuple[int, int, int, int],
+        save_dir: str = "./sam2_results",
+    ) -> Dict:
+        """
+        Run inference on a single image with a box prompt and save results.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        image = Image.open(image_path).convert("RGB")
+        image_np = np.array(image)
         self.predictor.set_image(image)
 
-    def predict_masks_from_boxes(self, boxes: torch.Tensor):
-        """
-        Predicts segmentation masks from input bounding boxes.
-        Returns:
-            masks: (N, H, W) binary masks
-            scores: (N,) mask confidences
-            logits: (N, H, W) raw logits
-        """
-        masks, scores, logits = self.predictor.predict(
-            point_coords=None,
-            point_labels=None,
-            box=boxes,
-            multimask_output=False,
+        box_array = np.array(box, dtype=np.float32)
+        masks, ious, lowres = self.predictor.predict(
+            box=box_array,
+            multimask_output=self.multimask_output,
+            return_logits=self.return_logits,
         )
-        if masks.ndim == 2:
-            masks = masks[None]
-            scores = scores[None]
-            logits = logits[None]
-        elif masks.ndim == 4:
-            masks = masks.squeeze(1)
-        return masks, scores, logits
+
+        mask = masks[0]  # (H, W)
+        score = float(ious[0])
+        low_res = lowres[0]  # (256, 256)
+
+        mask_uint8 = (mask * 255).astype(np.uint8)
+        mask_colored = cv2.applyColorMap(mask_uint8, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(image_np, 1.0, mask_colored, 0.5, 0)
+
+        filename = os.path.splitext(os.path.basename(image_path))[0]
+        cv2.imwrite(os.path.join(save_dir, f"{filename}_original.jpg"), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(os.path.join(save_dir, f"{filename}_mask_gray.png"), mask_uint8)
+        cv2.imwrite(os.path.join(save_dir, f"{filename}_mask_color.png"), mask_colored)
+        cv2.imwrite(os.path.join(save_dir, f"{filename}_overlay.jpg"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+
+        print(f"Saved to: {save_dir}")
+        print(f"Mask score: {score:.4f}")
+        print(f"Mask shape: {mask.shape}, Low-res logits shape: {low_res.shape}")
+
+        return {
+            "mask_array": mask.astype(np.uint8),
+            "mask_score": score,
+            "low_res_mask": low_res,
+        }
 
 
 if __name__ == "__main__":
-    # 获取路径
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    EXTERNAL_SAM2_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "external", "Grounded-SAM-2"))
+    # === Static configuration ===
+    image_path = "/path/to/your/image.jpg" 
+    box = (100, 150, 300, 400)  # (x1, y1, x2, y2)
+    save_dir = "./sam2_results"
 
-    config_dir = os.path.join(EXTERNAL_SAM2_DIR, "sam2", "configs", "sam2.1")
-    config_name = "sam2.1_hiera_l.yaml"
-    ckpt_path = os.path.join(EXTERNAL_SAM2_DIR, "checkpoints", "sam2.1_hiera_large.pt")
+    # Parameters affecting mask quality
+    mask_threshold = 0.3
+    max_hole_area = 100.0
+    max_sprinkle_area = 50.0
+    multimask_output = True
+    return_logits = False
 
-    image_path = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "test_videos", "IMG_4031.JPG"))
-    image = cv2.imread(image_path)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    predictor = SAM2ImagePredictorWrapper(
+        model_id="facebook/sam2.1-hiera-large",
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        mask_threshold=mask_threshold,
+        max_hole_area=max_hole_area,
+        max_sprinkle_area=max_sprinkle_area,
+        multimask_output=multimask_output,
+        return_logits=return_logits,
+    )
 
-    # 初始化分割器
-    segmentor = SAM2ImageSegmentor(config_dir, config_name, ckpt_path, device="cuda")
-    segmentor.set_image(image_rgb)
-
-    # 示例 bbox（可替换）
-    box = torch.tensor([[100, 50, 300, 250]], dtype=torch.float)
-
-    # 推理并可视化
-    masks, scores, logits = segmentor.predict_masks_from_boxes(box)
-
-    fig, ax = plt.subplots(1)
-    ax.imshow(image_rgb)
-    ax.add_patch(patches.Rectangle(
-        (box[0][0], box[0][1]),
-        box[0][2] - box[0][0],
-        box[0][3] - box[0][1],
-        linewidth=2,
-        edgecolor="red",
-        facecolor="none"
-    ))
-    ax.imshow(masks[0], alpha=0.5, cmap="jet")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.show()
+    predictor.run_inference(
+        image_path=image_path,
+        box=box,
+        save_dir=save_dir,
+    )

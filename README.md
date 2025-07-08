@@ -3,15 +3,13 @@
 ```bash
 conda activate smartgrip
 ```
-
+You can create a new conda environment at will, I am using python version 3.11
 ---
 
-# Git Submodule Setup
+## Git Submodule Setup
 
 
 ```bash
-git submodule add <REPO_URL>
-
 git submodule update --init --recursive
 ```
 ---
@@ -22,6 +20,7 @@ git submodule update --init --recursive
 
 ```bash
 cd Grounded-SAM-2
+pip install -e .
 ```
 
 ### Download checkpoints
