@@ -13,9 +13,9 @@ class SAM2ImagePredictorWrapper:
         self,
         model_id: str = "facebook/sam2.1-hiera-large",
         device: str = "cuda",
-        mask_threshold: float = 0.0,
-        max_hole_area: float = 0.0,
-        max_sprinkle_area: float = 0.0,
+        mask_threshold: float = 0.3,
+        max_hole_area: float = 100.0,
+        max_sprinkle_area: float = 50.0,
         multimask_output: bool = False,
         return_logits: bool = False,
     ):
