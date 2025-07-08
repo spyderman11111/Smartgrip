@@ -41,6 +41,9 @@ bash download_ckpts.sh
 pip install -e .
 pip install --no-build-isolation -e grounding_dino
 pip install transformers
+
+echo 'export PYTHONPATH=$PYTHONPATH:~/Smartgrip/Grounded-SAM-2' >> ~/.bashrc
+source ~/.bashrc
 ```
 ## install VGGT
 

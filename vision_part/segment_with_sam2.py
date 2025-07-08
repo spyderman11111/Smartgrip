@@ -4,6 +4,10 @@ import numpy as np
 import cv2
 from PIL import Image
 from typing import Tuple, Union, Dict
+import sys
+
+SAM2_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Grounded-SAM-2'))
+sys.path.append(SAM2_path)
 
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
