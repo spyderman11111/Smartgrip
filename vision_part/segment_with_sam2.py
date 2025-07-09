@@ -83,6 +83,26 @@ class SAM2ImagePredictorWrapper:
             "mask_score": score,
             "low_res_mask": low_res,
         }
+    
+    def run_on_crop(self, crop: Image.Image, save_path: str) -> None:
+        """
+        Run segmentation on a cropped PIL image and save the overlay result.
+        """
+        image_np = np.array(crop)
+        self.predictor.set_image(crop)
+
+        dummy_box = np.array([0, 0, crop.width, crop.height], dtype=np.float32)
+        masks, ious, _ = self.predictor.predict(
+            box=dummy_box,
+            multimask_output=self.multimask_output,
+            return_logits=self.return_logits,
+        )
+
+        mask = (masks[0] * 255).astype(np.uint8)
+        mask_colored = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(image_np, 1.0, mask_colored, 0.5, 0)
+
+        cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
 
 if __name__ == "__main__":
