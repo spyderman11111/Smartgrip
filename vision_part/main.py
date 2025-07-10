@@ -130,8 +130,8 @@ def extract_and_detect(
     Master pipeline that calls all 4 steps.
     """
     extract_frames(video_source, output_dir, frame_interval, max_frames)
-    grounding_dino, sam2, extractor, matcher = initialize_models()
-    run_detection_and_segmentation(output_dir, prompt, grounding_dino, sam2, extractor, matcher)
+    grounding_dino, sam2, matcher = initialize_models()
+    run_detection_and_segmentation(output_dir, prompt, grounding_dino, sam2, matcher)
 
 
 if __name__ == "__main__":
