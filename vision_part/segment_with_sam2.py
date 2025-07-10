@@ -6,7 +6,6 @@ from PIL import Image
 from typing import Tuple, Dict
 import sys
 
-# 加入 Grounded-SAM-2 路径
 SAM2_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Grounded-SAM-2'))
 sys.path.append(SAM2_path)
 
