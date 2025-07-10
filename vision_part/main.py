@@ -93,8 +93,8 @@ def detect_and_segment_frame(output_dir: str, video_path: str, prompt: str,
 
 if __name__ == "__main__":
     # Paths to the two video sources
-    video1_path = "/home/sz/Smartgrip/vision_part/test_video/test_ball.mp4"
-    video2_path = "/home/sz/Smartgrip/vision_part/test_video/video2.mp4"  # second video path
+    video1_path = "vision_part/test_video/test_ball.mp4"
+    video2_path = "vision_part/test_video/test_ball2.mp4"  
     # Output directories for Aira and UR5e
     output_dir1 = "aira"
     output_dir2 = "ur5e"
