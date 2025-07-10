@@ -89,6 +89,9 @@ class SAM2ImagePredictorWrapper:
         Run segmentation on a cropped PIL image and save the overlay result.
         """
         image_np = np.array(crop)
+        if image_np.dtype != np.uint8:
+            image_np = (image_np * 255).clip(0, 255).astype(np.uint8)
+
         self.predictor.set_image(crop)
 
         dummy_box = np.array([0, 0, crop.width, crop.height], dtype=np.float32)
@@ -99,37 +102,38 @@ class SAM2ImagePredictorWrapper:
         )
 
         mask = (masks[0] * 255).astype(np.uint8)
-        mask_colored = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(image_np, 1.0, mask_colored, 0.5, 0)
+        mask_colored = cv2.applyColorMap(mask, cv2.COLORMAP_PARULA)
 
-        cv2.imwrite(save_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        overlay = cv2.addWeighted(image_bgr, 1.0, mask_colored, 0.5, 0)
+
+        cv2.imwrite(save_path, overlay)
 
 
 if __name__ == "__main__":
-    # === Static configuration ===
-    image_path = "/path/to/your/image.jpg" 
-    box = (100, 150, 300, 400)  # (x1, y1, x2, y2)
-    save_dir = "./sam2_results"
+    # Step 1: Set path and configuration
+    image_path = "/home/MA_SmartGrip/Smartgrip/vision_part/outputs/frame_00000.jpg"
+    save_dir = "./sam2_debug"
+    os.makedirs(save_dir, exist_ok=True)
 
-    # Parameters affecting mask quality
-    mask_threshold = 0.3
-    max_hole_area = 100.0
-    max_sprinkle_area = 50.0
-    multimask_output = True
-    return_logits = False
-
+    # Step 2: Initialize SAM2 predictor
     predictor = SAM2ImagePredictorWrapper(
         model_id="facebook/sam2.1-hiera-large",
         device="cuda" if torch.cuda.is_available() else "cpu",
-        mask_threshold=mask_threshold,
-        max_hole_area=max_hole_area,
-        max_sprinkle_area=max_sprinkle_area,
-        multimask_output=multimask_output,
-        return_logits=return_logits,
+        mask_threshold=0.3,
+        max_hole_area=100.0,
+        max_sprinkle_area=50.0,
+        multimask_output=False,
+        return_logits=False,
     )
 
-    predictor.run_inference(
+    # Step 3: Load image, create dummy box (whole image), run inference
+    image = Image.open(image_path).convert("RGB")
+    w, h = image.size
+    result = predictor.run_inference(
         image_path=image_path,
-        box=box,
-        save_dir=save_dir,
+        box=(0, 0, w, h),  # Use full image as box
+        save_dir=save_dir
     )
+
+    print(f"Segmentation done. Overlay saved to: {save_dir}")

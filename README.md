@@ -22,6 +22,9 @@ git submodule update --init --recursive
 
 ```bash
 cd Grounded-SAM-2
+pip3 install torch torchvision torchaudio
+#check
+echo $CUDA_HOME
 pip install -e .
 ```
 
@@ -45,18 +48,25 @@ pip install transformers
 echo 'export PYTHONPATH=$PYTHONPATH:~/Smartgrip/Grounded-SAM-2' >> ~/.bashrc
 source ~/.bashrc
 ```
+
+## install Lightglue
+```bash
+cd LightGlue
+python -m pip install -e .
+```
+need to change code in **lightglue.py** line 24
+
+    try:
+        AMP_CUSTOM_FWD_F32 = torch.amp.custom_fwd(cast_inputs=torch.float32, device_type="cuda")
+    except AttributeError:
+        AMP_CUSTOM_FWD_F32 = torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+
 ## install VGGT
 
 ```bash
 cd vggt
 pip install -r requirements.txt
 ```
-## install Lightglue
-```bash
-cd LightGlue
-python -m pip install -e .
-```
-
 ## vision_part package Instructions
 
 **extract_frames** method, implemented in extract_frames.py, supports two modes: video file input (e.g., .mp4) and webcam stream input (e.g., '0'). It uses OpenCV to extract every N-th frame and saves them to a specified directory using the original frame index in the filename.
