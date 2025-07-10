@@ -66,7 +66,14 @@ class SAM2ImagePredictorWrapper:
 
         mask_uint8 = (mask * 255).astype(np.uint8)
         mask_colored = cv2.applyColorMap(mask_uint8, cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(image_np, 1.0, mask_colored, 0.5, 0)
+        # Create 3-channel boolean mask
+        mask_bool = mask.astype(bool)
+        mask_3c = np.stack([mask_bool] * 3, axis=-1)
+
+        # Only blend in the masked region
+        overlay = image_np.copy()
+        overlay[mask_3c] = cv2.addWeighted(image_np[mask_3c], 0.5, mask_colored[mask_3c], 0.5, 0)
+
 
         filename = os.path.splitext(os.path.basename(image_path))[0]
         cv2.imwrite(os.path.join(save_dir, f"{filename}_original.jpg"), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
