@@ -121,7 +121,7 @@ def run_detection_and_segmentation(
 
 def extract_and_detect(
     video_source: str,   # Path to video file or camera ID
-    frame_interval: int = 200,  # Frame sampling interval
+    frame_interval: int = 20,  # Frame sampling interval
     max_frames: int = None,     # Max frames to process
     output_dir: str = "cache_frames",  # Output folder path
     prompt: str = "object"             # Detection prompt

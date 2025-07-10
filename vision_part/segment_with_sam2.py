@@ -87,6 +87,44 @@ class SAM2ImagePredictorWrapper:
             "mask_score": float(ious[0]),
             "low_res_mask": lowres[0],
         }
+    
+    def run_on_crop(self, crop: Image.Image, save_path: str) -> None:
+        """
+        Run segmentation on a cropped PIL image and save the overlay result.
+        Only the predicted object area will be visualized (with mask flipped).
+        """
+        image_np = np.array(crop)
+        if image_np.dtype != np.uint8:
+            image_np = (image_np * 255).clip(0, 255).astype(np.uint8)
+
+        self.predictor.set_image(crop)
+
+        dummy_box = np.array([0, 0, crop.width, crop.height], dtype=np.float32)
+        masks, ious, _ = self.predictor.predict(
+            box=dummy_box,
+            multimask_output=self.multimask_output,
+            return_logits=self.return_logits,
+        )
+
+        # Step 1: 反转掩码（前景为1）
+        mask = masks[0]
+        mask_binary = mask <= 0.5  # SAM2原本前景为0，翻转后前景为1
+
+        # Step 2: 可视化混合图像（仅在掩码区域混合颜色）
+        mask_uint8 = (mask_binary * 255).astype(np.uint8)
+        mask_colored = cv2.applyColorMap(mask_uint8, cv2.COLORMAP_PARULA)
+
+        overlay = image_np.copy()
+        for c in range(3):
+            overlay[..., c] = np.where(
+                mask_binary,
+                0.5 * image_np[..., c] + 0.5 * mask_colored[..., c],
+                image_np[..., c]
+            ).astype(np.uint8)
+
+        # Step 3: 保存结果
+        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(save_path, overlay_bgr)
 
 
 if __name__ == "__main__":
