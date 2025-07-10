@@ -6,8 +6,7 @@ from PIL import Image
 from detect_with_dino import GroundingDinoPredictor
 from extract_frames import VideoFrameExtractor
 from segment_with_sam2 import SAM2ImagePredictorWrapper
-from lightglue import LightGlue, SuperPoint
-from lightglue.utils import load_image, rbd
+from LightGlueMatcher import LightGlueMatcher
 
 
 def extract_frames(
@@ -40,8 +39,7 @@ def initialize_models():
     Returns:
         grounding_dino: GroundingDinoPredictor object for zero-shot detection
         sam2: SAM2ImagePredictorWrapper object for segmentation
-        extractor: SuperPoint feature extractor
-        matcher: LightGlue feature matcher
+        matcher: LightGlueMatcher wrapper (includes feature extractor)
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     grounding_dino = GroundingDinoPredictor(
@@ -57,25 +55,23 @@ def initialize_models():
         multimask_output=False,
         return_logits=False,
     )
-    extractor = SuperPoint(max_num_keypoints=2048).eval().to(device)
-    matcher = LightGlue(features='superpoint').eval().to(device)
-    print(f"Loaded GroundingDINO, SAM2, SuperPoint, and LightGlue")
-    return grounding_dino, sam2, extractor, matcher
+    matcher = LightGlueMatcher(feature_type='superpoint', device=device, mp=True)
+    print(f"Loaded GroundingDINO, SAM2, and LightGlueMatcher")
+    return grounding_dino, sam2, matcher
 
 
 def run_detection_and_segmentation(
-    output_dir: str,  # Directory containing extracted frames
-    prompt: str,      # Text prompt for object detection
-    dino,             # GroundingDinoPredictor
-    sam2,             # SAM2ImagePredictorWrapper
-    extractor,        # SuperPoint extractor
-    matcher           # LightGlue matcher
+    output_dir: str,
+    prompt: str,
+    dino,
+    sam2,
+    matcher  
 ):
     """
     Step 3 & 4: Detection → Segmentation → Feature extraction → Matching.
     """
     frame_files = sorted([f for f in os.listdir(output_dir) if f.endswith(".jpg")])
-    prev_feats = None  # To store features of previous crop for matching
+    prev_feats = None
 
     for fname in frame_files:
         fpath = os.path.join(output_dir, fname)
@@ -97,20 +93,25 @@ def run_detection_and_segmentation(
             sam2.run_on_crop(crop, save_path)
             print(f"  - {label}: x1={x1}, y1={y1}, x2={x2}, y2={y2} → mask saved: {save_path}")
 
-            crop_tensor = load_image(save_path).to(extractor.device)  # [3, H, W], normalized
-            feats = extractor.extract(crop_tensor)
+            # === Feature extraction using LightGlueMatcher ===
+            feats = matcher.extract_features(save_path)
 
-            if feats['keypoints'].shape[0] == 0:
+            if feats['keypoints'].shape[1] == 0:
                 print(f"    [WARN] No keypoints found in crop {i}")
                 continue
 
             if prev_feats is not None:
-                match_result = matcher({"image0": prev_feats, "image1": feats})
-                feats0, feats1, matches01 = [rbd(x) for x in [prev_feats, feats, match_result]]
+                result = matcher.match(
+                    prev_feats["keypoints"], prev_feats["descriptors"],
+                    feats["keypoints"], feats["descriptors"],
+                    prev_feats["image_size"], feats["image_size"]
+                )
 
-                matches = matches01['matches']
+                matches = result["matches"][0]
+                scores = result["scores"][0]
+
                 num_matches = matches.shape[0]
-                avg_score = matches01['scores'].mean().item() if num_matches > 0 else 0.0
+                avg_score = scores.mean().item() if num_matches > 0 else 0.0
                 print(f"    [MATCH] Matches: {num_matches}, Avg confidence: {avg_score:.3f}")
             else:
                 print(f"    [MATCH] First crop — no reference to match.")

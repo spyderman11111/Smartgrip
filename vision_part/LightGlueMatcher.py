@@ -1,5 +1,8 @@
 import torch
-from lightglue.lightglue import LightGlue
+from pathlib import Path
+from lightglue import LightGlue, SuperPoint
+from lightglue.utils import load_image, rbd
+
 
 class LightGlueMatcher:
     def __init__(
@@ -17,7 +20,20 @@ class LightGlueMatcher:
         weights: str = None,
     ):
         """
-        Wrapper for LightGlue model with customizable parameters.
+        Wrapper class for LightGlue matcher with configurable options.
+
+        Args:
+            feature_type (str): Type of feature extractor, e.g., 'superpoint'.
+            device (str): Device to run inference on ('cuda' or 'cpu').
+            descriptor_dim (int): Descriptor dimensionality.
+            n_layers (int): Number of transformer layers.
+            num_heads (int): Number of attention heads.
+            flash (bool): Whether to enable FlashAttention (if available).
+            mp (bool): Mixed precision inference.
+            depth_confidence (float): Confidence threshold for early stopping.
+            width_confidence (float): Confidence threshold for pruning.
+            filter_threshold (float): Minimum score for valid matches.
+            weights (str): Path to pretrained weights (optional).
         """
         self.device = device
         self.matcher = LightGlue(
@@ -33,6 +49,26 @@ class LightGlueMatcher:
             weights=weights,
         ).to(device)
 
+        if feature_type == "superpoint":
+            self.feature_extractor = SuperPoint().to(device)
+        else:
+            raise ValueError(f"Unsupported feature type: {feature_type}")
+
+    def extract_features(self, image_path: str) -> dict:
+        """
+        Extract keypoints and descriptors from a given image path.
+
+        Args:
+            image_path (str): Path to the input image.
+
+        Returns:
+            dict: A dictionary containing keypoints, descriptors, and image size.
+        """
+        image = load_image(image_path).to(self.device)
+        features = self.feature_extractor.extract(image)
+        features["image_size"] = torch.tensor(image.shape[-2:][::-1]).unsqueeze(0).to(self.device)
+        return features
+
     def match(
         self,
         keypoints0: torch.Tensor,
@@ -43,7 +79,18 @@ class LightGlueMatcher:
         image_size1: torch.Tensor,
     ) -> dict:
         """
-        Match keypoints and descriptors between two images.
+        Perform matching between two sets of keypoints and descriptors.
+
+        Args:
+            keypoints0 (Tensor): [B x M x 2] keypoints from image 0.
+            descriptors0 (Tensor): [B x M x D] descriptors from image 0.
+            keypoints1 (Tensor): [B x N x 2] keypoints from image 1.
+            descriptors1 (Tensor): [B x N x D] descriptors from image 1.
+            image_size0 (Tensor): [B x 2] original size of image 0.
+            image_size1 (Tensor): [B x 2] original size of image 1.
+
+        Returns:
+            dict: LightGlue output including matches, scores, etc.
         """
         data = {
             "image0": {
@@ -61,30 +108,37 @@ class LightGlueMatcher:
 
     def compile(self, mode: str = "reduce-overhead"):
         """
-        Optional: Compile transformer layers for runtime acceleration.
+        Optionally compile transformer layers to reduce runtime overhead.
+
+        Args:
+            mode (str): Compilation strategy ('default', 'reduce-overhead', etc.).
         """
         self.matcher.compile(mode=mode)
 
 
 if __name__ == "__main__":
-    # Debugging example: batch size 1, 128 keypoints per image
-    B, M, N, D = 1, 128, 128, 256
+    # Example: run matcher on two sample images
+    image_path0 = "assets/phototourism_aachen/frame_000000.jpg"
+    image_path1 = "assets/phototourism_aachen/frame_000001.jpg"
+
+    if not Path(image_path0).exists() or not Path(image_path1).exists():
+        raise FileNotFoundError("Sample images not found. Please update the image paths.")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    keypoints0 = torch.rand(B, M, 2, device=device)
-    descriptors0 = torch.rand(B, M, D, device=device)
-    keypoints1 = torch.rand(B, N, 2, device=device)
-    descriptors1 = torch.rand(B, N, D, device=device)
-    image_size0 = torch.tensor([[480, 640]], device=device)
-    image_size1 = torch.tensor([[480, 640]], device=device)
-
     matcher = LightGlueMatcher(feature_type="superpoint", device=device, mp=True)
+
+    # Step 1: Extract features
+    feats0 = matcher.extract_features(image_path0)
+    feats1 = matcher.extract_features(image_path1)
+
+    # Step 2: Match descriptors
     output = matcher.match(
-        keypoints0, descriptors0,
-        keypoints1, descriptors1,
-        image_size0, image_size1
+        feats0["keypoints"], feats0["descriptors"],
+        feats1["keypoints"], feats1["descriptors"],
+        feats0["image_size"], feats1["image_size"]
     )
 
+    # Step 3: Print match results
     print("Matched pairs:", output["matches"][0].shape[0])
-    print("First few matches:", output["matches"][0][:5])
-    print("Matching scores:", output["scores"][0][:5])
+    print("First few matches:\n", output["matches"][0][:5])
+    print("Matching scores:\n", output["scores"][0][:5])
