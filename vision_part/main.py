@@ -74,8 +74,13 @@ def match_and_report(feats1, feats2, label1, label2, matcher):
 
 def main():
     # ========== Step 1: 设置路径并选择图像 ==========
-    aria_dir = "/home/sz/Smartgrip/vision_part/aria_images"
-    ur5e_dir = "/home/sz/Smartgrip/vision_part/ur5e_images"
+    base_dir = os.path.dirname(os.path.abspath(__file__))  # 当前脚本所在目录
+
+    aria_dir = os.path.join(base_dir, "aria_images")
+    ur5e_dir = os.path.join(base_dir, "ur5e_images")
+    output_dir = os.path.join(base_dir, "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+
     prompt = "ball"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -99,7 +104,7 @@ def main():
         results[ur5e_labels[i]] = result
 
     # ========== Step 4: 保存匹配结果 ==========
-    save_path = os.path.join(aria_dir, "match_confidence_result.json")
+    save_path = os.path.join(output_dir, "match_confidence_result.json")
     with open(save_path, 'w') as f:
         json.dump(results, f, indent=4)
     print(f"[Done] Matching results saved to: {save_path}")
