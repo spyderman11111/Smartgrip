@@ -31,7 +31,7 @@ def select_frame_paths(aria_dir, ur5e_dir):
 
 
 # ========== Step 2: DINO + SAM2 特征提取 ==========
-def extract_features(image_path, prompt, dino, sam2, matcher, label_prefix):
+def extract_features(image_path, prompt, dino, sam2, matcher, label_prefix, output_dir):
     image = Image.open(image_path).convert("RGB")
     boxes, labels = dino.predict(image=image, text_prompts=prompt,
                                  box_threshold=0.25, text_threshold=0.25)
@@ -40,21 +40,37 @@ def extract_features(image_path, prompt, dino, sam2, matcher, label_prefix):
     for i, (label, box) in enumerate(zip(labels, boxes)):
         x1, y1, x2, y2 = [int(v) for v in box.tolist()]
         crop = image.crop((x1, y1, x2, y2))
-        save_path = image_path.replace(".jpg", f"_mask{i}.png")
+
+        image_base = os.path.splitext(os.path.basename(image_path))[0]
+        save_path = os.path.join(output_dir, f"{image_base}_{label_prefix.lower()}_mask{i}.png")
+
         sam2.run_on_crop(crop, save_path)
         feats = matcher.extract_features(save_path)
 
         if feats["keypoints"].shape[1] > 0:
-            return feats  # 返回第一个有效 mask 特征
+            return {
+                "features": feats,
+                "image_path": image_path,
+                "mask_path": save_path
+            }
     print(f"  - [WARN] No usable features for {label_prefix}")
     return None
 
-
 # ========== Step 3 & 4: 特征匹配并输出 ==========
-def match_and_report(feats1, feats2, label1, label2, matcher):
-    if feats1 is None or feats2 is None:
-        print(f"[MATCH {label1} vs {label2}] Skip: No features")
-        return None
+def match_and_report(aria_feats, ur5e_feats, label_ur5e, matcher):
+    if aria_feats is None or ur5e_feats is None:
+        print(f"[MATCH Aria vs {label_ur5e}] Skip: No features")
+        return {
+            "match_count": 0,
+            "avg_score": 0.0,
+            "aria_image": aria_feats["image_path"] if aria_feats else None,
+            "aria_mask": aria_feats["mask_path"] if aria_feats else None,
+            "ur5e_image": ur5e_feats["image_path"] if ur5e_feats else None,
+            "ur5e_mask": ur5e_feats["mask_path"] if ur5e_feats else None,
+        }
+
+    feats1 = aria_feats["features"]
+    feats2 = ur5e_feats["features"]
 
     result = matcher.match(feats1["keypoints"], feats1["descriptors"],
                            feats2["keypoints"], feats2["descriptors"],
@@ -64,13 +80,16 @@ def match_and_report(feats1, feats2, label1, label2, matcher):
 
     match_count = matches.shape[0]
     avg_score = scores.mean().item() if match_count > 0 else 0.0
-    print(f"[MATCH {label1} vs {label2}] Matches: {match_count}, Avg score: {avg_score:.3f}")
+    print(f"[MATCH Aria vs {label_ur5e}] Matches: {match_count}, Avg score: {avg_score:.3f}")
 
     return {
         "match_count": match_count,
-        "avg_score": round(avg_score, 6)
+        "avg_score": round(avg_score, 6),
+        "aria_image": aria_feats["image_path"],
+        "aria_mask": aria_feats["mask_path"],
+        "ur5e_image": ur5e_feats["image_path"],
+        "ur5e_mask": ur5e_feats["mask_path"],
     }
-
 
 def main():
     # ========== Step 1: 设置路径并选择图像 ==========
@@ -95,12 +114,12 @@ def main():
 
     # ========== Step 3: 提取特征 ==========
     feats_aria = extract_features(aria_img, prompt, dino, sam2, matcher, "Aria")
+
     results = {}
     ur5e_labels = ["First", "Middle", "Last"]
-
     for i, ur5e_img in enumerate(ur5e_imgs):
         feats_ur5e = extract_features(ur5e_img, prompt, dino, sam2, matcher, f"UR5e-{ur5e_labels[i]}")
-        result = match_and_report(feats_aria, feats_ur5e, "Aria", f"UR5e-{ur5e_labels[i]}", matcher)
+        result = match_and_report(feats_aria, feats_ur5e, f"UR5e-{ur5e_labels[i]}", matcher)
         results[ur5e_labels[i]] = result
 
     # ========== Step 4: 保存匹配结果 ==========
