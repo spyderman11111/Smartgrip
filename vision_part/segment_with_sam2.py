@@ -54,74 +54,44 @@ class SAM2ImagePredictorWrapper:
             return_logits=self.return_logits,
         )
 
-        mask = masks[0]  # float32, shape (H, W), values in [0, 1]
+        mask = masks[0]
         mask_uint8 = (mask * 255).astype(np.uint8)
-        mask_colored = cv2.applyColorMap(mask_uint8, cv2.COLORMAP_JET)
 
-        # 只对前景区域混合颜色
-        mask_binary = mask <= 0.5  # bool mask
-        overlay = image_np.copy()
-        for c in range(3):
-            overlay[..., c] = np.where(
-                mask_binary,
-                0.5 * image_np[..., c] + 0.5 * mask_colored[..., c],
-                image_np[..., c]
-            ).astype(np.uint8)
-
-        # 保存图像
         filename = os.path.splitext(os.path.basename(image_path))[0]
-        cv2.imwrite(os.path.join(save_dir, f"{filename}_original.jpg"), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
         cv2.imwrite(os.path.join(save_dir, f"{filename}_mask_gray.png"), mask_uint8)
-        cv2.imwrite(os.path.join(save_dir, f"{filename}_mask_color.png"), mask_colored)
-        cv2.imwrite(os.path.join(save_dir, f"{filename}_overlay.jpg"), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-
-        print(f"Saved to: {save_dir}")
-        print("Mask dtype:", mask.dtype)
-        print("Mask unique values:", np.unique(mask))
-        print(f"Mask score: {float(ious[0]):.4f}")
-        print(f"Mask shape: {mask.shape}, Low-res logits shape: {lowres[0].shape}")
 
         return {
             "mask_array": mask.astype(np.uint8),
             "mask_score": float(ious[0]),
             "low_res_mask": lowres[0],
         }
-    
+
     def run_on_crop(self, crop: Image.Image, save_path: str) -> None:
         """
-        Run segmentation on a cropped PIL image and save the overlay result.
-        Only the predicted object area will be visualized (with mask flipped).
+        Run segmentation on a cropped image and draw only the mask contour.
+        The result is saved as an RGB image.
         """
-        image_np = np.array(crop)
-        if image_np.dtype != np.uint8:
-            image_np = (image_np * 255).clip(0, 255).astype(np.uint8)
+        if crop.mode != "RGB":
+            crop = crop.convert("RGB")
 
+        image_np = np.array(crop)
         self.predictor.set_image(crop)
 
         dummy_box = np.array([0, 0, crop.width, crop.height], dtype=np.float32)
-        masks, ious, _ = self.predictor.predict(
+        masks, _, _ = self.predictor.predict(
             box=dummy_box,
             multimask_output=self.multimask_output,
             return_logits=self.return_logits,
         )
 
-        # Step 1: 反转掩码（前景为1）
         mask = masks[0]
-        mask_binary = mask <= 0.5  # SAM2原本前景为0，翻转后前景为1
+        mask_binary = (mask <= 0.5).astype(np.uint8)
 
-        # Step 2: 可视化混合图像（仅在掩码区域混合颜色）
-        mask_uint8 = (mask_binary * 255).astype(np.uint8)
-        mask_colored = cv2.applyColorMap(mask_uint8, cv2.COLORMAP_PARULA)
+        contours, _ = cv2.findContours(mask_binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         overlay = image_np.copy()
-        for c in range(3):
-            overlay[..., c] = np.where(
-                mask_binary,
-                0.5 * image_np[..., c] + 0.5 * mask_colored[..., c],
-                image_np[..., c]
-            ).astype(np.uint8)
+        cv2.drawContours(overlay, contours, -1, color=(0, 255, 0), thickness=2)
 
-        # Step 3: 保存结果
         overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
         cv2.imwrite(save_path, overlay_bgr)
 
@@ -143,8 +113,12 @@ if __name__ == "__main__":
 
     image = Image.open(image_path).convert("RGB")
     w, h = image.size
-    predictor.run_inference(
+    result = predictor.run_inference(
         image_path=image_path,
         box=(0, 0, w, h),
         save_dir=save_dir
     )
+
+    print(f"[Saved] Gray mask to: {save_dir}")
+    print(f"[Info] Mask score: {result['mask_score']:.4f}")
+    print(f"[Info] Mask shape: {result['mask_array'].shape}, dtype: {result['mask_array'].dtype}")
