@@ -62,9 +62,24 @@ class VideoFrameExtractor:
 
 
 if __name__ == "__main__":
-    extractor = VideoFrameExtractor(video_source="test_video.mp4", frame_interval=5)
-    extractor.extract_frames()
+    aria_video_path = "/home/sz/Smartgrip/vision_part/test_video/test_ball.mp4"
+    ur5e_video_path = "/home/sz/Smartgrip/vision_part/test_video/test_ball2.mp4"
 
+    aria_output_dir = "/home/sz/Smartgrip/vision_part/aria_images"
+    ur5e_output_dir = "/home/sz/Smartgrip/vision_part/ur5e_images"
 
-    # extractor = VideoFrameExtractor(video_source="0", frame_interval=10)
-    # extractor.extract_frames(max_frames=50)
+    print("\n[Start] Extracting frames from Aria video...")
+    aria_extractor = VideoFrameExtractor(
+        video_source=aria_video_path,
+        output_dir=aria_output_dir,
+        frame_interval=20
+    )
+    aria_extractor.extract_frames()
+
+    print("\n[Start] Extracting frames from UR5e video...")
+    ur5e_extractor = VideoFrameExtractor(
+        video_source=ur5e_video_path,
+        output_dir=ur5e_output_dir,
+        frame_interval=20
+    )
+    ur5e_extractor.extract_frames()
