@@ -85,20 +85,22 @@ class SAM2ImagePredictorWrapper:
         )
 
         mask = masks[0]
-        mask_binary = (mask <= 0.5).astype(np.uint8)
+        mask_binary = (mask < 0.2).astype(np.uint8)
 
         contours, _ = cv2.findContours(mask_binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 700]
 
         overlay = image_np.copy()
-        cv2.drawContours(overlay, contours, -1, color=(0, 255, 0), thickness=2)
+        cv2.drawContours(overlay, filtered_contours, -1, color=(0, 255, 0), thickness=2)
 
         overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
         cv2.imwrite(save_path, overlay_bgr)
 
 
 if __name__ == "__main__":
-    image_path = "/home/MA_SmartGrip/Smartgrip/vision_part/outputs/frame_00000.jpg"
-    save_dir = "./sam2_debug"
+    image_path = "/media/MA_SmartGrip/Data/Smartgrip/vision_part/aria_images/frame_00000.jpg"
+    save_dir = os.path.join(os.path.dirname(__file__), "sam2_debug")
     os.makedirs(save_dir, exist_ok=True)
 
     predictor = SAM2ImagePredictorWrapper(
