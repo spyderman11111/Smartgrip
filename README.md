@@ -66,6 +66,8 @@ need to change code in **lightglue.py** line 24
 ```bash
 cd vggt
 pip install -r requirements.txt
+pip install trimesh
+pip install pycolmap
 ```
 ## vision_part package Instructions
 

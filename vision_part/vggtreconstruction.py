@@ -20,16 +20,16 @@ from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
 from vggt.dependency.track_predict import predict_tracks
 from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np_matrix_to_pycolmap_wo_track
 
-
 class VGGTReconstruction:
-    def __init__(self, scene_dir: str, use_ba: bool = False, seed: int = 42, **kwargs):
-        self.scene_dir = scene_dir
-        self.image_dir = os.path.join(scene_dir, "images")
-        self.sparse_dir = os.path.join(scene_dir, "sparse")
+    def __init__(self, image_dir: str, use_ba: bool = False, seed: int = 42, batch_size: int = 4, **kwargs):
+        self.image_dir = image_dir
+        self.scene_dir = os.path.join(os.path.dirname(image_dir), os.path.basename(image_dir) + "_scene")
+        self.sparse_dir = os.path.join(self.scene_dir, "sparse")
         os.makedirs(self.sparse_dir, exist_ok=True)
 
         self.use_ba = use_ba
         self.seed = seed
+        self.batch_size = batch_size
         self.config = {
             'max_reproj_error': kwargs.get('max_reproj_error', 8.0),
             'shared_camera': kwargs.get('shared_camera', False),
@@ -62,25 +62,36 @@ class VGGTReconstruction:
 
     def run(self):
         image_paths = glob.glob(os.path.join(self.image_dir, '*'))
+        image_paths = [p for p in image_paths if p.lower().endswith(('jpg', 'jpeg', 'png'))]
         if not image_paths:
             raise FileNotFoundError(f"No images found in {self.image_dir}")
 
-        images, original_coords = load_and_preprocess_images_square(image_paths, 1024)
-        images = images.to(self.device)
-        original_coords = original_coords.to(self.device)
+        image_chunks = [image_paths[i:i + self.batch_size] for i in range(0, len(image_paths), self.batch_size)]
 
-        extrinsic, intrinsic, depth_map, depth_conf = self._run_vggt(images)
-        points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+        for chunk_idx, chunk in enumerate(image_chunks):
+            print(f"\n[INFO] Processing batch {chunk_idx + 1}/{len(image_chunks)} with {len(chunk)} images")
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
 
-        if self.use_ba:
-            reconstruction, points_rgb = self._run_ba(images, depth_conf, extrinsic, intrinsic, points_3d)
-        else:
-            reconstruction, points_rgb, points_3d = self._run_no_ba(images, depth_conf, extrinsic, intrinsic, points_3d)
+            images, original_coords = load_and_preprocess_images_square(chunk, 1024)
+            images = images.to(self.device)
+            original_coords = original_coords.to(self.device)
 
-        image_filenames = [os.path.basename(p) for p in image_paths]
-        reconstruction = self._rescale_colmap(reconstruction, image_filenames, original_coords.cpu().numpy())
-        reconstruction.write(self.sparse_dir)
-        trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(self.sparse_dir, 'points.ply'))
+            extrinsic, intrinsic, depth_map, depth_conf = self._run_vggt(images)
+            points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+
+            if self.use_ba:
+                reconstruction, points_rgb = self._run_ba(images, depth_conf, extrinsic, intrinsic, points_3d)
+            else:
+                reconstruction, points_rgb, points_3d = self._run_no_ba(images, depth_conf, extrinsic, intrinsic, points_3d)
+
+            image_filenames = [os.path.basename(p) for p in chunk]
+            reconstruction = self._rescale_colmap(reconstruction, image_filenames, original_coords.cpu().numpy())
+            reconstruction.write(self.sparse_dir)
+            trimesh.PointCloud(points_3d, colors=points_rgb).export(os.path.join(self.sparse_dir, f'points_batch{chunk_idx+1}.ply'))
+
+            print(f"[MEMORY] Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f} MB")
+            print(f"[MEMORY] Cached: {torch.cuda.memory_reserved() / 1024**2:.2f} MB")
 
     def _run_vggt(self, images, resolution=518):
         images_resized = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
@@ -158,13 +169,15 @@ class VGGTReconstruction:
             pycamera.height = real_size[1]
 
         return reconstruction
-    
+
 if __name__ == "__main__":
     reconstructor = VGGTReconstruction(
-        scene_dir="/path/to/your/project/input",  # must contain a folder named 'images/'
-        use_ba=True,
+        image_dir="/media/MA_SmartGrip/Data/Smartgrip/vision_part/ur5e_images",  # directory with images only
+        use_ba=False,
+        batch_size=4,
         camera_type="SIMPLE_PINHOLE",
-        query_frame_num=8,
+        fine_tracking=False,
+        query_frame_num=4,
         vis_thresh=0.2
     )
     reconstructor.run()
