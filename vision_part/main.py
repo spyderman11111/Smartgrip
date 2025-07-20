@@ -108,7 +108,7 @@ def match_and_report(aria_feats, ur5e_feats, label_ur5e, matcher, output_dir):
 def main():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     aria_dir = os.path.join(base_dir, "aria_images")
-    ur5e_dir = os.path.join(base_dir, "ur5e_images")
+    ur5e_dir = os.path.join(base_dir, "ur5e_images_scene", "images")
     output_dir = os.path.join(base_dir, "outputs")
     os.makedirs(output_dir, exist_ok=True)
 

@@ -64,14 +64,24 @@ def load_camera_poses(images_txt, cameras_txt, scale=0.05):
     return camera_lines
 
 
+def create_center_sphere(center, color=[1, 1, 0], radius=0.01):
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+    sphere.translate(center)
+    sphere.paint_uniform_color(color)
+    return sphere
+
+
 def visualize_colmap_scene(ply_path, txt_dir):
     vis_objs = []
 
-    # Load PLY point cloud (optional, may be sparse or denser)
+    # Load PLY point cloud
     if os.path.exists(ply_path):
         print(f"Loading PLY file: {ply_path}")
         pcd_ply = o3d.io.read_point_cloud(ply_path)
         vis_objs.append(pcd_ply)
+        pcd_for_box = pcd_ply
+    else:
+        pcd_for_box = None
 
     # Load points3D.txt
     points_txt = os.path.join(txt_dir, "points3D.txt")
@@ -79,8 +89,28 @@ def visualize_colmap_scene(ply_path, txt_dir):
         print(f"Loading COLMAP TXT point cloud: {points_txt}")
         pcd_txt = load_points3D_txt(points_txt)
         vis_objs.append(pcd_txt)
+        pcd_for_box = pcd_txt
 
-    # Load cameras (images.txt + cameras.txt)
+    # 生成两种包围盒并可视化中心点
+    if pcd_for_box is not None:
+        print("Generating bounding boxes...")
+        aabb = pcd_for_box.get_axis_aligned_bounding_box()
+        obb = pcd_for_box.get_oriented_bounding_box()
+
+        aabb.color = (1, 0, 0)  # 红色
+        obb.color = (0, 1, 0)  # 绿色
+
+        vis_objs.extend([aabb, obb])
+
+        # 中心点可视化
+        center_aabb = create_center_sphere(aabb.get_center(), color=[1, 0, 0])
+        center_obb = create_center_sphere(obb.get_center(), color=[0, 1, 0])
+        vis_objs.extend([center_aabb, center_obb])
+
+        print(f"AABB center: {aabb.get_center()}")
+        print(f"OBB center:  {obb.get_center()}")
+
+    # Load camera poses
     images_txt = os.path.join(txt_dir, "images.txt")
     cameras_txt = os.path.join(txt_dir, "cameras.txt")
     if os.path.exists(images_txt) and os.path.exists(cameras_txt):
