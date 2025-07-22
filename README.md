@@ -71,47 +71,206 @@ pip install pycolmap
 ```
 ## vision_part package Instructions
 
-**extract_frames** method, implemented in extract_frames.py, supports two modes: video file input (e.g., .mp4) and webcam stream input (e.g., '0'). It uses OpenCV to extract every N-th frame and saves them to a specified directory using the original frame index in the filename.
+### **extract_frames** 
+method, implemented in extract_frames.py, supports two modes: video file input (e.g., .mp4) and webcam stream input (e.g., '0'). It uses OpenCV to extract every N-th frame and saves them to a specified directory using the original frame index in the filename.
 
-**GroundingDinoPredictor** class performs zero-shot object detection using text prompts and returns bounding boxes and class labels from input images.
+### **GroundingDinoPredictor**
 
-**SAM2ImagePredictorWrapper** This class wraps Meta AI's SAM2 model to perform segmentation on a specified region of an input image defined by a bounding box.
+This class wraps a **GroundingDINO** model for **zero-shot object detection** using natural language prompts.
 
-**Function**
+---
 
-    Loads an RGB image and a bounding box (x1, y1, x2, y2)
+**Functionality:**
 
-    Applies the SAM2 model to predict a fine-grained mask for the specified region
+- Uses `transformers.AutoModelForZeroShotObjectDetection` and `AutoProcessor`.
+- Takes an input RGB image and a **text prompt** (e.g., `"red box"`).
+- Outputs:
+  - `boxes`: Tensor of detected bounding boxes `[x0, y0, x1, y1]`
+  - `labels`: List of matched class strings
 
-    Saves results including color mask, grayscale mask, and overlay image
+---
 
-**Output**
+**Key Parameters:**
 
-Returns a dictionary with:
+- `model_id`: Default is `"IDEA-Research/grounding-dino-tiny"`
+- `device`: `"cuda"` or `"cpu"`
+- `box_threshold`: Filter out boxes with low visual confidence
+- `text_threshold`: Filter out boxes with low textual alignment
 
-    mask_array (np.ndarray): Binary mask of shape (H, W)
+---
 
-    mask_score (float): IoU score of the predicted mask
+**Example Usage:**
 
-    low_res_mask (np.ndarray): Raw low-resolution logits, shape (256, 256)
+```python
+predictor = GroundingDinoPredictor()
+boxes, labels = predictor.predict(image, "red box")
+```
 
-## Output Description
+### **SAM2ImagePredictorWrapper**
 
-### 1. Saved Frames
+The `SAM2ImagePredictorWrapper` class wraps Meta AI's **SAM2** segmentation model to perform fine-grained mask prediction on RGB images, either using full images or cropped regions.
 
-Extracted frames are saved to the directory specified by output_dir (e.g., ../outputs).
+**Functionality:**
 
-Filenames follow the pattern:
+1. **Full Image Masking** (`run_inference`)
+   - Loads a full RGB image and a target bounding box (x1, y1, x2, y2).
+   - Predicts a segmentation mask using the SAM2 model.
+   - Saves grayscale binary mask as `*_mask_gray.png` in the specified directory.
+   - Returns a dictionary containing:
+     - `mask_array` (`np.uint8`): Binary mask of shape (H, W)
+     - `mask_score` (`float`): IoU confidence score
+     - `low_res_mask` (`np.ndarray`): Raw low-resolution logits (256×256)
 
-frame_<frame_index>.jpg
+2. **Cropped Region Contour Masking** (`run_on_crop`)
+   - Accepts a cropped RGB `PIL.Image` (e.g., extracted via a bounding box).
+   - Uses full image region as a dummy box to apply SAM2.
+   - Applies post-processing:
+     - Thresholding (`mask < 0.2`)
+     - Contour filtering by area (`> 700`)
+     - Draws filtered contours on the original crop.
+   - Saves result as an RGB image with drawn contours.
 
-### 2.  Console Output Format
+**Initialization Parameters:**
 
-Each saved frame will output detection info like:
+- `model_id` (str): Pretrained SAM2 model ID (e.g., `"facebook/sam2.1-hiera-large"`)
+- `device` (str): `"cuda"` or `"cpu"`
+- `mask_threshold` (float): Binarization threshold for masks
+- `max_hole_area` (float): Max allowed hole size in masks
+- `max_sprinkle_area` (float): Max allowed sprinkle noise in masks
+- `multimask_output` (bool): Whether to output multiple masks per input
+- `return_logits` (bool): Whether to return raw logits (used for low-resolution masks)
 
-    [Frame] frame_00220.jpg | Detected 1 ball:
-      - ball: x1=816, y1=544, x2=1076, y2=803
+### **LightGlueMatcher**
 
-x1, y1: top-left corner of the bounding box (in pixels)
+The `LightGlueMatcher` class provides a modular wrapper around LightGlue and SuperPoint for image matching tasks. It allows configurable transformer architecture and inference settings and supports feature extraction and matching with minimal code.
 
-x2, y2: bottom-right corner of the bounding box (in pixels)
+**Functionality:**
+
+1. **Feature Extraction**  
+   - Loads and normalizes an image using `load_image`.
+   - Uses `SuperPoint` to extract keypoints and descriptors.
+   - Returns a feature dictionary including:
+     - `keypoints` (Tensor): shape `[1, N, 2]`  
+     - `descriptors` (Tensor): shape `[1, N, D]`  
+     - `image_size` (Tensor): shape `[1, 2]` (width, height)
+
+2. **Feature Matching**  
+   - Accepts two sets of keypoints, descriptors, and image sizes.
+   - Feeds them to `LightGlue` for matching.
+   - Returns a dictionary including:
+     - `matches`: matched keypoint indices per image
+     - `scores`: confidence scores per match
+
+3. **Optional Compilation**  
+   - `matcher.compile("reduce-overhead")` speeds up inference via Torch 2.0 graph compilation.
+
+**Initialization Parameters:**
+
+- `feature_type` (str): Only `'superpoint'` is currently supported.
+- `device` (str): `'cuda'` or `'cpu'`
+- `descriptor_dim`, `n_layers`, `num_heads`: Transformer config
+- `flash`, `mp`: Optimization flags (e.g., FlashAttention, mixed precision)
+- `depth_confidence`, `width_confidence`, `filter_threshold`: Matching quality thresholds
+- `weights`: Path to custom pretrained weights
+
+### **vggtreconstruction**
+
+This script runs **VGGT-based monocular 3D reconstruction** and exports a **COLMAP-compatible sparse model**.
+
+---
+
+**Pipeline Overview:**
+
+1. **Load Config & Model**
+   - Uses pretrained VGGT-1B weights (auto-download).
+   - Reads images from `scene_dir/images`.
+
+2. **VGGT Inference**
+   - Predicts camera extrinsics, intrinsics, depth, and confidence.
+   - Supports `float16` / `bfloat16` based on GPU capability.
+
+3. **Point Cloud Generation**
+   - Converts depth to 3D point cloud.
+   - Applies confidence threshold and random sampling.
+
+4. **COLMAP Structure Creation**
+   - Builds `pycolmap.Reconstruction` with optional shared camera.
+   - Rescales intrinsics to match original image resolution.
+
+5. **Export**
+   - Saves:
+     - `sparse/`: COLMAP binary model + `points.ply`
+     - `sparse_txt/`: TXT model via `colmap model_converter`
+
+---
+
+## **main.py - Aria & UR5e Multi-View Object Matching Pipeline**
+
+This script performs **multi-view object detection, segmentation, feature extraction, and feature matching** between an **ARIA** glasses image and three selected **UR5e** arm camera frames. It integrates **GroundingDINO**, **SAM2**, and **LightGlue** into a complete matching pipeline.
+
+---
+
+### **Pipeline Overview**
+
+1. **Frame Selection**  
+   Function: `select_frame_paths(aria_dir, ur5e_dir)`  
+   - Randomly selects **1 frame** from ARIA camera folder  
+   - Selects **3 UR5e frames** (first, middle, last) for coverage  
+   → Input to the downstream detection pipeline
+
+2. **Model Initialization**  
+   - Loads GroundingDINO (object detection), SAM2 (segmentation), and LightGlue (feature matching).
+   - Device set automatically (`cuda` or `cpu`)  
+   → Prepares all models for zero-shot visual-language inference.
+
+3. **Object Detection + Segmentation + Feature Extraction**  
+   Function: `extract_features(...)`  
+   - Runs GroundingDINO with a text prompt (e.g., `"ball"`) to detect objects.  
+   - Crops the detected bounding box → feeds into SAM2 to generate segmentation mask.  
+   - Extracts keypoints + descriptors from the masked region using LightGlue.  
+   → For each input image (ARIA or UR5e), returns a feature dictionary.
+
+4. **Feature Matching**  
+   Function: `match_and_report(...)`  
+   - For each UR5e frame:
+     - Matches its features with ARIA features.
+     - Calculates number of matches and average score.
+     - Saves match visualization (using `draw_matches`) to output directory.
+   → Provides quantitative and qualitative comparison between views.
+
+5. **Result Export**  
+   - All match scores and image paths saved to a JSON file:  
+     `outputs/match_confidence_result.json`  
+   - Contains:
+     - match count
+     - average confidence score
+     - image and mask paths
+     - path to match visualization image
+
+---
+
+### **Step Relationships**
+
+| Step | Input | Output | Used In |
+|------|-------|--------|---------|
+| 1. select_frame_paths | image folders | ARIA frame + 3 UR5e frames | → Step 3 |
+| 2. model init | model names | loaded models | → Step 3–4 |
+| 3. extract_features | image path, prompt | features (keypoints, descriptors, image size) | → Step 4 |
+| 4. match_and_report | two feature sets | match count + scores + visual | → Step 5 |
+| 5. save result | match data dict | JSON summary | — |
+
+---
+
+### **Example Output (JSON structure)**
+
+```json
+{
+  "First": {
+    "match_count": 34,
+    "score_mean": 0.72,
+    "aria_image": "...",
+    "ur5e_image": "...",
+    "match_vis": "outputs/aria_vs_first_matches.png"
+  },
+  ...
+}
