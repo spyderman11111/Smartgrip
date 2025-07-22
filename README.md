@@ -272,5 +272,5 @@ This script performs **multi-view object detection, segmentation, feature extrac
     "ur5e_image": "...",
     "match_vis": "outputs/aria_vs_first_matches.png"
   },
-  ...
 }
+```
