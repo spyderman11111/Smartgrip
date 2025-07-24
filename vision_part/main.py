@@ -30,12 +30,15 @@ def extract_features(image_path, prompt, dino, sam2, matcher, label_prefix, outp
 
     for i, (label, box) in enumerate(zip(labels, boxes)):
         x1, y1, x2, y2 = [int(v) for v in box.tolist()]
-        crop = image.crop((x1, y1, x2, y2))
+        
+        # Use full image path and bounding box in run_inference
+        result = sam2.run_inference(
+            image_path=image_path,
+            box=(x1, y1, x2, y2),
+            save_dir=output_dir
+        )
 
-        image_base = os.path.splitext(os.path.basename(image_path))[0]
-        save_path = os.path.join(output_dir, f"{image_base}_{label_prefix.lower()}_mask{i}.png")
-
-        sam2.run_on_crop(crop, save_path)
+        save_path = result["mask_rgba_path"]
         feats = matcher.extract_features(save_path)
 
         if feats["keypoints"].shape[1] > 0:
@@ -44,9 +47,9 @@ def extract_features(image_path, prompt, dino, sam2, matcher, label_prefix, outp
                 "image_path": image_path,
                 "mask_path": save_path
             }
+
     print(f"  - [WARN] No usable features for {label_prefix}")
     return None
-
 
 def draw_matches(image1_path, kp1, image2_path, kp2, matches, save_path):
     import numpy as np  

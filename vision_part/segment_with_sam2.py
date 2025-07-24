@@ -6,6 +6,7 @@ from PIL import Image
 from typing import Tuple, Dict
 import sys
 
+# Add SAM2 package to Python path
 SAM2_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Grounded-SAM-2'))
 sys.path.append(SAM2_path)
 
@@ -23,6 +24,9 @@ class SAM2ImagePredictorWrapper:
         multimask_output: bool = False,
         return_logits: bool = False,
     ):
+        """
+        Initialize the SAM2 wrapper with model configuration.
+        """
         self.device = device
         self.multimask_output = multimask_output
         self.return_logits = return_logits
@@ -41,12 +45,20 @@ class SAM2ImagePredictorWrapper:
         box: Tuple[int, int, int, int],
         save_dir: str = "./sam2_results",
     ) -> Dict:
+        """
+        Run SAM2 inference on the given image and save outputs:
+        - gray mask (mask == 1)
+        - colored mask overlay
+        - transparent RGBA cropped mask
+        """
         os.makedirs(save_dir, exist_ok=True)
+        filename = os.path.splitext(os.path.basename(image_path))[0]
 
         image = Image.open(image_path).convert("RGB")
         image_np = np.array(image)
         self.predictor.set_image(image)
 
+        # Run SAM2 with given box
         box_array = np.array(box, dtype=np.float32)
         masks, ious, lowres = self.predictor.predict(
             box=box_array,
@@ -54,48 +66,39 @@ class SAM2ImagePredictorWrapper:
             return_logits=self.return_logits,
         )
 
-        mask = masks[0]
-        mask_uint8 = (mask * 255).astype(np.uint8)
+        # Get first mask
+        mask = masks[0].astype(bool)
 
-        filename = os.path.splitext(os.path.basename(image_path))[0]
-        cv2.imwrite(os.path.join(save_dir, f"{filename}_mask_gray.png"), mask_uint8)
+        # 1. Save gray mask
+        mask_uint8 = (mask.astype(np.uint8)) * 255
+        gray_mask_path = os.path.join(save_dir, f"{filename}_mask_gray.png")
+        cv2.imwrite(gray_mask_path, mask_uint8)
+
+        # 2. Save RGBA image with transparent background
+        mask = masks[0].astype(bool)
+        mask_3d = np.repeat(mask[:, :, np.newaxis], 3, axis=2)
+
+        rgba = np.zeros((image_np.shape[0], image_np.shape[1], 4), dtype=np.uint8)
+        rgba[:, :, :3][mask_3d] = image_np[mask_3d]
+        rgba[:, :, 3][mask] = 255
+
+        rgba_path = os.path.join(save_dir, f"{filename}_mask_rgba.png")
+        Image.fromarray(rgba, mode="RGBA").save(rgba_path)
+
+        # 3. Save overlay visualization (original + semi-transparent mask)
+        overlay = image_np.copy()
+        overlay[mask] = (overlay[mask] * 0.5 + np.array([0, 255, 0]) * 0.5).astype(np.uint8)
+        overlay_path = os.path.join(save_dir, f"{filename}_overlay.png")
+        cv2.imwrite(overlay_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
 
         return {
             "mask_array": mask.astype(np.uint8),
             "mask_score": float(ious[0]),
             "low_res_mask": lowres[0],
+            "mask_gray_path": gray_mask_path,
+            "mask_rgba_path": rgba_path,
+            "mask_overlay_path": overlay_path,
         }
-
-    def run_on_crop(self, crop: Image.Image, save_path: str) -> None:
-        """
-        Run segmentation on a cropped image and draw only the mask contour.
-        The result is saved as an RGB image.
-        """
-        if crop.mode != "RGB":
-            crop = crop.convert("RGB")
-
-        image_np = np.array(crop)
-        self.predictor.set_image(crop)
-
-        dummy_box = np.array([0, 0, crop.width, crop.height], dtype=np.float32)
-        masks, _, _ = self.predictor.predict(
-            box=dummy_box,
-            multimask_output=self.multimask_output,
-            return_logits=self.return_logits,
-        )
-
-        mask = masks[0]
-        mask_binary = (mask < 0.2).astype(np.uint8)
-
-        contours, _ = cv2.findContours(mask_binary * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) > 700]
-
-        overlay = image_np.copy()
-        cv2.drawContours(overlay, filtered_contours, -1, color=(0, 255, 0), thickness=2)
-
-        overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(save_path, overlay_bgr)
 
 
 if __name__ == "__main__":
@@ -103,6 +106,7 @@ if __name__ == "__main__":
     save_dir = os.path.join(os.path.dirname(__file__), "sam2_debug")
     os.makedirs(save_dir, exist_ok=True)
 
+    # Initialize predictor
     predictor = SAM2ImagePredictorWrapper(
         model_id="facebook/sam2.1-hiera-large",
         device="cuda" if torch.cuda.is_available() else "cpu",
@@ -113,6 +117,7 @@ if __name__ == "__main__":
         return_logits=False,
     )
 
+    # Run inference on full image
     image = Image.open(image_path).convert("RGB")
     w, h = image.size
     result = predictor.run_inference(
@@ -121,6 +126,9 @@ if __name__ == "__main__":
         save_dir=save_dir
     )
 
-    print(f"[Saved] Gray mask to: {save_dir}")
+    # Print output info
+    print(f"[Saved] Gray mask to: {result['mask_gray_path']}")
+    print(f"[Saved] Transparent RGBA to: {result['mask_rgba_path']}")
+    print(f"[Saved] Overlay visualization to: {result['mask_overlay_path']}")
     print(f"[Info] Mask score: {result['mask_score']:.4f}")
     print(f"[Info] Mask shape: {result['mask_array'].shape}, dtype: {result['mask_array'].dtype}")
