@@ -1,11 +1,14 @@
 import os
-import open3d as o3d
 import numpy as np
+import open3d as o3d
+from sklearn.cluster import DBSCAN
 
 
-def load_points3D_txt(txt_path):
-    points = []
-    colors = []
+def load_points3D_txt(txt_path: str) -> o3d.geometry.PointCloud:
+    """
+    Load COLMAP-format points3D.txt into Open3D PointCloud.
+    """
+    points, colors = [], []
     with open(txt_path, 'r') as f:
         for line in f:
             if line.startswith('#') or line.strip() == '':
@@ -21,112 +24,69 @@ def load_points3D_txt(txt_path):
     return pcd
 
 
-def load_camera_poses(images_txt, cameras_txt, scale=0.05):
-    camera_lines = []
-
-    with open(images_txt, 'r') as f:
-        lines = f.readlines()
-
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith('#') or line == '':
-            i += 1
-            continue
-
-        elems = line.split()
-        if len(elems) < 10:
-            i += 1
-            continue
-
-        qw, qx, qy, qz = map(float, elems[1:5])
-        tx, ty, tz = map(float, elems[5:8])
-        cam_pos = np.array([tx, ty, tz])
-
-        # 简单视图方向向前（Z轴）
-        forward = np.array([0, 0, scale])
-        pts = [
-            cam_pos,
-            cam_pos + np.array([scale, 0, 0]),
-            cam_pos + np.array([0, scale, 0]),
-            cam_pos + forward
-        ]
-        lineset = [[0, 1], [0, 2], [0, 3]]
-        colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-        cam_line = o3d.geometry.LineSet()
-        cam_line.points = o3d.utility.Vector3dVector(pts)
-        cam_line.lines = o3d.utility.Vector2iVector(lineset)
-        cam_line.colors = o3d.utility.Vector3dVector(colors)
-        camera_lines.append(cam_line)
-
-        i += 2  # Skip the next line (2D point list)
-
-    return camera_lines
-
-
-def create_center_sphere(center, color=[1, 1, 0], radius=0.01):
-    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+def create_center_sphere(center: np.ndarray, color=[0, 0, 0], radius=0.005) -> o3d.geometry.TriangleMesh:
+    """
+    Create a small sphere to visualize the cluster center.
+    """
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius)
     sphere.translate(center)
     sphere.paint_uniform_color(color)
     return sphere
 
 
-def visualize_colmap_scene(ply_path, txt_dir):
+def cluster_by_xyz(
+    pcd: o3d.geometry.PointCloud,
+    eps: float = 0.02,
+    min_points: int = 50,
+    voxel_size: float = 0.005
+):
+    """
+    Perform DBSCAN clustering on 3D points (only using XYZ), after voxel downsampling.
+    Returns list of (cluster point cloud, cluster center, color).
+    """
+    # Step 1: Downsample point cloud
+    pcd_down = pcd.voxel_down_sample(voxel_size)
+    points = np.asarray(pcd_down.points)
+
+    # Step 2: DBSCAN clustering
+    labels = DBSCAN(eps=eps, min_samples=min_points).fit_predict(points)
+    max_label = labels.max()
+    print(f"Found {max_label + 1} clusters")
+
+    clusters = []
+    for i in range(max_label + 1):
+        indices = np.where(labels == i)[0]
+        cluster = pcd_down.select_by_index(indices)
+        color = np.random.rand(3)
+        cluster.paint_uniform_color(color)
+        center = np.mean(np.asarray(cluster.points), axis=0)
+        clusters.append((cluster, center, color))
+    return clusters
+
+
+def visualize_clusters(pcd_path: str, eps: float, min_points: int, voxel_size: float, center_radius: float):
+    """
+    Load, cluster, and visualize 3D point cloud with cluster coloring and center spheres.
+    """
+    pcd = load_points3D_txt(pcd_path)
+    clusters = cluster_by_xyz(pcd, eps=eps, min_points=min_points, voxel_size=voxel_size)
+
     vis_objs = []
+    for i, (cluster, center, _) in enumerate(clusters):
+        vis_objs.append(cluster)
+        vis_objs.append(create_center_sphere(center, color=[0, 0, 0], radius=center_radius))
+        print(f"Cluster {i+1}: Center = {center}, Points = {len(cluster.points)}")
 
-    # Load PLY point cloud
-    if os.path.exists(ply_path):
-        print(f"Loading PLY file: {ply_path}")
-        pcd_ply = o3d.io.read_point_cloud(ply_path)
-        vis_objs.append(pcd_ply)
-        pcd_for_box = pcd_ply
-    else:
-        pcd_for_box = None
-
-    # Load points3D.txt
-    points_txt = os.path.join(txt_dir, "points3D.txt")
-    if os.path.exists(points_txt):
-        print(f"Loading COLMAP TXT point cloud: {points_txt}")
-        pcd_txt = load_points3D_txt(points_txt)
-        vis_objs.append(pcd_txt)
-        pcd_for_box = pcd_txt
-
-    # 生成两种包围盒并可视化中心点
-    if pcd_for_box is not None:
-        print("Generating bounding boxes...")
-        aabb = pcd_for_box.get_axis_aligned_bounding_box()
-        obb = pcd_for_box.get_oriented_bounding_box()
-
-        aabb.color = (1, 0, 0)  # 红色
-        obb.color = (0, 1, 0)  # 绿色
-
-        vis_objs.extend([aabb, obb])
-
-        # 中心点可视化
-        center_aabb = create_center_sphere(aabb.get_center(), color=[1, 0, 0])
-        center_obb = create_center_sphere(obb.get_center(), color=[0, 1, 0])
-        vis_objs.extend([center_aabb, center_obb])
-
-        print(f"AABB center: {aabb.get_center()}")
-        print(f"OBB center:  {obb.get_center()}")
-
-    # Load camera poses
-    images_txt = os.path.join(txt_dir, "images.txt")
-    cameras_txt = os.path.join(txt_dir, "cameras.txt")
-    if os.path.exists(images_txt) and os.path.exists(cameras_txt):
-        print("Loading camera poses...")
-        cam_lines = load_camera_poses(images_txt, cameras_txt)
-        vis_objs.extend(cam_lines)
-
-    if len(vis_objs) == 0:
-        print("Nothing to visualize.")
-        return
-
-    # Launch Open3D visualizer
     o3d.visualization.draw_geometries(vis_objs)
 
 
 if __name__ == "__main__":
-    ply_path = "/media/MA_SmartGrip/Data/Smartgrip/vision_part/ur5e_images_scene/sparse/points.ply"
-    txt_dir = "/media/MA_SmartGrip/Data/Smartgrip/vision_part/ur5e_images_scene/sparse_txt"
-    visualize_colmap_scene(ply_path, txt_dir)
+    # ===== 可调参数区域 =====
+    pcd_txt_path = "/media/MA_SmartGrip/Data/Smartgrip/vision_part/ur5e_images_scene/sparse_txt/points3D.txt"
+    voxel_size = 0.005      # 降采样体素尺寸（单位：米）
+    eps = 0.02              # DBSCAN 空间距离阈值（单位：米）
+    min_points = 50         # 聚类最小点数
+    center_radius = 0.005   # 中心球体半径
+
+    # ===== 执行入口 =====
+    visualize_clusters(pcd_txt_path, eps, min_points, voxel_size, center_radius)
