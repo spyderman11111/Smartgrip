@@ -115,7 +115,7 @@ def main():
     output_dir = os.path.join(base_dir, "outputs")
     os.makedirs(output_dir, exist_ok=True)
 
-    prompt = "ball"
+    prompt = "red cup"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     aria_img, ur5e_imgs = select_frame_paths(aria_dir, ur5e_dir)

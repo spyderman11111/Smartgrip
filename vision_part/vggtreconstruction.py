@@ -1,152 +1,184 @@
-# vggtreconstruction.py
-# Step-by-step VGGT scene reconstruction script with COLMAP model output
-
+import os
+import glob
 import random
 import numpy as np
-import glob
-import os
-import sys
-import copy
 import torch
 import torch.nn.functional as F
+import trimesh
+from pathlib import Path
+from tqdm import tqdm
+import sys
+import copy
 
 VGGT_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'vggt'))
 sys.path.append(VGGT_path)
-
-# Step 1: Import dependencies and configure environment
-import argparse
-from pathlib import Path
-import trimesh
-import pycolmap
-import subprocess
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
-from vggt.dependency.track_predict import predict_tracks
-from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np_matrix_to_pycolmap_wo_track
+from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap_wo_track
 
 
-def run_VGGT(model, images, dtype, resolution=518):
-    # Step 2: Run VGGT model to predict camera and depth
-    images = F.interpolate(images, size=(resolution, resolution), mode="bilinear", align_corners=False)
-    with torch.no_grad():
-        with torch.cuda.amp.autocast(dtype=dtype):
-            images = images[None]  # [1, B, 3, H, W]
-            aggregated_tokens_list, ps_idx = model.aggregator(images)
-        pose_enc = model.camera_head(aggregated_tokens_list)[-1]
-        extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
-        depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+class VGGTReconstructor:
+    def __init__(
+        self,
+        scene_dir: str,
+        batch_size: int = 4,
+        max_points: int = 100000,
+        resolution: int = 518,
+        seed: int = 42,
+        use_ba: bool = True,
+        max_reproj_error: float = 8.0,
+        shared_camera: bool = False,
+        camera_type: str = "SIMPLE_PINHOLE",
+        vis_thresh: float = 0.2,
+        query_frame_num: int = 8,
+        max_query_pts: int = 4096,
+        fine_tracking: bool = True,
+        conf_thresh: float = 3.5,
+        img_limit: int = None,
+    ):
+        self.scene_dir = scene_dir
+        self.batch_size = batch_size
+        self.max_points = max_points
+        self.resolution = resolution
+        self.seed = seed
+        self.shared_camera = shared_camera
+        self.camera_type = camera_type
+        self.conf_thresh = conf_thresh
+        self.img_limit = img_limit
 
-    return (
-        extrinsic.squeeze(0).cpu().numpy(),
-        intrinsic.squeeze(0).cpu().numpy(),
-        depth_map.squeeze(0).cpu().numpy(),
-        depth_conf.squeeze(0).cpu().numpy(),
-    )
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
 
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-def convert_colmap_bin_to_txt(sparse_dir, output_txt_dir):
-    # Step 5: Export COLMAP bin model to TXT format for easy downstream use
-    os.makedirs(output_txt_dir, exist_ok=True)
-    cmd = [
-        "colmap", "model_converter",
-        "--input_path", sparse_dir,
-        "--output_path", output_txt_dir,
-        "--output_type", "TXT"
-    ]
-    subprocess.run(cmd, check=True)
+        self.model = VGGT()
+        self.model.load_state_dict(torch.hub.load_state_dict_from_url(
+            "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"))
+        self.model.eval().to(self.device)
 
+    def run_model_on_batch(self, images):
+        images = F.interpolate(images, size=(self.resolution, self.resolution), mode="bilinear", align_corners=False)
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=self.dtype):
+                images = images[None]
+                aggregated_tokens_list, ps_idx = self.model.aggregator(images)
+            pose_enc = self.model.camera_head(aggregated_tokens_list)[-1]
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            depth_map, depth_conf = self.model.depth_head(aggregated_tokens_list, images, ps_idx)
+        return (
+            extrinsic.squeeze(0).cpu().numpy(),
+            intrinsic.squeeze(0).cpu().numpy(),
+            depth_map.squeeze(0).cpu().numpy(),
+            depth_conf.squeeze(0).cpu().numpy(),
+        )
 
-def rename_and_rescale(reconstruction, image_paths, original_coords, img_size, shared_camera):
-    rescale_camera = True
-    for pyimageid in reconstruction.images:
-        pyimage = reconstruction.images[pyimageid]
-        pycamera = reconstruction.cameras[pyimage.camera_id]
-        pyimage.name = image_paths[pyimageid - 1]
-        if rescale_camera:
+    def rescale_camera_info(self, reconstruction, image_paths, original_coords):
+        for pyimageid in reconstruction.images:
+            pyimage = reconstruction.images[pyimageid]
+            pycamera = reconstruction.cameras[pyimage.camera_id]
+            pyimage.name = image_paths[pyimageid - 1]
+
             pred_params = copy.deepcopy(pycamera.params)
             real_image_size = original_coords[pyimageid - 1, -2:]
-            resize_ratio = max(real_image_size) / img_size
-            pred_params = pred_params * resize_ratio
+            resize_ratio = max(real_image_size) / self.resolution
             real_pp = real_image_size / 2
+
+            pred_params = pred_params * resize_ratio
             pred_params[-2:] = real_pp
+
             pycamera.params = pred_params
-            pycamera.width = real_image_size[0]
-            pycamera.height = real_image_size[1]
-            if shared_camera:
-                rescale_camera = False
-    return reconstruction
+            pycamera.width = int(real_image_size[0])
+            pycamera.height = int(real_image_size[1])
 
+            if self.shared_camera:
+                break
+        return reconstruction
 
-def main():
-    # Step 1: Set configuration parameters
-    class Args:
-        scene_dir = "/media/MA_SmartGrip/Data/Smartgrip/vision_part/ur5e_images_scene"
-        use_ba = False
-        seed = 42
-        max_reproj_error = 8.0
-        shared_camera = False
-        camera_type = "SIMPLE_PINHOLE"
-        vis_thresh = 0.2
-        query_frame_num = 8
-        max_query_pts = 4096
-        fine_tracking = True
-        conf_thres_value = 5.0
-    args = Args()
+    def run(self):
+        image_dir = os.path.join(self.scene_dir, "images")
+        image_paths = sorted(glob.glob(os.path.join(image_dir, "*")))
+        if self.img_limit is not None:
+            image_paths = image_paths[:self.img_limit]
+        base_names = [os.path.basename(p) for p in image_paths]
 
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+        all_points, all_colors, all_coords = [], [], []
+        all_extrinsics, all_intrinsics = [], []
+        all_image_names, all_original_coords = [], []
 
-    # Step 2: Load VGGT model
-    model = VGGT()
-    model.load_state_dict(torch.hub.load_state_dict_from_url("https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"))
-    model.eval().to(device)
+        for i in tqdm(range(0, len(image_paths), self.batch_size)):
+            batch_paths = image_paths[i:i + self.batch_size]
+            image_names = base_names[i:i + self.batch_size]
 
-    # Step 3: Load images
-    image_dir = os.path.join(args.scene_dir, "images")
-    image_path_list = sorted(glob.glob(os.path.join(image_dir, "*")))[:3]
-    base_image_names = [os.path.basename(p) for p in image_path_list]
-    images, original_coords = load_and_preprocess_images_square(image_path_list, 1024)
-    images = images.to(device)
+            images, original_coords = load_and_preprocess_images_square(batch_paths, 1024)
+            images = images.to(self.device)
 
-    # Step 4: VGGT inference to COLMAP structure
-    extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype)
-    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+            extrinsics, intrinsics, depth_map, depth_conf = self.run_model_on_batch(images)
+            points_3d = unproject_depth_map_to_point_map(depth_map, extrinsics, intrinsics)
 
-    mask = depth_conf >= args.conf_thres_value
-    mask = randomly_limit_trues(mask, 100000)
-    points_3d = points_3d[mask]
-    images_resized = F.interpolate(images, size=(518, 518), mode="bilinear", align_corners=False)
-    rgb = (images_resized.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)[mask]
-    coords = create_pixel_coordinate_grid(*points_3d.shape[:3])[mask]
+            mask = depth_conf >= self.conf_thresh
+            mask = randomly_limit_trues(mask, self.max_points)
 
-    reconstruction = batch_np_matrix_to_pycolmap_wo_track(
-        points_3d, coords, rgb, extrinsic, intrinsic,
-        np.array([518, 518]), shared_camera=args.shared_camera,
-        camera_type=args.camera_type)
+            images_resized = F.interpolate(images, size=(self.resolution, self.resolution), mode="bilinear", align_corners=False)
+            rgb = (images_resized.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)[mask]
+            num_frames, _, H, W = images_resized.shape
+            coords = create_pixel_coordinate_grid(num_frames, H, W)[mask]
 
-    reconstruction = rename_and_rescale(
-        reconstruction, base_image_names, original_coords.cpu().numpy(),
-        img_size=518, shared_camera=args.shared_camera)
+            all_points.append(points_3d[mask])
+            all_colors.append(rgb)
+            all_coords.append(coords)
+            all_extrinsics.append(extrinsics)
+            all_intrinsics.append(intrinsics)
+            all_image_names.extend(image_names)
+            all_original_coords.append(original_coords.cpu().numpy())
 
-    # Step 5: Save results to disk
-    sparse_dir = os.path.join(args.scene_dir, "sparse")
-    sparse_txt_dir = os.path.join(args.scene_dir, "sparse_txt")
-    os.makedirs(sparse_dir, exist_ok=True)
-    reconstruction.write(sparse_dir)
-    trimesh.PointCloud(points_3d, colors=rgb).export(os.path.join(sparse_dir, "points.ply"))
-    convert_colmap_bin_to_txt(sparse_dir, sparse_txt_dir)
+        all_points = np.concatenate(all_points, axis=0)
+        all_colors = np.concatenate(all_colors, axis=0)
+        all_coords = np.concatenate(all_coords, axis=0)
+        all_extrinsics = np.concatenate(all_extrinsics, axis=0)
+        all_intrinsics = np.concatenate(all_intrinsics, axis=0)
+        all_original_coords = np.concatenate(all_original_coords, axis=0)
 
-    print("Reconstruction saved in:", sparse_dir)
-    print("TXT format exported to:", sparse_txt_dir)
+        image_size = np.array([self.resolution, self.resolution])
+        reconstruction = batch_np_matrix_to_pycolmap_wo_track(
+            all_points, all_coords, all_colors,
+            all_extrinsics, all_intrinsics,
+            image_size=image_size,
+            shared_camera=self.shared_camera,
+            camera_type=self.camera_type
+        )
 
+        reconstruction = self.rescale_camera_info(
+            reconstruction,
+            all_image_names,
+            all_original_coords
+        )
 
+        sparse_dir = os.path.join(self.scene_dir, "sparse")
+        sparse_txt_dir = os.path.join(self.scene_dir, "sparse_txt")
+        os.makedirs(sparse_dir, exist_ok=True)
+        os.makedirs(sparse_txt_dir, exist_ok=True)
+
+        reconstruction.write(sparse_dir)
+        reconstruction.write_text(sparse_txt_dir)
+        trimesh.PointCloud(all_points, colors=all_colors).export(os.path.join(sparse_dir, "points.ply"))
+
+        print("[Done] COLMAP bin saved to:", sparse_dir)
+        print("[Done] TXT export saved to:", sparse_txt_dir)
+        
 if __name__ == "__main__":
+    reconstructor = VGGTReconstructor(
+        scene_dir="/media/MA_SmartGrip/Data/Smartgrip/vision_part/ur5e_images_scene",
+        batch_size=4,
+        max_points=100000,
+        resolution=518,
+        conf_thresh=3.5,
+        img_limit=None
+    )
     with torch.no_grad():
-        main()
+        reconstructor.run()
