@@ -277,6 +277,8 @@ This script performs **multi-view object detection, segmentation, feature extrac
 # ROS2 command
 
 ```bash
+source install/setup.bash
+
 ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.11 launch_rviz:=true
 #Do not use vscode from app installer! Just install vscode from deb package.
 
