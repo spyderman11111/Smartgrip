@@ -3,3 +3,6 @@ outputs/
 __pycache__/
 ur5e_images_scene/
 aria_images/
+build/
+install/
+log/
