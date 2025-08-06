@@ -1,0 +1,26 @@
+image_width: 2500
+image_height: 1532
+camera_name: my_camera/pylon_ros2_camera_node
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [2674.38037,    0.     ,  954.59221,
+            0.     , 2667.42113, 1074.96595,
+            0.     ,    0.     ,    1.     ]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-0.130098, 0.067932, 0.017127, -0.011330, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1., 0., 0.,
+         0., 1., 0.,
+         0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [2577.14087,    0.     ,  919.70325,    0.     ,
+            0.     , 2594.39014, 1091.32195,    0.     ,
+            0.     ,    0.     ,    1.     ,    0.     ]

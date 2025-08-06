@@ -282,7 +282,19 @@ source install/setup.bash
 ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.11 launch_rviz:=true
 #Do not use vscode from app installer! Just install vscode from deb package.
 
+ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e launch_rviz:=true robot_ip:=192.168.0.11
+
 ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
 
-ros2 launch pylon_ros2_camera_wrapper my_blaze.launch.py
+ros2 run pylon_ros2_camera pylon_ros2_camera_node \
+  --ros-args \
+  -p camera_info_url:=file:///home/MA_SmartGrip/calib_result/ost.yaml
+
+
 ```
+ros2 run camera_calibration cameracalibrator \
+    --size 7x10 \
+    --square 0.2 \
+    --ros-args \
+    --remap image:=/my_camera/pylon_ros2_camera_node/image_raw \
+    --remap camera:=/my_camera/pylon_ros2_camera_node
