@@ -298,3 +298,8 @@ ros2 run camera_calibration cameracalibrator \
     --ros-args \
     --remap image:=/my_camera/pylon_ros2_camera_node/image_raw \
     --remap camera:=/my_camera/pylon_ros2_camera_node
+
+ros2 run xacro xacro \
+  /home/MA_SmartGrip/Smartgrip/ros2_ws/src/vision_to_ros/robot_description/ur.urdf.xacro \
+  ur_type:=ur5e name:=ur5e \
+  > /home/MA_SmartGrip/Smartgrip/ros2_ws/src/vision_to_ros/robot_description/ur5e_robot.urdf
