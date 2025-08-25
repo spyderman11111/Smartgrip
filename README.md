@@ -281,16 +281,11 @@ source install/setup.bash
 
 conda deactivate
 
-ros2 launch ur_robot_driver ur_control.launch.py \
-  ur_type:=ur5e \
-  robot_ip:=192.168.0.11 \
-  description_package:=my_ur5e_description \
-  description_file:=ur5e_with_camera.urdf.xacro \
-  launch_rviz:=true
+ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.11 launch_rviz:=true
 
 #Do not use vscode from app installer! Just install vscode from deb package.
 
-ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e launch_rviz:=true robot_ip:=192.168.0.11
+ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e launch_rviz:=true
 
 ros2 launch ur_moveit_config ur_moveit.launch.py \
   ur_type:=ur5e \
