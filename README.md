@@ -294,6 +294,9 @@ ros2 launch ur_moveit_config ur_moveit.launch.py \
   description_file:=ur5e_with_camera.urdf.xacro \
   launch_rviz:=true
 
+ros2 control switch_controllers \
+  --activate scaled_joint_trajectory_controller \
+  --deactivate joint_trajectory_controller
 
 ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
 
@@ -314,3 +317,20 @@ ros2 run xacro xacro \
   /home/MA_SmartGrip/Smartgrip/ros2_ws/src/vision_to_ros/robot_description/ur.urdf.xacro \
   ur_type:=ur5e name:=ur5e \
   > /home/MA_SmartGrip/Smartgrip/ros2_ws/src/vision_to_ros/robot_description/ur5e_robot.urdf
+
+
+ros2 topic pub --once /scaled_joint_trajectory_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{
+  header: {stamp: {sec: 0, nanosec: 0}},
+  joint_names: [
+    'shoulder_pan_joint',
+    'shoulder_lift_joint',
+    'elbow_joint',
+    'wrist_1_joint',
+    'wrist_2_joint',
+    'wrist_3_joint'
+  ],
+  points: [{
+    positions: [0.9298571348, -1.3298700166, 1.9266884963, -2.1331087552, -1.6006286780, -1.0919039885],
+    time_from_start: {sec: 3, nanosec: 0}
+  }]
+}"
