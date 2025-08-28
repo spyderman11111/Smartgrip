@@ -10,8 +10,8 @@ from tqdm import tqdm
 import sys
 import copy
 
-VGGT_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'vggt'))
-sys.path.append(VGGT_path)
+# VGGT_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'vggt'))
+# sys.path.append(VGGT_path)
 
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square

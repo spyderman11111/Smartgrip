@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'seeanything = gripanything.seeanything:main'
+            'seeanything_demo = gripanything.seeanything_demo:main'
         ],
     },
 )
