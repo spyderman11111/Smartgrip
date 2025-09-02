@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Virtual Top-Down Locator + GroundingDINO（无直线下探版）
+Virtual Top-Down Locator + GroundingDINO（无直线下探版 + 发布物体TF）
 - 从图像检测目标 -> (u,v) -> 射线与虚拟平面求交 -> 计算 P_top（物体上方）
+- 发布 TF: base_frame -> object_1_position（位于物体中心 C，姿态与 base 对齐）
 - 末端姿态保持与虚拟平面平行（-Z_tool // +Z_base）
 - 可选：仅规划/执行到 P_top（不做笛卡尔直线下探）
 - 启动后先发送一次“初始观察位姿”（关节角）到 joint_trajectory 控制器
 """
 
 # ===================== 可随时修改的“初始观察位姿”与发送函数 ======================
-# 关节名称（UR5e）
 JOINT_NAMES = [
     'shoulder_pan_joint',
     'shoulder_lift_joint',
@@ -18,14 +18,9 @@ JOINT_NAMES = [
     'wrist_2_joint',
     'wrist_3_joint',
 ]
-
-# 初始观察位姿（弧度），按照上面的顺序
 POS1 = [0.9298571348, -1.3298700166, 1.9266884963, -2.1331087552, -1.6006286780, -1.0919039885]
-
-# 发送到的轨迹话题与移动时间
 JOINT_TRAJ_TOPIC = '/scaled_joint_trajectory_controller/joint_trajectory'
 INIT_MOVE_TIME = 3.0  # 秒
-
 # ===========================================================================
 
 import math
@@ -38,7 +33,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.parameter import Parameter
 from rclpy.duration import Duration as RclDuration
 
-from geometry_msgs.msg import PointStamped, PoseStamped, Pose
+from geometry_msgs.msg import PointStamped, PoseStamped, Pose, TransformStamped
 from std_msgs.msg import Header
 from sensor_msgs.msg import CameraInfo, Image
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -170,6 +165,9 @@ class VirtualTopdownNode(Node):
         self.declare_parameter('box_threshold', 0.25)
         self.declare_parameter('text_threshold', 0.25)
 
+        # 新增：物体 TF 名称（可在 main() 覆盖）
+        self.declare_parameter('object_frame', 'object_1_position')
+
         # 读参数
         g = self.get_parameter
         self.use_ci = g('use_camera_info').value
@@ -196,6 +194,7 @@ class VirtualTopdownNode(Node):
         self.dino_device = g('dino_device').value
         self.box_th = float(g('box_threshold').value)
         self.text_th = float(g('text_threshold').value)
+        self.object_frame = g('object_frame').value
 
         # 内参缓存
         self.K = np.array([[self.fx, 0, self.cx],
@@ -208,6 +207,7 @@ class VirtualTopdownNode(Node):
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=RclDuration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)  # 新增：用于发布物体 TF
 
         # MoveIt（仅用于到 P_top 的一次规划）
         if self.execute:
@@ -237,13 +237,13 @@ class VirtualTopdownNode(Node):
 
         # 关节轨迹发布器（初始观察位姿）
         self.traj_pub = self.create_publisher(JointTrajectory, JOINT_TRAJ_TOPIC, 10)
-        # 启动后稍等一下发一次初始位姿，避免控制器未就绪
         self._init_pose_sent = False
         self.create_timer(0.8, self._send_initial_once)
 
         self.get_logger().info(
             f"[VTDown] z_virt={self.z_virt:.3f}, h_above={self.h_above:.3f}; "
-            f"use_camera_info={self.use_ci}, image_topic={self.image_topic}, prompt='{self.text_prompt}', execute={self.execute}"
+            f"use_camera_info={self.use_ci}, image_topic={self.image_topic}, prompt='{self.text_prompt}', execute={self.execute}, "
+            f"object_frame='{self.object_frame}'"
         )
         self._busy = False
 
@@ -304,7 +304,7 @@ class VirtualTopdownNode(Node):
             return
         self._process_uv(float(msg.point.x), float(msg.point.y), msg.header.stamp)
 
-    # ---------------- 主流程：像素 -> 射线 -> 求交 -> 发布/执行 ----------------
+    # ---------------- 主流程：像素 -> 射线 -> 求交 -> 发布/执行/发TF ----------------
     def _process_uv(self, u: float, v: float, stamp):
         # TF: base<-tool at stamp
         try:
@@ -382,7 +382,21 @@ class VirtualTopdownNode(Node):
         ps_pre.pose.orientation.x, ps_pre.pose.orientation.y, ps_pre.pose.orientation.z, ps_pre.pose.orientation.w = qx, qy, qz, qw
         self.pub_p_pre.publish(ps_pre)
 
-        self.get_logger().info(f"(u,v)=({u:.1f},{v:.1f})  C=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f})  P_top=({P_top[0]:.3f},{P_top[1]:.3f},{P_top[2]:.3f})")
+        # 新增：发布物体 TF（位于 C，姿态与 base 对齐）
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()   # 用当前时间，RViz 更容易对齐
+        t.header.frame_id = self.base_frame
+        t.child_frame_id = self.object_frame
+        t.transform.translation.x = float(C[0])
+        t.transform.translation.y = float(C[1])
+        t.transform.translation.z = float(C[2])
+        t.transform.rotation.x = 0.0
+        t.transform.rotation.y = 0.0
+        t.transform.rotation.z = 0.0
+        t.transform.rotation.w = 1.0
+        self.tf_broadcaster.sendTransform(t)
+
+        self.get_logger().info(f"(u,v)=({u:.1f},{v:.1f})  C=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f})  P_top=({P_top[0]:.3f},{P_top[1]:.3f},{P_top[2]:.3f})  -> TF:{self.object_frame}")
 
         # 执行：仅到 P_top（不做直线下探）
         if self.execute:
@@ -430,7 +444,6 @@ def main():
     # —— 相机内参（作为回退；若订阅到 /camera_info 会覆盖）——
     fx, fy = 2674.38037, 2667.42113
     cx, cy = 954.59221, 1074.96595
-    # 如果你的图像是 rect 后的，可考虑改用投影矩阵 P 的参数：2577.14087, 2594.39014, 919.70325, 1091.32195
 
     overrides = [
         # 图像 + DINO
@@ -468,6 +481,9 @@ def main():
         Parameter('execute',             value=False),
         Parameter('max_vel_scale',       value=0.2),
         Parameter('max_acc_scale',       value=0.2),
+
+        # 新增：物体 TF 名称
+        Parameter('object_frame',        value='object_position'),
     ]
 
     node = VirtualTopdownNode(parameter_overrides=overrides)
