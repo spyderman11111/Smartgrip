@@ -60,7 +60,6 @@ def publish_trajectory(node: Node, pub, positions, move_time: float):
     node.get_logger().info(f'已发送关节目标: {positions}')
 
 
-# ---- 直接在此文件内提供一个“seeanything_demo”包装，内部调用 vggtreconstruction ----
 import torch
 from gripanything.core.vggtreconstruction import VGGTReconstructor
 
