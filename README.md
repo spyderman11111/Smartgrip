@@ -1,10 +1,11 @@
 # Setting Up the Environment
 
 ```bash
-conda activate smartgrip
+python3.10 -m venv ~/Smartgrip/py310 --system-site-packages
+source ~/Smartgrip/py310/bin/activate
 ```
 
-You can create a new conda environment at will, I am using python version 3.11
+You can create a new environment at will, I am using python version **3.10**, don't use conda!
 
 ---
 
@@ -69,6 +70,11 @@ pip install -r requirements.txt
 pip install trimesh
 pip install pycolmap
 ```
+
+colcon build --symlink-install \
+  --cmake-args -DPYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" \
+  --cmake-force-configure
+
 ## vision_part package Instructions
 
 ### **extract_frames** 
@@ -303,7 +309,10 @@ ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
 ros2 run pylon_ros2_camera pylon_ros2_camera_node \
   --ros-args \
   -p camera_info_url:=file:///home/MA_SmartGrip/calib_result/ost.yaml
-
+  
+export SETUPTOOLS_USE_DISTUTILS=stdlib
+python -m colcon build --packages-select gripanything --symlink-install \
+  --cmake-args -DPYTHON_EXECUTABLE="$(which python)" -DPython3_EXECUTABLE="$(which python)"
 
 ```
 ros2 run camera_calibration cameracalibrator \

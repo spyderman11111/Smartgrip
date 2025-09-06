@@ -1,12 +1,35 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Virtual Top-Down Locator + GroundingDINO（无直线下探版 + 发布物体TF）
-- 从图像检测目标 -> (u,v) -> 射线与虚拟平面求交 -> 计算 P_top（物体上方）
-- 发布 TF: base_frame -> object_1_position（位于物体中心 C，姿态与 base 对齐）
-- 末端姿态保持与虚拟平面平行（-Z_tool // +Z_base）
-- 可选：仅规划/执行到 P_top（不做笛卡尔直线下探）
-- 启动后先发送一次“初始观察位姿”（关节角）到 joint_trajectory 控制器
+Virtual Top-Down Locator + GroundingDINO
+
+流程概述：
+  - 从图像检测目标 -> 得到像素 (u, v)
+  - 在相机系下构造视线方向 d_cam_cam，并变换到 base 系 d_cam_base
+  - 用 base 系下的“虚拟平面” z = z_virt（法向 n = +Z_base）与视线求交 -> 得到交点 C_base
+  - 计算上方点 P_top = C_base + h_above * n，并发布 /p_top、/p_pre
+  - 发布 TF: base_frame -> object_frame（位于 C_base，姿态与 base 对齐，单位四元数）
+  - 末端姿态保持与虚拟平面平行（-Z_tool // +Z_base）
+
+坐标与变换记号（本文件统一采用）：
+  B = base_frame（默认 'base_link'）
+  T = tool_frame（默认 'tool0'）
+  C = camera（手眼外参：tool->cam）
+  O = object_frame（目标物体的 TF，姿态与 B 对齐）
+
+  R_parent_child, p_parent_child 的含义：
+    - R_parent_child ∈ SO(3)：把 child 向量表达式变到 parent（v_parent = R_parent_child @ v_child）
+    - p_parent_child ∈ R^3：child 原点在 parent 系下的坐标
+
+  常用组合关系：
+    T^B_T = (R_base_tool, p_base_tool)          # TF: base <- tool
+    T^T_C = (R_tool_cam, p_tool_cam)            # 外参: tool -> cam
+    T^B_C = T^B_T ∘ T^T_C = (R_base_tool @ R_tool_cam,
+                             R_base_tool @ p_tool_cam + p_base_tool)
+    逆变换：
+    T^C_B = (R_cam_base, p_cam_base) = inverse(T^B_C)
+
+  物体 TF：
+    T^B_O = (R_base_obj, p_base_obj) = (I, C_base)      # 姿态与 base 对齐
+    T^C_O = T^C_B ∘ T^B_O = (R_cam_base @ I, R_cam_base @ (p_base_obj - p_base_cam))
 """
 
 # ===================== 可随时修改的“初始观察位姿”与发送函数 ======================
@@ -33,7 +56,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from rclpy.parameter import Parameter
 from rclpy.duration import Duration as RclDuration
 
-from geometry_msgs.msg import PointStamped, PoseStamped, Pose, TransformStamped
+from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped
 from std_msgs.msg import Header
 from sensor_msgs.msg import CameraInfo, Image
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -79,7 +102,7 @@ def publish_trajectory(node: Node, pub, positions: List[float], move_time: float
     node.get_logger().info(f'已发送关节目标（初始观察位姿）: {np.round(positions, 3).tolist()}')
 
 
-# ---------------------------- 基础数学 ---------------------------- #
+# ---------------------------- 旋转/四元数工具 ---------------------------- #
 def rpy_to_rot(r: float, p: float, y: float) -> np.ndarray:
     cr, sr = math.cos(r), math.sin(r)
     cp, sp = math.cos(p), math.sin(p)
@@ -134,6 +157,45 @@ def rot_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
     return (x/n, y/n, z/n, w/n)
 
 
+# ---------------------------- 变换(R,p)工具 ---------------------------- #
+def tfmsg_to_Rp(transform: TransformStamped) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    将 geometry_msgs/TransformStamped 转为 (R_parent_child, p_parent_child)
+    其中 parent = transform.header.frame_id, child = transform.child_frame_id
+    满足：v_parent = R_parent_child @ v_child
+         p_parent_child = child原点在parent系下坐标
+    """
+    q = transform.transform.rotation
+    t = transform.transform.translation
+    x, y, z, w = q.x, q.y, q.z, q.w
+    R_parent_child = np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
+        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
+    ], dtype=float)
+    p_parent_child = np.array([t.x, t.y, t.z], dtype=float)
+    return R_parent_child, p_parent_child
+
+def compose_Rp(R_ab: np.ndarray, p_ab: np.ndarray,
+               R_bc: np.ndarray, p_bc: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    复合变换：T^A_C = T^A_B ∘ T^B_C
+      R_ac = R_ab @ R_bc
+      p_ac = R_ab @ p_bc + p_ab
+    """
+    R_ac = R_ab @ R_bc
+    p_ac = R_ab @ p_bc + p_ab
+    return R_ac, p_ac
+
+def invert_Rp(R_ab: np.ndarray, p_ab: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    逆变换：T^B_A = (R_ab^T, -R_ab^T @ p_ab)
+    """
+    R_ba = R_ab.T
+    p_ba = -R_ba @ p_ab
+    return R_ba, p_ba
+
+
 # ---------------------------- 主节点 ---------------------------- #
 class VirtualTopdownNode(Node):
     def __init__(self, **node_kwargs):
@@ -165,7 +227,7 @@ class VirtualTopdownNode(Node):
         self.declare_parameter('box_threshold', 0.25)
         self.declare_parameter('text_threshold', 0.25)
 
-        # 新增：物体 TF 名称（可在 main() 覆盖）
+        # 物体 TF 名称（可在 main() 覆盖）
         self.declare_parameter('object_frame', 'object_1_position')
 
         # 读参数
@@ -207,7 +269,7 @@ class VirtualTopdownNode(Node):
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=RclDuration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)  # 新增：用于发布物体 TF
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)  # 发布物体 TF
 
         # MoveIt（仅用于到 P_top 的一次规划）
         if self.execute:
@@ -306,59 +368,74 @@ class VirtualTopdownNode(Node):
 
     # ---------------- 主流程：像素 -> 射线 -> 求交 -> 发布/执行/发TF ----------------
     def _process_uv(self, u: float, v: float, stamp):
-        # TF: base<-tool at stamp
+        """
+        记号：
+          B = base_frame，T = tool_frame，C = camera。
+          平面为 B 系下 z = z_virt，法向 n_base = [0,0,1]^T。
+
+        组合关系：
+          T^B_T = (R_base_tool, p_base_tool)   # TF: base <- tool
+          T^T_C = (R_tool_cam, p_tool_cam)     # 外参: tool -> cam
+          T^B_C = T^B_T ∘ T^T_C = (R_base_tool @ R_tool_cam,
+                                   R_base_tool @ p_tool_cam + p_base_tool)
+        """
+        # 1) TF: base <- tool at stamp
         try:
-            T_base_tool = self.tf_buffer.lookup_transform(self.base_frame, self.tool_frame, rclpy.time.Time.from_msg(stamp))
+            T_base_tool_msg = self.tf_buffer.lookup_transform(
+                self.base_frame, self.tool_frame, rclpy.time.Time.from_msg(stamp)
+            )
         except TransformException as ex:
             self.get_logger().warn(f'TF 未就绪: {ex}')
             return
+        R_base_tool, p_base_tool = tfmsg_to_Rp(T_base_tool_msg)
 
-        R_bt, t_bt = self._tf_to_R_t(T_base_tool)
-
-        # 外参：tool->cam（优先 quat）
-        if self.t_tool_cam_quat is not None and not np.allclose(self.t_tool_cam_quat, [0,0,0,1.0]):
-            R_tc = quat_to_rot(*self.t_tool_cam_quat.tolist())
+        # 2) 手眼外参：tool -> cam（优先 quat）
+        if self.t_tool_cam_quat is not None and not np.allclose(self.t_tool_cam_quat, [0, 0, 0, 1.0]):
+            R_tool_cam = quat_to_rot(*self.t_tool_cam_quat.tolist())
         else:
-            R_tc = rpy_to_rot(*self.t_tool_cam_rpy.tolist())
-        t_tc = self.t_tool_cam_xyz
+            R_tool_cam = rpy_to_rot(*self.t_tool_cam_rpy.tolist())
+        p_tool_cam = self.t_tool_cam_xyz
 
-        # base 下的相机位姿
-        R_bc = R_bt @ R_tc
-        t_bc = R_bt @ t_tc + t_bt
+        # 3) 相机在 base 下的位姿：T^B_C
+        R_base_cam, p_base_cam = compose_Rp(R_base_tool, p_base_tool, R_tool_cam, p_tool_cam)
 
-        # (u,v) -> 归一化相机坐标（优先使用畸变去除）
+        # 4) 像素 -> 相机归一化光线（先去畸变，再归一化）
         if self.D is not None and self.dist_model in (None, '', 'plumb_bob', 'rational_polynomial'):
             pts = np.array([[[u, v]]], dtype=np.float32)
             undist = cv2.undistortPoints(pts, self.K, self.D, P=None)  # -> 1x1x2
-            x, y = float(undist[0,0,0]), float(undist[0,0,1])
-            r_cam = np.array([x, y, 1.0], dtype=float)
+            x_n, y_n = float(undist[0, 0, 0]), float(undist[0, 0, 1])
+            d_cam_cam = np.array([x_n, y_n, 1.0], dtype=float)  # C 系方向
         else:
-            x = (u - self.cx) / self.fx
-            y = (v - self.cy) / self.fy
-            r_cam = np.array([x, y, 1.0], dtype=float)
+            x_n = (u - self.cx) / self.fx
+            y_n = (v - self.cy) / self.fy
+            d_cam_cam = np.array([x_n, y_n, 1.0], dtype=float)
 
-        r_cam /= np.linalg.norm(r_cam)
-        r_base = R_bc @ r_cam
-        r_base /= np.linalg.norm(r_base)
-        o = t_bc
+        d_cam_cam /= np.linalg.norm(d_cam_cam)
+        d_cam_base = R_base_cam @ d_cam_cam        # 方向变换到 B 系
+        d_cam_base /= np.linalg.norm(d_cam_base)
+        o_base = p_base_cam                         # 光心 O 的 B 系坐标
 
-        rz = float(r_base[2])
+        # 5) 与虚拟平面（B 系下 z = z_virt）求交
+        n_base = np.array([0.0, 0.0, 1.0], dtype=float)
+        rz = float(d_cam_base[2])
         if abs(rz) < 1e-6:
             self.get_logger().warn('视线近水平（|r_z|≈0），无法与虚拟平面求交。')
             return
-        t_star = (self.z_virt - float(o[2])) / rz
+
+        t_star = (self.z_virt - float(o_base[2])) / rz
         if t_star < 0:
             self.get_logger().warn('平面交点在相机后方（t<0），忽略。')
             return
 
-        C = o + t_star * r_base  # base 下物体中心
-        n = np.array([0.0, 0.0, 1.0], dtype=float)
-        P_top = C + self.h_above * n
-        P_pre = P_top + self.approach_clearance * n  # 仍发布供可视化
+        C_base = o_base + t_star * d_cam_base  # 交点（物体中心）in B
 
-        # 末端姿态：-Z_tool // +Z_base
-        z_tool_in_base = -n
-        x_tool_in_base = np.array([1.0, 0.0, 0.0])
+        # 6) 计算上方点（用于执行/可视化）
+        P_top_base = C_base + self.h_above * n_base
+        P_pre_base = P_top_base + self.approach_clearance * n_base  # 仅可视化
+
+        # 7) 末端期望姿态：-Z_tool // +Z_base
+        z_tool_in_base = -n_base
+        x_tool_in_base = np.array([1.0, 0.0, 0.0])  # 任意与 z 不共线的单位向量
         y_tool_in_base = np.cross(z_tool_in_base, x_tool_in_base)
         if np.linalg.norm(y_tool_in_base) < 1e-6:
             x_tool_in_base = np.array([0.0, 1.0, 0.0])
@@ -366,39 +443,53 @@ class VirtualTopdownNode(Node):
         x_tool_in_base /= np.linalg.norm(x_tool_in_base)
         y_tool_in_base /= np.linalg.norm(y_tool_in_base)
         z_tool_in_base /= np.linalg.norm(z_tool_in_base)
-        R_des = np.column_stack((x_tool_in_base, y_tool_in_base, z_tool_in_base))
-        qx, qy, qz, qw = rot_to_quat(R_des)
+        R_base_tool_des = np.column_stack((x_tool_in_base, y_tool_in_base, z_tool_in_base))
+        qx, qy, qz, qw = rot_to_quat(R_base_tool_des)
 
-        # 发布 P_top / P_pre（供可视化/调试）
+        # 8) 发布 P_top / P_pre（B 系）
         ps_top = PoseStamped()
         ps_top.header = Header(stamp=stamp, frame_id=self.base_frame)
-        ps_top.pose.position.x, ps_top.pose.position.y, ps_top.pose.position.z = float(P_top[0]), float(P_top[1]), float(P_top[2])
+        ps_top.pose.position.x, ps_top.pose.position.y, ps_top.pose.position.z = map(float, P_top_base)
         ps_top.pose.orientation.x, ps_top.pose.orientation.y, ps_top.pose.orientation.z, ps_top.pose.orientation.w = qx, qy, qz, qw
         self.pub_p_top.publish(ps_top)
 
         ps_pre = PoseStamped()
         ps_pre.header = Header(stamp=stamp, frame_id=self.base_frame)
-        ps_pre.pose.position.x, ps_pre.pose.position.y, ps_pre.pose.position.z = float(P_pre[0]), float(P_pre[1]), float(P_pre[2])
+        ps_pre.pose.position.x, ps_pre.pose.position.y, ps_pre.pose.position.z = map(float, P_pre_base)
         ps_pre.pose.orientation.x, ps_pre.pose.orientation.y, ps_pre.pose.orientation.z, ps_pre.pose.orientation.w = qx, qy, qz, qw
         self.pub_p_pre.publish(ps_pre)
 
-        # 新增：发布物体 TF（位于 C，姿态与 base 对齐）
+        # 9) 发布物体 TF（T^B_O）：位置在 C_base，姿态与 B 对齐
+        R_base_obj = np.eye(3)
+        p_base_obj = C_base.copy()
+
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()   # 用当前时间，RViz 更容易对齐
         t.header.frame_id = self.base_frame
         t.child_frame_id = self.object_frame
-        t.transform.translation.x = float(C[0])
-        t.transform.translation.y = float(C[1])
-        t.transform.translation.z = float(C[2])
+        t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, p_base_obj)
         t.transform.rotation.x = 0.0
         t.transform.rotation.y = 0.0
         t.transform.rotation.z = 0.0
         t.transform.rotation.w = 1.0
         self.tf_broadcaster.sendTransform(t)
 
-        self.get_logger().info(f"(u,v)=({u:.1f},{v:.1f})  C=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f})  P_top=({P_top[0]:.3f},{P_top[1]:.3f},{P_top[2]:.3f})  -> TF:{self.object_frame}")
+        # 10)（可选）推导相机->基座、相机->物体的变换，便于你调试/打印
+        R_cam_base, p_cam_base = invert_Rp(R_base_cam, p_base_cam)                    # T^C_B
+        R_cam_obj,  p_cam_obj  = compose_Rp(R_cam_base, p_cam_base, R_base_obj, p_base_obj)  # T^C_O
 
-        # 执行：仅到 P_top（不做直线下探）
+        self.get_logger().info(
+            f"(u,v)=({u:.1f},{v:.1f})  "
+            f"C_base=({C_base[0]:.3f},{C_base[1]:.3f},{C_base[2]:.3f})  "
+            f"P_top=({P_top_base[0]:.3f},{P_top_base[1]:.3f},{P_top_base[2]:.3f})  "
+            f"-> TF:{self.object_frame}"
+        )
+        # 如需查看这些变换，可取消下行注释：
+        # self.get_logger().info(f"R_base_cam=\n{R_base_cam}\np_base_cam={p_base_cam}")
+        # self.get_logger().info(f"R_cam_base=\n{R_cam_base}\np_cam_base={p_cam_base}")
+        # self.get_logger().info(f"R_cam_obj=\n{R_cam_obj}\np_cam_obj={p_cam_obj}")
+
+        # 11) 可选执行：移动到 P_top（不做直线下探）
         if self.execute:
             try:
                 self._go_to_pose(ps_top)
@@ -418,20 +509,6 @@ class VirtualTopdownNode(Node):
         self.move_group.stop()
         self.move_group.clear_pose_targets()
 
-    # ---------------- TF 工具 ----------------
-    @staticmethod
-    def _tf_to_R_t(transform) -> Tuple[np.ndarray, np.ndarray]:
-        q = transform.transform.rotation
-        t = transform.transform.translation
-        x, y, z, w = q.x, q.y, q.z, q.w
-        R = np.array([
-            [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
-            [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-            [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
-        ], dtype=float)
-        t_vec = np.array([t.x, t.y, t.z], dtype=float)
-        return R, t_vec
-
 
 # ---------------------------- 入口：集中配置参数（按需随时改） ---------------------------- #
 def main():
@@ -450,58 +527,9 @@ def main():
         Parameter('image_topic',         value='/image_raw'),
         Parameter('text_prompt',         value='object'),
         Parameter('dino_model_id',       value='IDEA-Research/grounding-dino-tiny'),
-        Parameter('dino_device',         value='cuda'),    # 无 GPU 改 'cpu'
+        Parameter('dino_device',         value='cuda'),    
         Parameter('box_threshold',       value=0.25),
         Parameter('text_threshold',      value=0.25),
 
         # 相机内参（回退）
         Parameter('use_camera_info',     value=True),
-        Parameter('camera_info_topic',   value='/camera_info'),
-        Parameter('fx',                  value=float(fx)),
-        Parameter('fy',                  value=float(fy)),
-        Parameter('cx',                  value=float(cx)),
-        Parameter('cy',                  value=float(cy)),
-
-        # 手眼外参（优先 quat）
-        Parameter('t_tool_cam_xyz',      value=t_xyz),
-        Parameter('t_tool_cam_quat',     value=q),
-
-        # 坐标系与末端
-        Parameter('base_frame',          value='base_link'),
-        Parameter('tool_frame',          value='tool0'),
-        Parameter('group_name',          value='ur_manipulator'),
-        Parameter('eef_link',            value='tool0'),
-
-        # 虚拟平面与高度
-        Parameter('z_virt',              value=0.0),
-        Parameter('h_above',             value=0.30),
-        Parameter('approach_clearance',  value=0.10),
-
-        # 执行与限速（仅到 P_top）
-        Parameter('execute',             value=False),
-        Parameter('max_vel_scale',       value=0.2),
-        Parameter('max_acc_scale',       value=0.2),
-
-        # 新增：物体 TF 名称
-        Parameter('object_frame',        value='object_position'),
-    ]
-
-    node = VirtualTopdownNode(parameter_overrides=overrides)
-
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if _HAS_MOVEIT and getattr(node, 'execute', False):
-            try:
-                node.move_group.stop()
-                node.move_group.clear_pose_targets()
-            except Exception:
-                pass
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == '__main__':
-    main()
