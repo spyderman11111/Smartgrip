@@ -23,9 +23,9 @@ def generate_launch_description():
                               description='Child frame id'),
 
         # 下面 8 个默认值就是你提供的 hand_eye_calibration
-        DeclareLaunchArgument('x',  default_value='0.05468636852374024'),
-        DeclareLaunchArgument('y',  default_value='-0.029182661943126947'),
-        DeclareLaunchArgument('z',  default_value='0.05391824813032688'),
+        DeclareLaunchArgument('x',  default_value='-0.000006852374024'),
+        DeclareLaunchArgument('y',  default_value='-0.099182661943126947'),
+        DeclareLaunchArgument('z',  default_value='0.02391824813032688'),
         DeclareLaunchArgument('qx', default_value='-0.0036165657530785695'),
         DeclareLaunchArgument('qy', default_value='-0.000780788838366878'),
         DeclareLaunchArgument('qz', default_value='0.7078681983794892'),

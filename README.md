@@ -309,7 +309,7 @@ ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
 ros2 run pylon_ros2_camera pylon_ros2_camera_node \
   --ros-args \
   -p camera_info_url:=file:///home/MA_SmartGrip/calib_result/ost.yaml
-  
+
 export SETUPTOOLS_USE_DISTUTILS=stdlib
 python -m colcon build --packages-select gripanything --symlink-install \
   --cmake-args -DPYTHON_EXECUTABLE="$(which python)" -DPython3_EXECUTABLE="$(which python)"
@@ -343,3 +343,24 @@ ros2 topic pub --once /scaled_joint_trajectory_controller/joint_trajectory traje
     time_from_start: {sec: 3, nanosec: 0}
   }]
 }"
+
+
+header:
+  stamp:
+    sec: 1757332639
+    nanosec: 363394422
+  frame_id: base_link
+name:
+- shoulder_lift_joint
+- elbow_joint
+- wrist_1_joint
+- wrist_2_joint
+- wrist_3_joint
+- shoulder_pan_joint
+position:
+- -1.2545607549003144
+- 1.2091739813434046
+- -1.488419310455658
+- -1.5398953596698206
+- -0.6954544226275843
+- 0.9004912376403809
