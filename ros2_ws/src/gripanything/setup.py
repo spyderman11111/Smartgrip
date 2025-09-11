@@ -27,6 +27,7 @@ setup(
         'console_scripts': [
             'seeanything = gripanything.seeanything:main',
             'seeanything_demo = gripanything.seeanything_demo:main',
+            'goto_p_top = gripanything.goto_p_top:main',
         ],
     },
 )

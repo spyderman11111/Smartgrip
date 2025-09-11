@@ -1,0 +1,124 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "1 Open ROS2 shell (sourced)",
+      "type": "shell",
+      "options": {
+        "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
+        "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+      },
+      "command": "source /home/MA_SmartGrip/Smartgrip/py310/bin/activate && source /opt/ros/humble/setup.bash && source install/setup.bash && exec bash -l",
+      "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "focus": true,
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+
+    {
+    "label": "2 Colcon build: gripanything (py310)",
+    "type": "shell",
+    "options": {
+        "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
+        "env": {
+        "SETUPTOOLS_USE_DISTUTILS": "stdlib"
+        },
+        "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+    },
+    "command": "source /home/MA_SmartGrip/Smartgrip/py310/bin/activate && source /opt/ros/humble/setup.bash && python -m colcon build --packages-select gripanything --symlink-install --cmake-args -DPYTHON_EXECUTABLE=$(which python) -DPython3_EXECUTABLE=$(which python); echo \"[task] Build finished with exit code $?\"; exec bash -l",
+    "problemMatcher": [],
+    "group": { "kind": "build", "isDefault": true },
+    "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "focus": true,
+        "clear": false
+    }
+    },
+
+    {
+  "label": "3 Launch camera_tf",
+  "type": "shell",
+  "options": {
+    "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
+    "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+  },
+  "command": "source /home/MA_SmartGrip/Smartgrip/py310/bin/activate && source /opt/ros/humble/setup.bash && source install/setup.bash && ros2 launch gripanything camera_tf.launch.py",
+  "problemMatcher": [],
+  "presentation": { "panel": "dedicated", "reveal": "always", "focus": true }
+    },
+
+    {
+  "label": "4 Run: Pylon ROS2 Camera",
+  "type": "shell",
+  "options": {
+    "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
+    "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+  },
+  "command": "source /opt/ros/humble/setup.bash && ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py; echo \"[task] pylon camera exited with code $?\"; exec bash -l",
+  "problemMatcher": [],
+  "presentation": {
+    "panel": "dedicated",
+    "reveal": "always",
+    "focus": true,
+    "clear": false
+  }
+    },
+
+    {
+    "label": "5 Run: UR driver + RViz",
+    "type": "shell",
+    "options": {
+        "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
+        "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+    },
+    "command": "ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.11 launch_rviz:=true",
+    "problemMatcher": [],
+    "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "focus": true,
+        "clear": false
+    }
+    },
+
+    {
+    "label": "6 Run: moveit",
+    "type": "shell",
+    "options": {
+        "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
+        "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+    },
+    "command": "ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e launch_rviz:=true",
+    "problemMatcher": [],
+    "presentation": {
+        "panel": "dedicated",
+        "reveal": "always",
+        "focus": true,
+        "clear": false
+    }
+    },
+
+    {
+  "label": "7 Move to Init Observation Pose",
+  "type": "shell",
+  "options": {
+    "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
+    "shell": { "executable": "/bin/bash", "args": ["-lc"] }
+  },
+  "command": "source /opt/ros/humble/setup.bash\nros2 topic pub --once /scaled_joint_trajectory_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory '{ header: {stamp: {sec: 0, nanosec: 0}}, joint_names: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint], points: [{ positions: [0.9004912376, -1.2545607549, 1.2091739813, -1.4884193104, -1.5398953597, -0.6954544226], time_from_start: {sec: 3, nanosec: 0} }] }'\nexec bash -l",
+  "problemMatcher": [],
+  "presentation": {
+    "panel": "dedicated",
+    "reveal": "always",
+    "focus": true,
+    "clear": false
+  }
+}
+
+
+  ]
+}

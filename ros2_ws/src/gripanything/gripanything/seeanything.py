@@ -46,7 +46,7 @@ POS1 = [0.9004912376403809, -1.2545607549003144, 1.2091739813434046,
 JOINT_TRAJ_TOPIC = '/scaled_joint_trajectory_controller/joint_trajectory'
 INIT_MOVE_TIME = 3.0  # 秒
 
-# ====== 你的 GroundingDinoPredictor（严格复用你给的模块与调用方式）======
+# ====== GroundingDinoPredictor======
 try:
     from gripanything.core.detect_with_dino import GroundingDinoPredictor
 except ImportError:
@@ -55,7 +55,7 @@ except ImportError:
     from gripanything.core.detect_with_dino import GroundingDinoPredictor
 
 
-# ====== 配置（可按需修改默认值）======
+# ====== 配置 ======
 @dataclass(frozen=True)
 class Config:
     # 话题名
@@ -80,15 +80,15 @@ class Config:
 
     # 虚拟平面与高度
     Z_VIRT: float = 0.0          # base 下工作面高度
-    H_ABOVE: float = 0.30        # 物体上方点高度
+    H_ABOVE: float = 0.50        # 物体上方点高度
     APPROACH_CLEARANCE: float = 0.10
 
     # DINO 参数
     TEXT_PROMPT: str = "yellow object ."
     DINO_MODEL_ID: str = 'IDEA-Research/grounding-dino-tiny'
     DINO_DEVICE: str = 'cuda'
-    BOX_THRESHOLD: float = 0.20
-    TEXT_THRESHOLD: float = 0.20
+    BOX_THRESHOLD: float = 0.25
+    TEXT_THRESHOLD: float = 0.25
 
     # 手眼外参（tool->cam）
     T_TOOL_CAM_XYZ: List[float] = (-0.000006852374024, -0.099182661943126947, 0.02391824813032688)
