@@ -17,28 +17,7 @@
       },
       "problemMatcher": []
     },
-
-    {
-    "label": "2 Colcon build: gripanything (py310)",
-    "type": "shell",
-    "options": {
-        "cwd": "/home/MA_SmartGrip/Smartgrip/ros2_ws",
-        "env": {
-        "SETUPTOOLS_USE_DISTUTILS": "stdlib"
-        },
-        "shell": { "executable": "/bin/bash", "args": ["-lc"] }
-    },
-    "command": "source /home/MA_SmartGrip/Smartgrip/py310/bin/activate && source /opt/ros/humble/setup.bash && python -m colcon build --packages-select gripanything --symlink-install --cmake-args -DPYTHON_EXECUTABLE=$(which python) -DPython3_EXECUTABLE=$(which python); echo \"[task] Build finished with exit code $?\"; exec bash -l",
-    "problemMatcher": [],
-    "group": { "kind": "build", "isDefault": true },
-    "presentation": {
-        "panel": "dedicated",
-        "reveal": "always",
-        "focus": true,
-        "clear": false
-    }
-    },
-
+ 
     {
   "label": "3 Launch camera_tf",
   "type": "shell",
