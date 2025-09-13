@@ -10,8 +10,9 @@ seeanything_minimal.py — GroundingDINO + 虚拟平面投影 (object_position �
 与虚拟平面 z = Z_VIRT 求交 -> C_base
 发布 TF: object_position（姿态与 base 对齐）
 
-可视化（新增）：
+可视化（含置信度）：
 - 一旦检测到目标，弹出窗口展示画框与置信度；关闭脚本时窗口自动退出。
+- 日志中逐条打印：#idx  label  score  bbox
 """
 
 from dataclasses import dataclass
@@ -203,7 +204,7 @@ class SeeAnythingMinimal(Node):
         self.use_latest_tf_on_fail = bool(g('use_latest_tf_on_fail').value)
 
         # TF 与 DINO
-        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
+        self.tf_buffer = tf2_ros.Buffer(cache_time=RclDuration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.predictor = GroundingDinoPredictor(self.model_id, self.device)
@@ -221,7 +222,7 @@ class SeeAnythingMinimal(Node):
         )
 
         # 内参缓存
-        self._have_K = False
+        self._have_K = not self.use_ci  # 若不用 /camera_info，则直接认为已就绪
         self._busy = False
         self.D = None
         self.dist_model: Optional[str] = None
@@ -266,38 +267,66 @@ class SeeAnythingMinimal(Node):
             rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
             pil = PILImage.fromarray(rgb)
 
-            # 2) DINO 预测（兼容两种返回：boxes,labels 或 boxes,scores,labels）
+            # 2) DINO 预测（兼容三种返回格式）
             out = self.predictor.predict(
                 pil, self.text_prompt, box_threshold=self.box_th, text_threshold=self.text_th
             )
             if isinstance(out, tuple) and len(out) == 3:
-                boxes, scores, labels = out
+                # 新版：boxes, labels, scores  —— 或者 boxes, scores, labels
+                # 做一次位置判断，避免库顺序差异
+                a, b, c = out
+                if hasattr(b, 'shape') or (isinstance(b, list) and b and hasattr(b[0], 'item')):
+                    # b 更像张量/数值 → 当 scores
+                    boxes, scores, labels = a, b, c
+                else:
+                    boxes, labels, scores = a, b, c
             elif isinstance(out, tuple) and len(out) == 2:
                 boxes, labels = out
                 scores = [None] * len(boxes)
             else:
-                # 最保守兼容：假设是 list[dict]
+                # 最保守兼容：list[dict]
                 try:
-                    boxes = [o['box'] for o in out]
-                    scores = [o.get('score') for o in out]
-                    labels = [o.get('label', '') for o in out]
+                    boxes = [o['boxes'] if 'boxes' in o else o['box'] for o in out]
+                    scores = [o.get('scores') if 'scores' in o else o.get('score') for o in out]
+                    labels = [o.get('labels') if 'labels' in o else o.get('label', '') for o in out]
                 except Exception:
                     self.get_logger().warn('DINO 返回格式不支持。')
                     return
 
-            if len(boxes) == 0:
+            n = len(boxes)
+            if n == 0:
                 self.get_logger().info('未检测到目标。')
-                # 若之前有窗口也继续显示最近一帧；这里不强制关闭
                 return
 
-            # 3) 画框调试图（BGR）
+            # 3) 打印每个检测的 label / score / bbox
+            lines = []
+            for i, b in enumerate(boxes):
+                x0, y0, x1, y1 = (b.tolist() if hasattr(b, 'tolist') else list(b))
+                conf = None
+                if scores is not None and len(scores) > i and scores[i] is not None:
+                    try:
+                        conf = float(scores[i])
+                    except Exception:
+                        conf = None
+                if conf is None and i < len(labels):
+                    conf = parse_conf(labels[i])
+                tag = labels[i] if i < len(labels) else ''
+                if conf is not None:
+                    lines.append(f"  #{i}: {tag}  score={conf:.3f}  box=[{x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f}]")
+                else:
+                    lines.append(f"  #{i}: {tag}  score=?     box=[{x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f}]")
+            self.get_logger().info("DINO detections:\n" + "\n".join(lines))
+
+            # 4) 绘制调试图
             dbg = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
-            H, W = dbg.shape[:2]
-            u = v = None
-            # 画全部框
             for i, b in enumerate(boxes):
                 x0, y0, x1, y1 = map(int, b.tolist() if hasattr(b, 'tolist') else list(b))
-                conf = scores[i]
+                conf = None
+                if scores is not None and len(scores) > i and scores[i] is not None:
+                    try:
+                        conf = float(scores[i])
+                    except Exception:
+                        conf = None
                 if conf is None and i < len(labels):
                     conf = parse_conf(labels[i])
                 tag = labels[i] if i < len(labels) else ''
@@ -307,13 +336,13 @@ class SeeAnythingMinimal(Node):
                 cv2.putText(dbg, tag, (x0, max(0, y0 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-            # 4) 以第一个框为目标（保持原逻辑）
-            x0, y0, x1, y1 = boxes[0].tolist() if hasattr(boxes[0], 'tolist') else boxes[0]
+            # 5) 以第一个框为目标（保持原逻辑）
+            x0, y0, x1, y1 = (boxes[0].tolist() if hasattr(boxes[0], 'tolist') else boxes[0])
             u = 0.5 * (x0 + x1)
             v = 0.5 * (y0 + y1)
             cv2.circle(dbg, (int(round(u)), int(round(v))), 4, (0, 0, 255), -1)
 
-            # 5) (u,v) -> 光学系单位视线 d_cam_opt
+            # 6) (u,v) -> 光学系单位视线 d_cam_opt
             if self.D is not None and self.dist_model in (None, '', 'plumb_bob', 'rational_polynomial'):
                 pts = np.array([[[u, v]]], dtype=np.float32)
                 K = np.array([[self.fx, 0, self.cx],
@@ -327,7 +356,7 @@ class SeeAnythingMinimal(Node):
             d_cam_opt = np.array([x_n, y_n, 1.0], dtype=float)
             d_cam_opt /= np.linalg.norm(d_cam_opt)
 
-            # 6) 相机位姿：优先走 base <- tool0 <- cam（手眼外参）
+            # 7) 相机位姿：优先走 base <- tool0 <- cam（手眼外参）
             t_img = rclpy.time.Time.from_msg(msg.header.stamp)
             if self.use_tool_extrinsic:
                 try:
@@ -370,11 +399,10 @@ class SeeAnythingMinimal(Node):
                 d_base /= np.linalg.norm(d_base)
                 o_base = p_base_clink
 
-            # 7) 与 z=Z_VIRT 求交
+            # 8) 与 z=Z_VIRT 求交
             rz = float(d_base[2])
             if abs(rz) < 1e-6:
                 self.get_logger().warn('视线近水平（|d_z|≈0），无法与虚拟平面求交。')
-                # 仍展示可视化
             else:
                 t_star = (self.z_virt - float(o_base[2])) / rz
                 if t_star >= 0:
@@ -399,7 +427,7 @@ class SeeAnythingMinimal(Node):
                         f"uv=({u:.1f},{v:.1f})  object=({C_base[0]:.3f},{C_base[1]:.3f},{C_base[2]:.3f})"
                     )
 
-            # 8) 弹窗显示
+            # 9) 弹窗显示
             self._ensure_window()
             if self._win_created:
                 cv2.imshow(self._win_name, dbg)
