@@ -1,5 +1,5 @@
 source /home/MA_SmartGrip/Smartgrip/py310/bin/activate
-
+source install/setup.bash 
 ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
 
 export SETUPTOOLS_USE_DISTUTILS=stdlib
@@ -20,37 +20,23 @@ ros2 run gripanything seeanything_demo
 
 ros2 run gripanything goto_hover_once --ros-args \
   -p object_frame:=object_position \
-  -p pose_frame:=base_link \
+  -p pose_frame:=base_link \ros
   -p hover_above:=0.30 \
   -p yaw_deg:=0.0 \
   -p ik_timeout:=2.0 \
   -p move_time:=3.0
 
----
-header:
-  stamp:
-    sec: 1757949080
-    nanosec: 989252914
-  frame_id: base_link
-name:
-- shoulder_lift_joint
-- elbow_joint
-- wrist_1_joint
-- wrist_2_joint
-- wrist_3_joint
-- shoulder_pan_joint
-position:
-- -1.186562405233719
-- 1.1997712294207972
-- -1.5745235882201136
-- -1.5696094671832483
-- -0.579871956502096
-- 0.9239029288291931
-effort:
-- -3.7297627925872803
-- -2.2732200622558594
-- -0.4983561635017395
-- 0.018187813460826874
-- -0.005302319303154945
-- -0.0032134205102920532
----
+ros2 topic pub --once /scaled_joint_trajectory_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{
+  joint_names: [
+    'shoulder_pan_joint',
+    'shoulder_lift_joint',
+    'elbow_joint',
+    'wrist_1_joint',
+    'wrist_2_joint',
+    'wrist_3_joint'
+  ],
+  points: [{
+    positions: [0.9239029288291931, -1.186562405233719, 1.1997712294207972, -1.5745235882201136, -1.5696094671832483, -0.579871956502096],
+    time_from_start: {sec: 3, nanosec: 0}
+  }]
+}"

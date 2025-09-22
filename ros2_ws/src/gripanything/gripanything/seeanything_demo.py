@@ -13,8 +13,8 @@ seeanything_minimal_clean.py — GroundingDINO + 虚拟平面投影（稳健版�
 
 # ====== 快速误差补偿（默认启用，X/Y 各 +0.15 m；Z 不补偿） ======
 ENABLE_BASE_BIAS = True
-BIAS_BASE_X = -0.15   # +X 前/右，单位米
-BIAS_BASE_Y = -0.25   # +Y 左/侧，单位米
+BIAS_BASE_X = -0.10   # +X 前/右，单位米
+BIAS_BASE_Y = -0.15   # +Y 左/侧，单位米
 BIAS_BASE_Z = 0.00   # Z 平面误差（通常为 0）
 
 from typing import Optional, Tuple, List
@@ -55,7 +55,7 @@ T_TOOL_CAM_QUAT = np.array([-0.0036165657530785695, -0.000780788838366878,
 HAND_EYE_FRAME  = 'optical'   # 'optical' 或 'link'
 
 # DINO
-TEXT_PROMPT    = 'yellow object .'
+TEXT_PROMPT    = 'orange object .'
 DINO_MODEL_ID  = 'IDEA-Research/grounding-dino-tiny'
 DINO_DEVICE    = 'cuda'
 BOX_THRESHOLD  = 0.25

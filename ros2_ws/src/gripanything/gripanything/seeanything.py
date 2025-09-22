@@ -2,139 +2,134 @@
 # -*- coding: utf-8 -*-
 
 """
-seeanything.py — GroundingDINO + Virtual Top-Down Locator（无直线下探版 + 发布物体TF）
-订阅相机图像 -> 调用 GroundingDinoPredictor -> 取首个检测框中心 (u,v)
--> 相机光线在 base 下与虚拟平面 z=z_virt 求交 -> 得到 C_base
--> 计算上方点 P_top / P_pre，发布 Pose 与 TF
--> 发布调试图像（框、标签、中心点）
+seeanything_center_then_hover.py
+阶段1：DINO 检测 -> 仅平移使目标居中（保持当前姿态 + 高度，纯 XY，可叠加微调 BIAS）
+阶段2：再次检测 -> 发布 object_position（含可选 XY/Z 硬补偿）-> 悬停到目标上方（末端朝下，可选 yaw）
+
+新增：
+- 启动即发布“初始位姿”（你提供的关节角），等待到位后再开始阶段1。
+- 阶段1平移引入 BASE 下 XY 微调 BIAS（方便手动微调居中行为）。
+
+前置：
+- MoveIt 已启动且 /compute_ik 可用（仅阶段1/2用 IK；初始位姿直接发关节轨迹，不用 IK）
+- 控制器 /scaled_joint_trajectory_controller/joint_trajectory 可用
 """
 
-from dataclasses import dataclass
-import math
-from typing import Tuple, List, Optional
+from typing import Optional, Tuple, Dict, List
 import numpy as np
+import math
+import cv2
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.duration import Duration as RclDuration
+from rclpy.time import Time
+from builtin_interfaces.msg import Duration
 
-from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped
-from std_msgs.msg import Header
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import Image, JointState
+from geometry_msgs.msg import TransformStamped, PoseStamped
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from builtin_interfaces.msg import Duration as MsgDuration
 
 import tf2_ros
 from tf2_ros import TransformException
-
 from cv_bridge import CvBridge
-import cv2
 from PIL import Image as PILImage
 
-# ====== 关节与初始化运动 ======
-JOINT_NAMES = [
-    'shoulder_pan_joint',
-    'shoulder_lift_joint',
-    'elbow_joint',
-    'wrist_1_joint',
-    'wrist_2_joint',
-    'wrist_3_joint',
+from moveit_msgs.srv import GetPositionIK
+
+
+# ========= 误差补偿（用于阶段2的 object_position）=========
+ENABLE_BASE_BIAS = True
+BIAS_BASE_X =  0.00
+BIAS_BASE_Y =  0.00
+BIAS_BASE_Z =  0.00
+
+# ========= 阶段1平移的微调 BIAS（在 BASE 下的 XY，默认打开，便于微调）=========
+ENABLE_CENTER_BIAS = True
+BIAS_CENTER_X = -0.10   # +X 物体在相机画面更靠右，通常需要把相机往 +X 走
+BIAS_CENTER_Y = -0.10   # +Y 物体在相机画面更靠上，通常需要把相机往 +Y 走
+
+# ========= 基本配置 =========
+IMAGE_TOPIC = '/my_camera/pylon_ros2_camera_node/image_raw'
+BASE_FRAME   = 'base_link'
+TOOL_FRAME   = 'tool0'
+OBJECT_FRAME = 'object_position'
+Z_VIRT       = 0.0   # 工作面高度
+
+# 相机内参（像素系）
+FX = 2674.3803723910564
+FY = 2667.4211254043507
+CX = 954.5922081613583
+CY = 1074.965947832258
+
+# 手眼外参：tool <- camera_(optical or link)
+T_TOOL_CAM_XYZ  = np.array([-0.000006852374024, -0.099182661943126947, 0.02391824813032688], dtype=float)
+T_TOOL_CAM_QUAT = np.array([-0.0036165657530785695, -0.000780788838366878,
+                            0.7078681983794892, 0.7063348529868249], dtype=float)
+HAND_EYE_FRAME  = 'optical'   # 'optical' 或 'link'
+
+# DINO
+TEXT_PROMPT    = 'yellow object .'
+DINO_MODEL_ID  = 'IDEA-Research/grounding-dino-tiny'
+DINO_DEVICE    = 'cuda'
+BOX_THRESHOLD  = 0.25
+TEXT_THRESHOLD = 0.25
+
+# 运行时开关
+TF_TIME_MODE         = 'latest'   # 'image' | 'latest'
+FRAME_STRIDE         = 2
+DEBUG_WINDOW         = False
+DRAW_BEST_BOX        = False
+DEBUG_HZ             = 5.0
+TF_REBROADCAST_HZ    = 20.0
+FLIP_X               = False
+FLIP_Y               = False
+
+# 悬停/IK 与控制
+POSE_FRAME           = 'base_link'
+GROUP_NAME           = 'ur_manipulator'
+IK_LINK_NAME         = 'tool0'
+HOVER_ABOVE          = 0.30
+YAW_DEG              = 0.0
+IK_SERVICE_EXPLICIT  = ''
+IK_TIMEOUT_SEC       = 2.0
+CONTROLLER_TOPIC     = '/scaled_joint_trajectory_controller/joint_trajectory'
+MOVE_TIME_SEC        = 3.0
+
+# /joint_states 作为 IK 种子
+REQUIRE_JS               = True
+JS_WAIT_TIMEOUT_SEC      = 2.0
+FALLBACK_ZERO_IF_TIMEOUT = False
+ZERO_SEED                = [0, 0, 0, 0, 0, 0]
+JS_RELIABILITY           = 'reliable'  # reliable / best_effort
+
+# 居中阶段运动收敛等待（粗略按时间）
+CENTER_SETTLE_EXTRA_SEC  = 0.3  # 轨迹时长外再等一点点
+# 可选限制“单次平移步长”，None 表示不限制
+MAX_CENTER_XY_STEP: Optional[float] = None  # 例如 0.25
+
+# ========= 启动初始位姿（新增）=========
+INIT_AT_START = True
+UR5E_ORDER = [
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
 ]
-POS1 = [0.9004912376403809, -1.2545607549003144, 1.2091739813434046,
-        -1.488419310455658, -1.5398953596698206, -0.6954544226275843]
-JOINT_TRAJ_TOPIC = '/scaled_joint_trajectory_controller/joint_trajectory'
-INIT_MOVE_TIME = 3.0  # 秒
+INIT_POS = [
+    0.9239029288291931,
+   -1.186562405233719,
+    1.1997712294207972,
+   -1.5745235882201136,
+   -1.5696094671832483,
+   -0.579871956502096,
+]
+INIT_MOVE_TIME_SEC = 3.0
+INIT_EXTRA_WAIT_SEC = 0.3  # 给控制器一点缓冲
 
-# ====== GroundingDinoPredictor======
-try:
-    from gripanything.core.detect_with_dino import GroundingDinoPredictor
-except ImportError:
-    import sys
-    sys.path.append('/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything')
-    from gripanything.core.detect_with_dino import GroundingDinoPredictor
-
-
-# ====== 配置 ======
-@dataclass(frozen=True)
-class Config:
-    # 话题名
-    IMAGE_TOPIC: str = '/my_camera/pylon_ros2_camera_node/image_raw'
-    CAMERA_INFO_TOPIC: str = '/my_camera/pylon_ros2_camera_node/camera_info'
-    DEBUG_IMAGE_TOPIC: str = '/seeanything/debug_image'
-
-    # CameraInfo
-    USE_CAMERA_INFO: bool = True
-
-    # 内参（无 /camera_info 时作为回退）
-    FX: float = 2674.3803723910564
-    FY: float = 2667.4211254043507
-    CX: float = 954.5922081613583
-    CY: float = 1074.965947832258
-
-    # 坐标系
-    BASE_FRAME: str = 'base_link'
-    TOOL_FRAME: str = 'tool0'
-    EEF_LINK: str = 'tool0'
-    GROUP_NAME: str = 'ur_manipulator'
-
-    # 虚拟平面与高度
-    Z_VIRT: float = 0.0          # base 下工作面高度
-    H_ABOVE: float = 0.50        # 物体上方点高度
-    APPROACH_CLEARANCE: float = 0.10
-
-    # DINO 参数
-    TEXT_PROMPT: str = "yellow object ."
-    DINO_MODEL_ID: str = 'IDEA-Research/grounding-dino-tiny'
-    DINO_DEVICE: str = 'cuda'
-    BOX_THRESHOLD: float = 0.25
-    TEXT_THRESHOLD: float = 0.25
-
-    # 手眼外参（tool->cam）
-    T_TOOL_CAM_XYZ: List[float] = (-0.000006852374024, -0.099182661943126947, 0.02391824813032688)
-    T_TOOL_CAM_QUAT: List[float] = (-0.0036165657530785695, -0.000780788838366878,
-                                    0.7078681983794892, 0.7063348529868249)  # [qx, qy, qz, qw]
-
-    # 物体 TF 名称
-    OBJECT_FRAME: str = 'object_position'
-
-    # 启动一次性发送初始观察位姿
-    SEND_INIT_POSE: bool = True
-
-    # TF 对齐策略
-    USE_LATEST_TF_ON_FAIL: bool = True   # 对应时间不可用时，是否回退最新 TF
-    STRICT_TIME_MODE: bool = False       # 若 True，严格时间对齐（失败直接丢帧，不回退）
-
-CFG = Config()
-
-
-# ====== 工具函数：发布一次关节轨迹（初始观察位姿）======
-def publish_trajectory(node: Node, pub, positions: List[float], move_time: float):
-    traj = JointTrajectory()
-    traj.joint_names = JOINT_NAMES
-    traj.header.stamp = node.get_clock().now().to_msg()
-
-    pt = JointTrajectoryPoint()
-    pt.positions = list(positions)
-    sec = int(move_time)
-    nsec = int((move_time - sec) * 1e9)
-    pt.time_from_start = MsgDuration(sec=sec, nanosec=nsec)
-    traj.points.append(pt)
-
-    pub.publish(traj)
-    node.get_logger().info(f'已发送关节目标（初始观察位姿）: {np.round(positions, 3).tolist()}')
-
-
-# ====== 旋转/四元数工具 ======
-def rpy_to_rot(r: float, p: float, y: float) -> np.ndarray:
-    cr, sr = math.cos(r), math.sin(r)
-    cp, sp = math.cos(p), math.sin(p)
-    cy, sy = math.cos(y), math.sin(y)
-    return np.array([
-        [cy*cp, cy*sp*sr - sy*cr, cy*sp*cr + sy*sr],
-        [sy*cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr],
-        [-sp,   cp*sr,             cp*cr]
-    ], dtype=float)
 
 def quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
     x, y, z, w = qx, qy, qz, qw
@@ -147,373 +142,553 @@ def quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
         [2*(xz - wy),     2*(yz + wx),     1 - 2*(xx + yy)]
     ], dtype=float)
 
-def rot_to_quat(R: np.ndarray) -> Tuple[float, float, float, float]:
-    m00, m01, m02 = R[0]
-    m10, m11, m12 = R[1]
-    m20, m21, m22 = R[2]
-    t = m00 + m11 + m22
-    if t > 0:
-        s = math.sqrt(t + 1.0) * 2
-        w = 0.25 * s
-        x = (m21 - m12) / s
-        y = (m02 - m20) / s
-        z = (m10 - m01) / s
-    elif (m00 > m11) and (m00 > m22):
-        s = math.sqrt(1.0 + m00 - m11 - m22) * 2
-        w = (m21 - m12) / s
-        x = 0.25 * s
-        y = (m01 + m10) / s
-        z = (m02 + m20) / s
-    elif m11 > m22:
-        s = math.sqrt(1.0 + m11 - m00 - m22) * 2
-        w = (m02 - m20) / s
-        x = (m01 + m10) / s
-        y = 0.25 * s
-        z = (m12 + m21) / s
-    else:
-        s = math.sqrt(1.0 + m22 - m00 - m11) * 2
-        w = (m10 - m01) / s
-        x = (m02 + m20) / s
-        y = (m12 + m21) / s
-        z = 0.25 * s
-    n = math.sqrt(x*x + y*y + z*z + w*w)
-    return (x/n, y/n, z/n, w/n)
 
-
-# ====== 变换(R,p)工具 ======
 def tfmsg_to_Rp(transform: TransformStamped) -> Tuple[np.ndarray, np.ndarray]:
     q = transform.transform.rotation
     t = transform.transform.translation
-    x, y, z, w = q.x, q.y, q.z, q.w
-    R_parent_child = np.array([
-        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
-        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
-        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
-    ], dtype=float)
-    p_parent_child = np.array([t.x, t.y, t.z], dtype=float)
-    return R_parent_child, p_parent_child
-
-def compose_Rp(R_ab: np.ndarray, p_ab: np.ndarray,
-               R_bc: np.ndarray, p_bc: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    R_ac = R_ab @ R_bc
-    p_ac = R_ab @ p_bc + p_ab
-    return R_ac, p_ac
+    R = quat_to_rot(q.x, q.y, q.z, q.w)
+    p = np.array([t.x, t.y, t.z], dtype=float)
+    return R, p
 
 
-# ====== 主节点 ======
-class SeeAnythingVTNode(Node):
+# camera_link <- camera_optical 固定旋转（REP-105）
+R_CL_CO = np.array([
+    [0.0,  0.0,  1.0],
+    [-1.0, 0.0,  0.0],
+    [0.0, -1.0,  0.0]
+], dtype=float)
+
+
+def quat_mul(q1, q2):
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2
+    )
+
+
+def quat_from_yaw(yaw_rad: float):
+    s, c = math.sin(0.5 * yaw_rad), math.cos(0.5 * yaw_rad)
+    return (0.0, 0.0, s, c)
+
+
+class SeeAnythingCenterThenHover(Node):
     def __init__(self):
-        super().__init__("seeanything")
+        super().__init__('seeanything_center_then_hover')
 
-        # 参数声明（含 DINO 与几何）
-        self.declare_parameter("image_topic", CFG.IMAGE_TOPIC)
-        self.declare_parameter("camera_info_topic", CFG.CAMERA_INFO_TOPIC)
-        self.declare_parameter("debug_image_topic", CFG.DEBUG_IMAGE_TOPIC)
-        self.declare_parameter("use_camera_info", CFG.USE_CAMERA_INFO)
+        qos_img = QoSProfile(depth=1,
+                             reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST)
+        self.bridge = CvBridge()
+        self.sub_img = self.create_subscription(Image, IMAGE_TOPIC, self._cb_image, qos_img)
 
-        self.declare_parameter("fx", CFG.FX); self.declare_parameter("fy", CFG.FY)
-        self.declare_parameter("cx", CFG.CX); self.declare_parameter("cy", CFG.CY)
-
-        self.declare_parameter("base_frame", CFG.BASE_FRAME)
-        self.declare_parameter("tool_frame", CFG.TOOL_FRAME)
-        self.declare_parameter("object_frame", CFG.OBJECT_FRAME)
-
-        self.declare_parameter("z_virt", CFG.Z_VIRT)
-        self.declare_parameter("h_above", CFG.H_ABOVE)
-        self.declare_parameter("approach_clearance", CFG.APPROACH_CLEARANCE)
-
-        self.declare_parameter("text_prompt", CFG.TEXT_PROMPT)
-        self.declare_parameter("model_id", CFG.DINO_MODEL_ID)
-        self.declare_parameter("device", CFG.DINO_DEVICE)
-        self.declare_parameter("box_threshold", CFG.BOX_THRESHOLD)
-        self.declare_parameter("text_threshold", CFG.TEXT_THRESHOLD)
-
-        self.declare_parameter('t_tool_cam_xyz', list(CFG.T_TOOL_CAM_XYZ))
-        self.declare_parameter('t_tool_cam_quat', list(CFG.T_TOOL_CAM_QUAT))
-
-        self.declare_parameter("send_init_pose", CFG.SEND_INIT_POSE)
-
-        # TF 对齐策略
-        self.declare_parameter("use_latest_tf_on_fail", CFG.USE_LATEST_TF_ON_FAIL)
-        self.declare_parameter("strict_time_mode", CFG.STRICT_TIME_MODE)
-
-        # 读取参数
-        g = self.get_parameter
-        self.image_topic = g("image_topic").value
-        self.ci_topic = g("camera_info_topic").value
-        self.debug_image_topic = g("debug_image_topic").value
-        self.use_ci = bool(g("use_camera_info").value)
-
-        self.fx = float(g('fx').value); self.fy = float(g('fy').value)
-        self.cx = float(g('cx').value); self.cy = float(g('cy').value)
-
-        self.base_frame = g('base_frame').value
-        self.tool_frame = g('tool_frame').value
-        self.object_frame = g('object_frame').value
-
-        self.z_virt = float(g('z_virt').value)
-        self.h_above = float(g('h_above').value)
-        self.approach_clearance = float(g('approach_clearance').value)
-
-        self.text_prompt = g("text_prompt").value
-        self.model_id = g("model_id").value
-        self.device = g("device").value
-        self.box_th = float(g("box_threshold").value)
-        self.text_th = float(g("text_threshold").value)
-
-        self.t_tool_cam_xyz = np.array(g('t_tool_cam_xyz').value, dtype=float)
-        self.t_tool_cam_quat = np.array(g('t_tool_cam_quat').value, dtype=float)
-
-        self.send_init_pose = bool(g("send_init_pose").value)
-
-        self.use_latest_tf_on_fail = bool(g("use_latest_tf_on_fail").value)
-        self.strict_time_mode = bool(g("strict_time_mode").value)
-
-        # 内参缓存（回退：若不用 /camera_info）
-        self.K = np.array([[self.fx, 0, self.cx],
-                           [0, self.fy, self.cy],
-                           [0,      0,      1]], dtype=float)
-        self.D: Optional[np.ndarray] = None
-        self.dist_model: Optional[str] = None
-        self._have_K = not self.use_ci
-        self._warned_no_K = False  # 一次性告警标志
+        # /joint_states
+        if JS_RELIABILITY.strip().lower() == "best_effort":
+            qos_js = QoSProfile(depth=10,
+                                reliability=ReliabilityPolicy.BEST_EFFORT,
+                                history=HistoryPolicy.KEEP_LAST,
+                                durability=DurabilityPolicy.VOLATILE)
+        else:
+            qos_js = QoSProfile(depth=10,
+                                reliability=ReliabilityPolicy.RELIABLE,
+                                history=HistoryPolicy.KEEP_LAST,
+                                durability=DurabilityPolicy.VOLATILE)
+        self._last_js: Optional[JointState] = None
+        self.create_subscription(JointState, "/joint_states", self._on_js, qos_js)
 
         # TF
         self.tf_buffer = tf2_ros.Buffer(cache_time=RclDuration(seconds=10.0))
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
 
-        # DINO 预测器（完全复用你的最小节点写法）
-        self.predictor = GroundingDinoPredictor(self.model_id, self.device)
+        # DINO
+        try:
+            from gripanything.core.detect_with_dino import GroundingDinoPredictor
+        except Exception:
+            import sys
+            sys.path.append('/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything')
+            from gripanything.core.detect_with_dino import GroundingDinoPredictor
+        self.predictor = GroundingDinoPredictor(DINO_MODEL_ID, DINO_DEVICE)
 
-        # ROS 接口
-        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST)
-        self.bridge = CvBridge()
-        if self.use_ci:
-            self.sub_ci = self.create_subscription(CameraInfo, self.ci_topic, self._cb_ci, qos)
-        self.sub_img = self.create_subscription(Image, self.image_topic, self._cb_image, qos)
-        self.pub_dbg = self.create_publisher(Image, self.debug_image_topic, 1)
+        # tool <- camera_optical
+        R_t_cam = quat_to_rot(*T_TOOL_CAM_QUAT.tolist())
+        if HAND_EYE_FRAME.lower() == 'optical':
+            self.R_t_co = R_t_cam
+        else:
+            self.R_t_co = R_t_cam @ R_CL_CO
+        self.p_t_co = T_TOOL_CAM_XYZ
 
-        # P_top / P_pre
-        self.pub_p_top = self.create_publisher(PoseStamped, '/p_top', 1)
-        self.pub_p_pre = self.create_publisher(PoseStamped, '/p_pre', 1)
+        # 调试窗口
+        self._last_debug_pub = self.get_clock().now()
+        if DEBUG_WINDOW:
+            try:
+                cv2.namedWindow("DINO Debug", cv2.WINDOW_NORMAL)
+            except Exception:
+                self.get_logger().warn("无法创建可视化窗口。")
 
-        # 初始观察位姿一次性下发
-        self.traj_pub = self.create_publisher(JointTrajectory, JOINT_TRAJ_TOPIC, 10)
-        self._init_pose_sent = False
-        if self.send_init_pose:
-            self.create_timer(0.8, self._send_initial_once)
+        # 最近一次有效 TF（阶段2重广播）
+        self._last_good_tf: Optional[TransformStamped] = None
+        if TF_REBROADCAST_HZ > 0:
+            self.create_timer(1.0/TF_REBROADCAST_HZ, self._rebroadcast_tf)
+
+        # 控制与 IK
+        self.pub_traj = self.create_publisher(JointTrajectory, CONTROLLER_TOPIC, 1)
+        self._ik_client = None
+        self._ik_service_name = None
+        self._ik_candidates = [IK_SERVICE_EXPLICIT] if IK_SERVICE_EXPLICIT else ["/compute_ik", "/move_group/compute_ik"]
+
+        # 状态机 & 计时
+        self._busy = False
+        self._frame_count = 0
+        self._warned = set()
+        self._deadline_js: Optional[int] = None
+        self._inflight_ik = False
+        self._pending_motion_tag: Optional[str] = None  # "center" or "hover"
+        self._center_due_ns: Optional[int] = None
+
+        # 初始位姿相关
+        self._init_due_ns: Optional[int] = None
+        self._init_published = False
+
+        # phases: "init_needed" -> "init_moving" -> "init_settling" -> "center_needed" -> "center_moving" -> ...
+        self._phase = "init_needed" if INIT_AT_START else "center_needed"
+        self._hover_requested = False
+        self._done_all = False
 
         self.get_logger().info(
-            f"seeanything node started. image_topic={self.image_topic}, prompt='{self.text_prompt}', "
-            f"z_virt={self.z_virt:.3f}, h_above={self.h_above:.3f}, object_frame='{self.object_frame}', "
-            f"use_latest_tf_on_fail={self.use_latest_tf_on_fail}, strict_time_mode={self.strict_time_mode}"
+            f"[center->hover] topic={IMAGE_TOPIC}, prompt='{TEXT_PROMPT}', stride={FRAME_STRIDE}, "
+            f"hand_eye={HAND_EYE_FRAME}, hover={HOVER_ABOVE:.3f}m, yaw={YAW_DEG:.1f}°"
         )
-        self._busy = False
 
-    # 一次性发送初始位姿
-    def _send_initial_once(self):
-        if self._init_pose_sent:
+        self.create_timer(0.1, self._tick)
+
+    # ---------- common utils ----------
+    def _warn_once(self, key: str, text: str):
+        if key not in self._warned:
+            self._warned.add(key)
+            self.get_logger().warning(text)
+
+    def _rebroadcast_tf(self):
+        if self._last_good_tf is None:
             return
-        publish_trajectory(self, self.traj_pub, POS1, INIT_MOVE_TIME)
-        self._init_pose_sent = True
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = self._last_good_tf.header.frame_id
+        t.child_frame_id  = self._last_good_tf.child_frame_id
+        t.transform = self._last_good_tf.transform
+        self.tf_broadcaster.sendTransform(t)
 
-    # CameraInfo 回调
-    def _cb_ci(self, msg: CameraInfo):
-        K = np.array(msg.k, dtype=float).reshape(3, 3)
-        self.K = K.copy()
-        self.fx, self.fy, self.cx, self.cy = K[0,0], K[1,1], K[0,2], K[1,2]
-        if msg.d is not None and len(msg.d) > 0:
-            self.D = np.array(msg.d, dtype=float).reshape(-1)
-        else:
-            self.D = None
-        self.dist_model = getattr(msg, 'distortion_model', None) or None
-        self._have_K = True
+    def _on_js(self, msg: JointState):
+        if self._last_js is None:
+            self.get_logger().info(f"已收到 /joint_states（{len(msg.name)} 关节）。")
+        self._last_js = msg
 
-    # 图像回调：DINO -> (u,v) -> 几何
+    # ---------- image callback ----------
     def _cb_image(self, msg: Image):
+        # 若仍处于初始位姿阶段，直接忽略图像，避免并行动作
+        if self._phase.startswith("init_"):
+            return
+
+        # 限速
+        self._frame_count += 1
+        if FRAME_STRIDE > 1 and (self._frame_count % FRAME_STRIDE) != 0:
+            return
         if self._busy:
             return
-        if not self._have_K:
-            if not self._warned_no_K:
-                self.get_logger().warn('等待 /camera_info 提供内参/畸变。')
-                self._warned_no_K = True
-            return
+
         self._busy = True
         try:
-            # 1) ROS Image -> PIL
             rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
             pil = PILImage.fromarray(rgb)
 
-            # 2) DINO 预测（完全照你的接口）
-            boxes, labels = self.predictor.predict(
-                pil, self.text_prompt, box_threshold=self.box_th, text_threshold=self.text_th
-            )
-            n = 0 if boxes is None else len(boxes)
-            self.get_logger().info(f"DINO detections: {n}")
-            if n == 0:
+            out = self.predictor.predict(pil, TEXT_PROMPT,
+                                         box_threshold=BOX_THRESHOLD, text_threshold=TEXT_THRESHOLD)
+            if isinstance(out, tuple) and len(out) == 3:
+                boxes, labels, scores = out
+            elif isinstance(out, tuple) and len(out) == 2:
+                boxes, labels = out
+                scores = [None] * len(boxes)
+            else:
+                self.get_logger().warn("DINO 返回格式不支持。")
+                return
+            if len(boxes) == 0:
+                if self._phase == "center_needed":
+                    self.get_logger().info("未检测到目标（等待首次居中用检测）。")
+                else:
+                    self.get_logger().info("未检测到目标。")
                 return
 
-            # 取首个目标中心 (u,v)
-            x0, y0, x1, y1 = boxes[0].tolist()
+            # 最高分框
+            s = np.array([float(s) if s is not None else -1.0 for s in scores])
+            best = int(np.argmax(s))
+            x0, y0, x1, y1 = (boxes[best].tolist() if hasattr(boxes[best], 'tolist') else boxes[best])
             u = 0.5 * (x0 + x1)
             v = 0.5 * (y0 + y1)
+            sc = s[best]
 
-            # 3) 像素 -> 相机归一化光线（考虑畸变）
-            if self.D is not None and self.dist_model in (None, '', 'plumb_bob', 'rational_polynomial'):
-                pts = np.array([[[u, v]]], dtype=np.float32)
-                undist = cv2.undistortPoints(pts, self.K, self.D, P=None)  # -> 1x1x2
-                x_n, y_n = float(undist[0, 0, 0]), float(undist[0, 0, 1])
-                d_cam_cam = np.array([x_n, y_n, 1.0], dtype=float)
-            else:
-                x_n = (u - self.cx) / self.fx
-                y_n = (v - self.cy) / self.fy
-                d_cam_cam = np.array([x_n, y_n, 1.0], dtype=float)
-            d_cam_cam /= np.linalg.norm(d_cam_cam)
-
-            # 4) TF: base <- tool（稳健查找）
-            lookup_time = rclpy.time.Time.from_msg(msg.header.stamp)
+            # base<-tool0（按图像时刻或最新）
+            t_query = Time.from_msg(msg.header.stamp) if TF_TIME_MODE == 'image' else Time()
             try:
-                ok = self.tf_buffer.can_transform(
-                    self.base_frame, self.tool_frame, lookup_time,
-                    timeout=RclDuration(seconds=0.2)
-                )
-                if ok:
-                    T_base_tool_msg = self.tf_buffer.lookup_transform(
-                        self.base_frame, self.tool_frame, lookup_time
-                    )
-                else:
-                    if self.strict_time_mode:
-                        self.get_logger().warn(
-                            "TF 对应时间不可用（严格模式），丢弃此帧。"
-                        )
-                        return
-                    if self.use_latest_tf_on_fail:
-                        self.get_logger().warn(
-                            "TF 对应时间不可用，回退到最新 TF（Time(0)）。"
-                        )
-                        T_base_tool_msg = self.tf_buffer.lookup_transform(
-                            self.base_frame, self.tool_frame, rclpy.time.Time()
-                        )
-                    else:
-                        self.get_logger().warn(
-                            "TF 对应时间不可用，未启用回退，丢弃此帧。"
-                        )
-                        return
+                T_bt = self.tf_buffer.lookup_transform(BASE_FRAME, TOOL_FRAME, t_query,
+                                                       timeout=RclDuration(seconds=0.2))
             except TransformException as ex:
-                if self.strict_time_mode or not self.use_latest_tf_on_fail:
-                    self.get_logger().warn(f'TF 未就绪: {ex}；严格/禁用回退，丢弃此帧。')
+                self.get_logger().warn(f"TF 查找失败（{TF_TIME_MODE}，base<-tool0）：{ex}")
+                return
+            R_bt, p_bt = tfmsg_to_Rp(T_bt)
+            q_bt = T_bt.transform.rotation
+
+            # 当前相机位姿（base）
+            R_bc = R_bt @ self.R_t_co
+            p_bc = R_bt @ self.p_t_co + p_bt
+
+            # ---------- 阶段1：基于 (u,v) 做“纯 XY 平移”以居中 ----------
+            if self._phase == "center_needed":
+                # 用 (u,v) 求虚拟平面交点 C_raw（不施加 XY 硬补偿）
+                x_n = (u - CX) / FX
+                y_n = (v - CY) / FY
+                if FLIP_X: x_n = -x_n
+                if FLIP_Y: y_n = -y_n
+                d_opt = np.array([x_n, y_n, 1.0], dtype=float)
+                d_opt /= np.linalg.norm(d_opt)
+
+                d_base = R_bc @ d_opt
+                if abs(float(d_base[2])) < 1e-6:
+                    self.get_logger().warn("视线近水平，无法与平面求交（居中阶段）。")
                     return
-                self.get_logger().warn(f'TF 未就绪: {ex}；改用最新 TF（Time(0)）。')
-                T_base_tool_msg = self.tf_buffer.lookup_transform(
-                    self.base_frame, self.tool_frame, rclpy.time.Time()
+                t_star = (Z_VIRT - float(p_bc[2])) / float(d_base[2])
+                if t_star < 0:
+                    self.get_logger().warn("交点在相机后方（居中阶段）。")
+                    return
+                C_raw = p_bc + t_star * d_base  # 目标在平面上的点（不补偿）
+
+                # 计算需要的相机新原点 o_new（仅 XY 变更）：使中心射线 [0,0,1] 穿过 C_raw
+                d_center = R_bc @ np.array([0.0, 0.0, 1.0], dtype=float)
+                dz = float(d_center[2])
+                if abs(dz) < 1e-6:
+                    self.get_logger().warn("中心射线近水平，无法求 o_new。")
+                    return
+                oz = float(p_bc[2])  # 保持高度不变
+                ox = float(C_raw[0]) - ((Z_VIRT - oz)/dz) * float(d_center[0])
+                oy = float(C_raw[1]) - ((Z_VIRT - oz)/dz) * float(d_center[1])
+                o_new = np.array([ox, oy, oz], dtype=float)
+
+                # 阶段1平移的 XY 微调 BIAS（在 BASE 坐标系）
+                if ENABLE_CENTER_BIAS:
+                    o_new[0] += float(BIAS_CENTER_X)
+                    o_new[1] += float(BIAS_CENTER_Y)
+
+                # 可选步长限制
+                delta = o_new - p_bc
+                delta_xy = np.linalg.norm(delta[:2])
+                if (MAX_CENTER_XY_STEP is not None) and (delta_xy > MAX_CENTER_XY_STEP):
+                    scale = MAX_CENTER_XY_STEP / max(delta_xy, 1e-9)
+                    o_new = p_bc + np.array([delta[0]*scale, delta[1]*scale, 0.0])
+
+                # 求目标 tool 原点（保持 R_bt 不变）：p_bt_new = o_new - R_bt @ p_t_co
+                p_bt_new = o_new - (R_bt @ self.p_t_co)
+
+                # 生成姿态（保持当前末端姿态）
+                ps = PoseStamped()
+                ps.header.frame_id = POSE_FRAME
+                ps.header.stamp = self.get_clock().now().to_msg()
+                ps.pose.position.x = float(p_bt_new[0])
+                ps.pose.position.y = float(p_bt_new[1])
+                ps.pose.position.z = float(p_bt_new[2])
+                ps.pose.orientation = q_bt  # 保持当前姿态
+
+                # 触发 IK（center）
+                seed = self._get_seed()
+                if seed is None:
+                    self._warn_once("wait_js_center", "等待 /joint_states 作为 IK 种子（居中阶段）…")
+                    return
+                self.get_logger().info(
+                    f"[CENTER] uv=({u:.1f},{v:.1f}), "
+                    f"move XY = ({(o_new[0]-p_bc[0]):.3f},{(o_new[1]-p_bc[1]):.3f}) m, "
+                    f"bias=({BIAS_CENTER_X:.3f},{BIAS_CENTER_Y:.3f})"
                 )
-
-            R_base_tool, p_base_tool = tfmsg_to_Rp(T_base_tool_msg)
-
-            # 5) tool->cam（手眼外参，使用 quat）
-            R_tool_cam = quat_to_rot(*self.t_tool_cam_quat.tolist())
-            p_tool_cam = self.t_tool_cam_xyz
-
-            # 6) 相机在 base 下位姿：T^B_C = T^B_T ∘ T^T_C
-            R_base_cam = R_base_tool @ R_tool_cam
-            p_base_cam = R_base_tool @ p_tool_cam + p_base_tool
-
-            # 7) 光线转到 base
-            d_cam_base = R_base_cam @ d_cam_cam
-            d_cam_base /= np.linalg.norm(d_cam_base)
-            o_base = p_base_cam
-
-            # 8) 与虚拟平面 z=z_virt 求交
-            rz = float(d_cam_base[2])
-            if abs(rz) < 1e-6:
-                self.get_logger().warn('视线近水平（|r_z|≈0），无法与虚拟平面求交。')
+                self._request_ik(ps, seed, tag="center")
+                self._phase = "center_moving"
                 return
-            t_star = (self.z_virt - float(o_base[2])) / rz
+
+            # ---------- 阶段2：常规检测，发布 object_position，并触发 hover ----------
+            # 用 (u,v) 求平面交点 C_raw
+            x_n = (u - CX) / FX
+            y_n = (v - CY) / FY
+            if FLIP_X: x_n = -x_n
+            if FLIP_Y: y_n = -y_n
+            d_opt = np.array([x_n, y_n, 1.0], dtype=float)
+            d_opt /= np.linalg.norm(d_opt)
+
+            d_base = R_bc @ d_opt
+            if abs(float(d_base[2])) < 1e-6:
+                self.get_logger().warn("视线近水平，无法与平面求交（阶段2）。")
+                return
+            t_star = (Z_VIRT - float(p_bc[2])) / float(d_base[2])
             if t_star < 0:
-                self.get_logger().warn('平面交点在相机后方（t<0），忽略。')
+                self.get_logger().warn("交点在相机后方（阶段2）。")
                 return
+            C_raw = p_bc + t_star * d_base
 
-            C_base = o_base + t_star * d_cam_base  # 交点（物体中心）in base
-            n_base = np.array([0.0, 0.0, 1.0], dtype=float)
-            P_top_base = C_base + self.h_above * n_base
-            P_pre_base = P_top_base + self.approach_clearance * n_base
+            # XY/Z 硬补偿仅在阶段2用于 object_position
+            C = C_raw.copy()
+            if ENABLE_BASE_BIAS:
+                C[0] += float(BIAS_BASE_X)
+                C[1] += float(BIAS_BASE_Y)
+                C[2] += float(BIAS_BASE_Z)
 
-            # 9) 末端期望姿态：-Z_tool // +Z_base
-            z_tool_in_base = -n_base
-            x_tool_in_base = np.array([1.0, 0.0, 0.0])  # 任意与 z 不共线
-            y_tool_in_base = np.cross(z_tool_in_base, x_tool_in_base)
-            if np.linalg.norm(y_tool_in_base) < 1e-6:
-                x_tool_in_base = np.array([0.0, 1.0, 0.0])
-                y_tool_in_base = np.cross(z_tool_in_base, x_tool_in_base)
-            x_tool_in_base /= np.linalg.norm(x_tool_in_base)
-            y_tool_in_base /= np.linalg.norm(y_tool_in_base)
-            z_tool_in_base /= np.linalg.norm(z_tool_in_base)
-            R_base_tool_des = np.column_stack((x_tool_in_base, y_tool_in_base, z_tool_in_base))
-            qx, qy, qz, qw = rot_to_quat(R_base_tool_des)
-
-            # 10) 发布 P_top / P_pre
-            ps_top = PoseStamped()
-            ps_top.header = Header(stamp=msg.header.stamp, frame_id=self.base_frame)
-            ps_top.pose.position.x, ps_top.pose.position.y, ps_top.pose.position.z = map(float, P_top_base)
-            ps_top.pose.orientation.x, ps_top.pose.orientation.y, ps_top.pose.orientation.z, ps_top.pose.orientation.w = qx, qy, qz, qw
-            self.pub_p_top.publish(ps_top)
-
-            ps_pre = PoseStamped()
-            ps_pre.header = Header(stamp=msg.header.stamp, frame_id=self.base_frame)
-            ps_pre.pose.position.x, ps_pre.pose.position.y, ps_pre.pose.position.z = map(float, P_pre_base)
-            ps_pre.pose.orientation.x, ps_pre.pose.orientation.y, ps_pre.pose.orientation.z, ps_pre.pose.orientation.w = qx, qy, qz, qw
-            self.pub_p_pre.publish(ps_pre)
-
-            # 11) 发布物体 TF（位于 C_base，姿态与 base 对齐）
-            t = TransformStamped()
-            t.header.stamp = self.get_clock().now().to_msg()  # 当前时间戳，RViz 更稳
-            t.header.frame_id = self.base_frame
-            t.child_frame_id = self.object_frame
-            t.transform.translation.x, t.transform.translation.y, t.transform.translation.z = map(float, C_base)
-            t.transform.rotation.x = 0.0
-            t.transform.rotation.y = 0.0
-            t.transform.rotation.z = 0.0
-            t.transform.rotation.w = 1.0
-            self.tf_broadcaster.sendTransform(t)
+            tf_msg = TransformStamped()
+            tf_msg.header.stamp = self.get_clock().now().to_msg()
+            tf_msg.header.frame_id = BASE_FRAME
+            tf_msg.child_frame_id  = OBJECT_FRAME
+            tf_msg.transform.translation.x = float(C[0])
+            tf_msg.transform.translation.y = float(C[1])
+            tf_msg.transform.translation.z = float(C[2])
+            tf_msg.transform.rotation.x = 0.0
+            tf_msg.transform.rotation.y = 0.0
+            tf_msg.transform.rotation.z = 0.0
+            tf_msg.transform.rotation.w = 1.0
+            self.tf_broadcaster.sendTransform(tf_msg)
+            self._last_good_tf = tf_msg
 
             self.get_logger().info(
-                f"(u,v)=({u:.1f},{v:.1f})  "
-                f"C_base=({C_base[0]:.3f},{C_base[1]:.3f},{C_base[2]:.3f})  "
-                f"P_top=({P_top_base[0]:.3f},{P_top_base[1]:.3f},{P_top_base[2]:.3f})  "
-                f"-> TF:{self.object_frame}"
+                f"[STAGE2] score={(sc if sc>=0 else float('nan')):.3f} "
+                f"uv=({u:.1f},{v:.1f}) "
+                f"C_raw=({C_raw[0]:.3f},{C_raw[1]:.3f},{C_raw[2]:.3f}) "
+                f"C_corr=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f}) -> {OBJECT_FRAME}"
             )
 
-            # 12) 调试图像可视化并发布
-            vis = rgb.copy()
-            for label, box in zip(labels, boxes):
-                x0i, y0i, x1i, y1i = [int(v) for v in box.tolist()]
-                cv2.rectangle(vis, (x0i, y0i), (x1i, y1i), (255, 0, 0), 2)
-                cv2.putText(vis, str(label), (x0i, max(0, y0i - 5)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-            cv2.circle(vis, (int(round(u)), int(round(v))), 5, (0, 255, 0), -1)
-
-            dbg_msg = self.bridge.cv2_to_imgmsg(vis, encoding="rgb8")
-            dbg_msg.header = Header(stamp=msg.header.stamp, frame_id=msg.header.frame_id)
-            self.pub_dbg.publish(dbg_msg)
+            # 居中已完成后，拿到有效 TF 即可触发 hover
+            if self._phase == "center_done":
+                self._hover_requested = True
 
         except Exception as e:
-            self.get_logger().error(f"DINO/几何处理失败: {e}")
+            self.get_logger().error(f"图像处理失败：{e}")
         finally:
             self._busy = False
+
+    # ---------- 主循环 ----------
+    def _tick(self):
+        if self._done_all or self._inflight_ik:
+            return
+
+        now_ns = self.get_clock().now().nanoseconds
+
+        # ====== 初始位姿阶段 ======
+        if self._phase == "init_needed":
+            # 发布一次初始位姿（不依赖 IK）
+            if not self._init_published:
+                self._publish_init_pose()
+                self._init_due_ns = now_ns + int((INIT_MOVE_TIME_SEC + INIT_EXTRA_WAIT_SEC) * 1e9)
+                self._phase = "init_moving"
+                return
+
+        if self._phase == "init_moving" and self._init_due_ns is not None:
+            if now_ns >= self._init_due_ns:
+                self._phase = "center_needed"
+                self.get_logger().info("初始位姿到位，开始阶段1（检测并平移居中）。")
+
+        # ====== 居中阶段收敛等待 ======
+        if self._phase == "center_settling" and self._center_due_ns is not None:
+            if now_ns >= self._center_due_ns:
+                self._phase = "center_done"
+                self.get_logger().info("CENTER 运动完成，进入阶段2（再次检测并发布 object_position）。")
+
+        # ====== 悬停触发 ======
+        if self._phase == "center_done" and self._hover_requested and self._last_good_tf is not None:
+            if not self._ensure_ik_client():
+                return
+            seed = self._get_seed()
+            if seed is None:
+                self._warn_once("wait_js_hover", "等待 /joint_states 作为 IK 种子（hover 阶段）…")
+                return
+            ps = self._make_hover_pose()
+            if ps is None:
+                return
+            self.get_logger().info(
+                f"[HOVER] p=({ps.pose.position.x:.3f},{ps.pose.position.y:.3f},{ps.pose.position.z:.3f}), "
+                f"yaw={YAW_DEG:.1f}°, hover={HOVER_ABOVE:.3f}m"
+            )
+            self._request_ik(ps, seed, tag="hover")
+            self._hover_requested = False  # 防多次触发
+
+    # ---------- IK/种子 ----------
+    def _ensure_ik_client(self) -> bool:
+        if self._ik_client:
+            return True
+        for name in self._ik_candidates:
+            if not name:
+                continue
+            cli = self.create_client(GetPositionIK, name)
+            if cli.wait_for_service(timeout_sec=0.5):
+                self._ik_client = cli
+                self._ik_service_name = name
+                self.get_logger().info(f"IK 服务可用：{name}")
+                return True
+        self._warn_once("wait_ik", f"等待 IK 服务…（尝试：{self._ik_candidates}）")
+        return False
+
+    def _get_seed(self) -> Optional[JointState]:
+        if self._last_js:
+            return self._last_js
+        now_ns = self.get_clock().now().nanoseconds
+        if self._deadline_js is None:
+            self._deadline_js = now_ns + int(JS_WAIT_TIMEOUT_SEC * 1e9)
+            if REQUIRE_JS:
+                self._warn_once("wait_js", "等待 /joint_states …")
+            return None
+        if now_ns < self._deadline_js and REQUIRE_JS:
+            return None
+        if not FALLBACK_ZERO_IF_TIMEOUT and REQUIRE_JS:
+            self._warn_once("js_timeout", "等待 /joint_states 超时，仍在等待（可设 FALLBACK_ZERO_IF_TIMEOUT=True 使用零位种子）。")
+            return None
+        js = JointState()
+        js.name = UR5E_ORDER
+        js.position = ZERO_SEED[:6]
+        js.header.stamp = self.get_clock().now().to_msg()
+        return js
+
+    # ---------- 生成悬停位姿 ----------
+    def _make_hover_pose(self) -> Optional[PoseStamped]:
+        try:
+            tf = self.tf_buffer.lookup_transform(POSE_FRAME, OBJECT_FRAME, Time(),
+                                                 timeout=RclDuration(seconds=0.5))
+        except TransformException as ex:
+            self._warn_once("tf_object", f"TF 未就绪：{POSE_FRAME} <- {OBJECT_FRAME} ：{ex}")
+            return None
+
+        x = tf.transform.translation.x
+        y = tf.transform.translation.y
+        z = tf.transform.translation.z + HOVER_ABOVE
+
+        q_down = (1.0, 0.0, 0.0, 0.0)
+        q_yaw  = quat_from_yaw(math.radians(YAW_DEG))
+        q      = quat_mul(q_yaw, q_down)
+
+        ps = PoseStamped()
+        ps.header.frame_id = POSE_FRAME
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = x
+        ps.pose.position.y = y
+        ps.pose.position.z = z
+        ps.pose.orientation.x, ps.pose.orientation.y, ps.pose.orientation.z, ps.pose.orientation.w = q
+        return ps
+
+    # ---------- 发起 IK ----------
+    def _request_ik(self, pose: PoseStamped, seed: JointState, tag: str):
+        if not self._ensure_ik_client():
+            return
+        req = GetPositionIK.Request()
+        req.ik_request.group_name = GROUP_NAME
+        req.ik_request.ik_link_name = IK_LINK_NAME
+        req.ik_request.pose_stamped = pose
+        req.ik_request.avoid_collisions = False
+        req.ik_request.robot_state.joint_state = seed
+        req.ik_request.timeout = Duration(
+            sec=int(IK_TIMEOUT_SEC),
+            nanosec=int((IK_TIMEOUT_SEC % 1.0) * 1e9),
+        )
+        self._inflight_ik = True
+        self._pending_motion_tag = tag
+        fut = self._ik_client.call_async(req)
+        fut.add_done_callback(self._on_ik_done)
+
+    # ---------- IK 回调 ----------
+    def _on_ik_done(self, fut):
+        self._inflight_ik = False
+        tag = self._pending_motion_tag
+        self._pending_motion_tag = None
+
+        try:
+            res = fut.result()
+        except Exception as e:
+            self.get_logger().error(f"IK 调用异常[{tag}]：{e}")
+            return
+        if res is None or res.error_code.val != 1:
+            code = None if res is None else res.error_code.val
+            self.get_logger().error(f"IK 未找到解[{tag}]，error_code={code}")
+            return
+
+        name_to_idx: Dict[str, int] = {n: i for i, n in enumerate(res.solution.joint_state.name)}
+        target_positions: List[float] = []
+        missing = []
+        for jn in UR5E_ORDER:
+            if jn not in name_to_idx:
+                missing.append(jn)
+            else:
+                target_positions.append(res.solution.joint_state.position[name_to_idx[jn]])
+        if missing:
+            self.get_logger().error(f"IK 结果缺少关节[{tag}]: {missing}")
+            return
+
+        traj = JointTrajectory()
+        traj.joint_names = UR5E_ORDER
+        pt = JointTrajectoryPoint()
+        pt.positions = target_positions
+        pt.time_from_start = Duration(
+            sec=int(MOVE_TIME_SEC),
+            nanosec=int((MOVE_TIME_SEC % 1.0) * 1e9)
+        )
+        traj.points = [pt]
+        self.pub_traj.publish(traj)
+
+        self.get_logger().info(
+            f"已发布关节目标[{tag}]："
+            + "[" + ", ".join(f"{v:.6f}" for v in target_positions) + f"], T={MOVE_TIME_SEC:.1f}s"
+        )
+
+        if tag == "center":
+            self._phase = "center_settling"
+            self._center_due_ns = self.get_clock().now().nanoseconds + int((MOVE_TIME_SEC + CENTER_SETTLE_EXTRA_SEC)*1e9)
+        elif tag == "hover":
+            self._done_all = True
+            self.create_timer(0.5, self._shutdown_once)
+
+    # ---------- 启动时发布初始位姿（不走 IK） ----------
+    def _publish_init_pose(self):
+        traj = JointTrajectory()
+        traj.joint_names = UR5E_ORDER
+        pt = JointTrajectoryPoint()
+        pt.positions = INIT_POS
+        pt.time_from_start = Duration(
+            sec=int(INIT_MOVE_TIME_SEC),
+            nanosec=int((INIT_MOVE_TIME_SEC % 1.0) * 1e9)
+        )
+        traj.points = [pt]
+        self.pub_traj.publish(traj)
+        self._init_published = True
+        self.get_logger().info(
+            "已发布初始位姿：[" + ", ".join(f"{v:.6f}" for v in INIT_POS) +
+            f"], T={INIT_MOVE_TIME_SEC:.1f}s"
+        )
+
+    # ---------- 收尾 ----------
+    def _shutdown_once(self):
+        self.get_logger().info("全部完成，退出节点。")
+        rclpy.shutdown()
+
+    def destroy_node(self):
+        try:
+            if DEBUG_WINDOW:
+                cv2.destroyAllWindows()
+        except Exception:
+            pass
+        super().destroy_node()
 
 
 def main():
     rclpy.init()
-    node = SeeAnythingVTNode()
+    node = SeeAnythingCenterThenHover()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

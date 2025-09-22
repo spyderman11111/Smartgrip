@@ -71,7 +71,7 @@ if __name__ == "__main__":
     print("transformers =", transformers.__version__)
     print("python =", sys.executable)
 
-    image_path = "/home/MA_SmartGrip/snapshot.jpg"
+    image_path = "/home/MA_SmartGrip/orange.png"
     image = Image.open(image_path).convert("RGB")
     prompt = "yellow object ."   # DINO 更偏好 'class .' 形式
 
