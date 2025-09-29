@@ -28,6 +28,7 @@ setup(
             'seeanything = gripanything.seeanything:main',
             'seeanything_demo = gripanything.seeanything_demo:main',
             'goto_hover_once = gripanything.goto_hover_once:main',
+            'detect_and_circle_scan_vggt = gripanything.detect_and_circle_scan_vggt:main',
         ],
     },
 )

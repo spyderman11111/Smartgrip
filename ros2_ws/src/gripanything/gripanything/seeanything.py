@@ -2,17 +2,19 @@
 # -*- coding: utf-8 -*-
 
 """
-seeanything_center_then_hover.py
-阶段1：DINO 检测 -> 仅平移使目标居中（保持当前姿态 + 高度，纯 XY，可叠加微调 BIAS）
-阶段2：再次检测 -> 发布 object_position（含可选 XY/Z 硬补偿）-> 悬停到目标上方（末端朝下，可选 yaw）
+seeanything_center_then_hover.py — 单帧触发 + 静止一帧取TF（严格按图像时间）+ 首次居中XY位移限幅
 
-新增：
-- 启动即发布“初始位姿”（你提供的关节角），等待到位后再开始阶段1。
-- 阶段1平移引入 BASE 下 XY 微调 BIAS（方便手动微调居中行为）。
+流程（每阶段仅使用“第一帧达标且机械臂静止”的检测）：
+1) 回到初始位姿（可选）
+2) 阶段1 center_needed：等待“第一帧且机械臂静止且score>=0.6” -> 仅一次 XY 平移（保持姿态+高度，且XY位移限幅）-> IK -> 运动
+3) 静置一段时间（保证确实到位并稳定）
+4) 阶段2 hover_needed：再次等待“第一帧且机械臂静止且score>=0.6” -> 发布 object_position -> 计算悬停 -> IK -> 运动
+5) 结束
 
-前置：
-- MoveIt 已启动且 /compute_ik 可用（仅阶段1/2用 IK；初始位姿直接发关节轨迹，不用 IK）
-- 控制器 /scaled_joint_trajectory_controller/joint_trajectory 可用
+关键点：
+- 严格使用【图像时间戳】查询 base<-tool0 TF（不再使用 latest）。
+- 仅在判定“机械臂静止”时才处理图像；运动/未到位期间的图像忽略。
+- 首次居中的 tool0 在 BASE 下 XY 位移做径向限幅（默认 ≤0.25 m）。
 """
 
 from typing import Optional, Tuple, Dict, List
@@ -39,22 +41,31 @@ from PIL import Image as PILImage
 from moveit_msgs.srv import GetPositionIK
 
 
-# ========= 误差补偿（用于阶段2的 object_position）=========
+# ========= 置信度门限 =========
+SCORE_OK   = 0.6
+SCORE_FAIL = 0.4
+
+# ========= 阶段2的 object_position 偏置（BASE 下）=========
 ENABLE_BASE_BIAS = True
 BIAS_BASE_X =  0.00
 BIAS_BASE_Y =  0.00
 BIAS_BASE_Z =  0.00
 
-# ========= 阶段1平移的微调 BIAS（在 BASE 下的 XY，默认打开，便于微调）=========
+# ========= 阶段1平移微调（BASE 下 XY 微调，仅在居中阶段叠加）=========
 ENABLE_CENTER_BIAS = True
-BIAS_CENTER_X = -0.10   # +X 物体在相机画面更靠右，通常需要把相机往 +X 走
-BIAS_CENTER_Y = -0.10   # +Y 物体在相机画面更靠上，通常需要把相机往 +Y 走
+BIAS_CENTER_X = -0.10
+BIAS_CENTER_Y = -0.15
+
+# ========= 居中位移限幅（仅第一次居中调整）=========
+ENABLE_CENTER_XY_LIMIT = True   # 打开/关闭限幅
+LIMIT_CENTER_XY = 0.25          # 最大 XY 平移半径（米）
 
 # ========= 基本配置 =========
 IMAGE_TOPIC = '/my_camera/pylon_ros2_camera_node/image_raw'
 BASE_FRAME   = 'base_link'
 TOOL_FRAME   = 'tool0'
 OBJECT_FRAME = 'object_position'
+POSE_FRAME   = 'base_link'
 Z_VIRT       = 0.0   # 工作面高度
 
 # 相机内参（像素系）
@@ -76,8 +87,10 @@ DINO_DEVICE    = 'cuda'
 BOX_THRESHOLD  = 0.25
 TEXT_THRESHOLD = 0.25
 
-# 运行时开关
-TF_TIME_MODE         = 'latest'   # 'image' | 'latest'
+# 取TF策略（严格用图像时间戳）
+TF_LOOKUP_TIMEOUT_SEC = 0.5  # 查询 TF 超时时间；查不到这帧就忽略
+
+# 帧率/调试
 FRAME_STRIDE         = 2
 DEBUG_WINDOW         = False
 DRAW_BEST_BOX        = False
@@ -87,29 +100,27 @@ FLIP_X               = False
 FLIP_Y               = False
 
 # 悬停/IK 与控制
-POSE_FRAME           = 'base_link'
 GROUP_NAME           = 'ur_manipulator'
 IK_LINK_NAME         = 'tool0'
-HOVER_ABOVE          = 0.30
+HOVER_ABOVE          = 0.40
 YAW_DEG              = 0.0
-IK_SERVICE_EXPLICIT  = ''
+IK_SERVICE_EXPLICIT  = ''         # 留空将自动尝试 ['/compute_ik','/move_group/compute_ik']
 IK_TIMEOUT_SEC       = 2.0
 CONTROLLER_TOPIC     = '/scaled_joint_trajectory_controller/joint_trajectory'
 MOVE_TIME_SEC        = 3.0
+
+# 静止判定（到位后仍需额外静置 + 速度阈值）
+SETTLE_EXTRA_SEC         = 0.30   # 每次运动后额外静置，防止残余震荡
+STILL_REQUIRE_JS_VEL     = True   # 若 JointState 含 velocity，则要求速度低于阈值
+VEL_EPS_RAD_PER_SEC      = 0.02   # 关节速度阈值
 
 # /joint_states 作为 IK 种子
 REQUIRE_JS               = True
 JS_WAIT_TIMEOUT_SEC      = 2.0
 FALLBACK_ZERO_IF_TIMEOUT = False
 ZERO_SEED                = [0, 0, 0, 0, 0, 0]
-JS_RELIABILITY           = 'reliable'  # reliable / best_effort
 
-# 居中阶段运动收敛等待（粗略按时间）
-CENTER_SETTLE_EXTRA_SEC  = 0.3  # 轨迹时长外再等一点点
-# 可选限制“单次平移步长”，None 表示不限制
-MAX_CENTER_XY_STEP: Optional[float] = None  # 例如 0.25
-
-# ========= 启动初始位姿（新增）=========
+# ========= 启动初始位姿 =========
 INIT_AT_START = True
 UR5E_ORDER = [
     "shoulder_pan_joint",
@@ -186,16 +197,10 @@ class SeeAnythingCenterThenHover(Node):
         self.sub_img = self.create_subscription(Image, IMAGE_TOPIC, self._cb_image, qos_img)
 
         # /joint_states
-        if JS_RELIABILITY.strip().lower() == "best_effort":
-            qos_js = QoSProfile(depth=10,
-                                reliability=ReliabilityPolicy.BEST_EFFORT,
-                                history=HistoryPolicy.KEEP_LAST,
-                                durability=DurabilityPolicy.VOLATILE)
-        else:
-            qos_js = QoSProfile(depth=10,
-                                reliability=ReliabilityPolicy.RELIABLE,
-                                history=HistoryPolicy.KEEP_LAST,
-                                durability=DurabilityPolicy.VOLATILE)
+        qos_js = QoSProfile(depth=10,
+                            reliability=ReliabilityPolicy.RELIABLE,
+                            history=HistoryPolicy.KEEP_LAST,
+                            durability=DurabilityPolicy.VOLATILE)
         self._last_js: Optional[JointState] = None
         self.create_subscription(JointState, "/joint_states", self._on_js, qos_js)
 
@@ -213,7 +218,7 @@ class SeeAnythingCenterThenHover(Node):
             from gripanything.core.detect_with_dino import GroundingDinoPredictor
         self.predictor = GroundingDinoPredictor(DINO_MODEL_ID, DINO_DEVICE)
 
-        # tool <- camera_optical
+        # tool <- camera_(optical/link)
         R_t_cam = quat_to_rot(*T_TOOL_CAM_QUAT.tolist())
         if HAND_EYE_FRAME.lower() == 'optical':
             self.R_t_co = R_t_cam
@@ -222,7 +227,6 @@ class SeeAnythingCenterThenHover(Node):
         self.p_t_co = T_TOOL_CAM_XYZ
 
         # 调试窗口
-        self._last_debug_pub = self.get_clock().now()
         if DEBUG_WINDOW:
             try:
                 cv2.namedWindow("DINO Debug", cv2.WINDOW_NORMAL)
@@ -238,34 +242,27 @@ class SeeAnythingCenterThenHover(Node):
         self.pub_traj = self.create_publisher(JointTrajectory, CONTROLLER_TOPIC, 1)
         self._ik_client = None
         self._ik_service_name = None
-        self._ik_candidates = [IK_SERVICE_EXPLICIT] if IK_SERVICE_EXPLICIT else ["/compute_ik", "/move_group/compute_ik"]
 
-        # 状态机 & 计时
+        # 运动到位/静止判定
+        self._motion_due_ns: Optional[int] = None  # 最近一次“预计到位时刻”（发布轨迹时设定）
+        self._inflight_ik = False
+
+        # 状态机
+        # phases: init_needed -> init_moving -> center_needed -> center_moving -> hover_needed -> hover_moving -> done
+        self._phase = "init_needed" if INIT_AT_START else "center_needed"
         self._busy = False
         self._frame_count = 0
         self._warned = set()
         self._deadline_js: Optional[int] = None
-        self._inflight_ik = False
-        self._pending_motion_tag: Optional[str] = None  # "center" or "hover"
-        self._center_due_ns: Optional[int] = None
-
-        # 初始位姿相关
-        self._init_due_ns: Optional[int] = None
-        self._init_published = False
-
-        # phases: "init_needed" -> "init_moving" -> "init_settling" -> "center_needed" -> "center_moving" -> ...
-        self._phase = "init_needed" if INIT_AT_START else "center_needed"
-        self._hover_requested = False
-        self._done_all = False
+        self._finished = False
 
         self.get_logger().info(
-            f"[center->hover] topic={IMAGE_TOPIC}, prompt='{TEXT_PROMPT}', stride={FRAME_STRIDE}, "
-            f"hand_eye={HAND_EYE_FRAME}, hover={HOVER_ABOVE:.3f}m, yaw={YAW_DEG:.1f}°"
+            f"[single-frame + still] topic={IMAGE_TOPIC}, prompt='{TEXT_PROMPT}', "
+            f"score_ok={SCORE_OK:.2f}, score_fail={SCORE_FAIL:.2f}, hover={HOVER_ABOVE:.3f}m, limitXY={LIMIT_CENTER_XY:.3f}m"
         )
+        self.create_timer(0.05, self._tick)
 
-        self.create_timer(0.1, self._tick)
-
-    # ---------- common utils ----------
+    # ---------- utils ----------
     def _warn_once(self, key: str, text: str):
         if key not in self._warned:
             self._warned.add(key)
@@ -286,17 +283,34 @@ class SeeAnythingCenterThenHover(Node):
             self.get_logger().info(f"已收到 /joint_states（{len(msg.name)} 关节）。")
         self._last_js = msg
 
+    def _is_stationary(self) -> bool:
+        """满足：已过预计到位时间+静置，且（若有速度信息）所有速度|v|<阈值"""
+        now_ns = self.get_clock().now().nanoseconds
+        if self._motion_due_ns is not None and now_ns < self._motion_due_ns:
+            return False
+        if STILL_REQUIRE_JS_VEL and self._last_js is not None and self._last_js.velocity:
+            try:
+                vels = [abs(float(v)) for v in self._last_js.velocity]
+                if any(v > VEL_EPS_RAD_PER_SEC for v in vels):
+                    return False
+            except Exception:
+                pass
+        return True
+
     # ---------- image callback ----------
     def _cb_image(self, msg: Image):
-        # 若仍处于初始位姿阶段，直接忽略图像，避免并行动作
-        if self._phase.startswith("init_"):
+        # 只在需要检测的阶段处理：center_needed / hover_needed
+        if self._phase not in ("center_needed", "hover_needed"):
+            return
+        # 仅在机械臂静止时才处理（保证“位姿运动完成后的一帧”）
+        if not self._is_stationary():
             return
 
-        # 限速
+        # 限帧
         self._frame_count += 1
         if FRAME_STRIDE > 1 and (self._frame_count % FRAME_STRIDE) != 0:
             return
-        if self._busy:
+        if self._busy or self._inflight_ik:
             return
 
         self._busy = True
@@ -306,6 +320,7 @@ class SeeAnythingCenterThenHover(Node):
 
             out = self.predictor.predict(pil, TEXT_PROMPT,
                                          box_threshold=BOX_THRESHOLD, text_threshold=TEXT_THRESHOLD)
+
             if isinstance(out, tuple) and len(out) == 3:
                 boxes, labels, scores = out
             elif isinstance(out, tuple) and len(out) == 2:
@@ -314,107 +329,45 @@ class SeeAnythingCenterThenHover(Node):
             else:
                 self.get_logger().warn("DINO 返回格式不支持。")
                 return
+
             if len(boxes) == 0:
-                if self._phase == "center_needed":
-                    self.get_logger().info("未检测到目标（等待首次居中用检测）。")
-                else:
-                    self.get_logger().info("未检测到目标。")
+                self.get_logger().error(f"[{self._phase}] 本帧无检测结果，退出。")
+                self._shutdown_once()
                 return
 
-            # 最高分框
             s = np.array([float(s) if s is not None else -1.0 for s in scores])
             best = int(np.argmax(s))
+            score = s[best]
             x0, y0, x1, y1 = (boxes[best].tolist() if hasattr(boxes[best], 'tolist') else boxes[best])
             u = 0.5 * (x0 + x1)
             v = 0.5 * (y0 + y1)
-            sc = s[best]
 
-            # base<-tool0（按图像时刻或最新）
-            t_query = Time.from_msg(msg.header.stamp) if TF_TIME_MODE == 'image' else Time()
+            if score < SCORE_FAIL:
+                self.get_logger().error(f"[{self._phase}] 检测置信度 {score:.3f} < {SCORE_FAIL:.2f}，退出。")
+                self._shutdown_once()
+                return
+            if score < SCORE_OK:
+                self.get_logger().info(f"[{self._phase}] 置信度 {score:.3f} 介于 {SCORE_FAIL:.2f}~{SCORE_OK:.2f}，继续等待。")
+                return
+
+            # —— 至此：score >= SCORE_OK，且机械臂静止 —— #
+            # 严格使用图像时间戳查询 base<-tool0
+            t_query = Time.from_msg(msg.header.stamp)
             try:
                 T_bt = self.tf_buffer.lookup_transform(BASE_FRAME, TOOL_FRAME, t_query,
-                                                       timeout=RclDuration(seconds=0.2))
+                                                       timeout=RclDuration(seconds=TF_LOOKUP_TIMEOUT_SEC))
             except TransformException as ex:
-                self.get_logger().warn(f"TF 查找失败（{TF_TIME_MODE}，base<-tool0）：{ex}")
+                self.get_logger().info(f"[{self._phase}] 图像时刻TF不可得（base<-tool0）：{ex}，忽略此帧，继续等待下一帧。")
                 return
+
             R_bt, p_bt = tfmsg_to_Rp(T_bt)
             q_bt = T_bt.transform.rotation
 
-            # 当前相机位姿（base）
+            # 相机位姿（base）
             R_bc = R_bt @ self.R_t_co
             p_bc = R_bt @ self.p_t_co + p_bt
 
-            # ---------- 阶段1：基于 (u,v) 做“纯 XY 平移”以居中 ----------
-            if self._phase == "center_needed":
-                # 用 (u,v) 求虚拟平面交点 C_raw（不施加 XY 硬补偿）
-                x_n = (u - CX) / FX
-                y_n = (v - CY) / FY
-                if FLIP_X: x_n = -x_n
-                if FLIP_Y: y_n = -y_n
-                d_opt = np.array([x_n, y_n, 1.0], dtype=float)
-                d_opt /= np.linalg.norm(d_opt)
-
-                d_base = R_bc @ d_opt
-                if abs(float(d_base[2])) < 1e-6:
-                    self.get_logger().warn("视线近水平，无法与平面求交（居中阶段）。")
-                    return
-                t_star = (Z_VIRT - float(p_bc[2])) / float(d_base[2])
-                if t_star < 0:
-                    self.get_logger().warn("交点在相机后方（居中阶段）。")
-                    return
-                C_raw = p_bc + t_star * d_base  # 目标在平面上的点（不补偿）
-
-                # 计算需要的相机新原点 o_new（仅 XY 变更）：使中心射线 [0,0,1] 穿过 C_raw
-                d_center = R_bc @ np.array([0.0, 0.0, 1.0], dtype=float)
-                dz = float(d_center[2])
-                if abs(dz) < 1e-6:
-                    self.get_logger().warn("中心射线近水平，无法求 o_new。")
-                    return
-                oz = float(p_bc[2])  # 保持高度不变
-                ox = float(C_raw[0]) - ((Z_VIRT - oz)/dz) * float(d_center[0])
-                oy = float(C_raw[1]) - ((Z_VIRT - oz)/dz) * float(d_center[1])
-                o_new = np.array([ox, oy, oz], dtype=float)
-
-                # 阶段1平移的 XY 微调 BIAS（在 BASE 坐标系）
-                if ENABLE_CENTER_BIAS:
-                    o_new[0] += float(BIAS_CENTER_X)
-                    o_new[1] += float(BIAS_CENTER_Y)
-
-                # 可选步长限制
-                delta = o_new - p_bc
-                delta_xy = np.linalg.norm(delta[:2])
-                if (MAX_CENTER_XY_STEP is not None) and (delta_xy > MAX_CENTER_XY_STEP):
-                    scale = MAX_CENTER_XY_STEP / max(delta_xy, 1e-9)
-                    o_new = p_bc + np.array([delta[0]*scale, delta[1]*scale, 0.0])
-
-                # 求目标 tool 原点（保持 R_bt 不变）：p_bt_new = o_new - R_bt @ p_t_co
-                p_bt_new = o_new - (R_bt @ self.p_t_co)
-
-                # 生成姿态（保持当前末端姿态）
-                ps = PoseStamped()
-                ps.header.frame_id = POSE_FRAME
-                ps.header.stamp = self.get_clock().now().to_msg()
-                ps.pose.position.x = float(p_bt_new[0])
-                ps.pose.position.y = float(p_bt_new[1])
-                ps.pose.position.z = float(p_bt_new[2])
-                ps.pose.orientation = q_bt  # 保持当前姿态
-
-                # 触发 IK（center）
-                seed = self._get_seed()
-                if seed is None:
-                    self._warn_once("wait_js_center", "等待 /joint_states 作为 IK 种子（居中阶段）…")
-                    return
-                self.get_logger().info(
-                    f"[CENTER] uv=({u:.1f},{v:.1f}), "
-                    f"move XY = ({(o_new[0]-p_bc[0]):.3f},{(o_new[1]-p_bc[1]):.3f}) m, "
-                    f"bias=({BIAS_CENTER_X:.3f},{BIAS_CENTER_Y:.3f})"
-                )
-                self._request_ik(ps, seed, tag="center")
-                self._phase = "center_moving"
-                return
-
-            # ---------- 阶段2：常规检测，发布 object_position，并触发 hover ----------
-            # 用 (u,v) 求平面交点 C_raw
+            # 像素 -> 光学系方向
             x_n = (u - CX) / FX
             y_n = (v - CY) / FY
             if FLIP_X: x_n = -x_n
@@ -422,47 +375,124 @@ class SeeAnythingCenterThenHover(Node):
             d_opt = np.array([x_n, y_n, 1.0], dtype=float)
             d_opt /= np.linalg.norm(d_opt)
 
+            # base 下与 z=Z_VIRT 平面求交
             d_base = R_bc @ d_opt
-            if abs(float(d_base[2])) < 1e-6:
-                self.get_logger().warn("视线近水平，无法与平面求交（阶段2）。")
+            dz = float(d_base[2])
+            if abs(dz) < 1e-6:
+                self.get_logger().error(f"[{self._phase}] 视线近水平，无法求交，退出。")
+                self._shutdown_once()
                 return
-            t_star = (Z_VIRT - float(p_bc[2])) / float(d_base[2])
+            t_star = (Z_VIRT - float(p_bc[2])) / dz
             if t_star < 0:
-                self.get_logger().warn("交点在相机后方（阶段2）。")
+                self.get_logger().error(f"[{self._phase}] 交点在相机后方，退出。")
+                self._shutdown_once()
                 return
             C_raw = p_bc + t_star * d_base
 
-            # XY/Z 硬补偿仅在阶段2用于 object_position
-            C = C_raw.copy()
-            if ENABLE_BASE_BIAS:
-                C[0] += float(BIAS_BASE_X)
-                C[1] += float(BIAS_BASE_Y)
-                C[2] += float(BIAS_BASE_Z)
+            if self._phase == "center_needed":
+                # 只用这帧一次性计算目标相机原点（只改 XY，保持高度与姿态）
+                d_center = R_bc @ np.array([0.0, 0.0, 1.0], dtype=float)
+                dzc = float(d_center[2])
+                if abs(dzc) < 1e-6:
+                    self.get_logger().error("[center] 中心射线近水平，退出。")
+                    self._shutdown_once()
+                    return
+                oz = float(p_bc[2])  # 高度保持
+                ox = float(C_raw[0]) - ((Z_VIRT - oz) / dzc) * float(d_center[0])
+                oy = float(C_raw[1]) - ((Z_VIRT - oz) / dzc) * float(d_center[1])
+                o_new = np.array([ox, oy, oz], dtype=float)
 
-            tf_msg = TransformStamped()
-            tf_msg.header.stamp = self.get_clock().now().to_msg()
-            tf_msg.header.frame_id = BASE_FRAME
-            tf_msg.child_frame_id  = OBJECT_FRAME
-            tf_msg.transform.translation.x = float(C[0])
-            tf_msg.transform.translation.y = float(C[1])
-            tf_msg.transform.translation.z = float(C[2])
-            tf_msg.transform.rotation.x = 0.0
-            tf_msg.transform.rotation.y = 0.0
-            tf_msg.transform.rotation.z = 0.0
-            tf_msg.transform.rotation.w = 1.0
-            self.tf_broadcaster.sendTransform(tf_msg)
-            self._last_good_tf = tf_msg
+                # 叠加 BASE 下微调（仅首次居中）
+                if ENABLE_CENTER_BIAS:
+                    o_new[0] += float(BIAS_CENTER_X)
+                    o_new[1] += float(BIAS_CENTER_Y)
 
-            self.get_logger().info(
-                f"[STAGE2] score={(sc if sc>=0 else float('nan')):.3f} "
-                f"uv=({u:.1f},{v:.1f}) "
-                f"C_raw=({C_raw[0]:.3f},{C_raw[1]:.3f},{C_raw[2]:.3f}) "
-                f"C_corr=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f}) -> {OBJECT_FRAME}"
-            )
+                # 目标 tool0 原点（姿态保持为 q_bt）
+                p_bt_new = o_new - (R_bt @ self.p_t_co)
 
-            # 居中已完成后，拿到有效 TF 即可触发 hover
-            if self._phase == "center_done":
-                self._hover_requested = True
+                # ===== 新增：对“首次居中”的 XY 位移做限幅（以 tool0 在 BASE 下的位移为准）=====
+                delta = p_bt_new - p_bt               # 当前 tool0 -> 目标 tool0
+                dx, dy = float(delta[0]), float(delta[1])
+                dist_xy = math.hypot(dx, dy)
+                clipped = False
+                if ENABLE_CENTER_XY_LIMIT and dist_xy > float(LIMIT_CENTER_XY):
+                    scale = float(LIMIT_CENTER_XY) / dist_xy
+                    p_bt_new = np.array([
+                        float(p_bt[0]) + dx * scale,
+                        float(p_bt[1]) + dy * scale,
+                        float(p_bt_new[2]),            # Z 不变
+                    ], dtype=float)
+                    clipped = True
+                # =======================================================================
+
+                ps = PoseStamped()
+                ps.header.frame_id = POSE_FRAME
+                ps.header.stamp = self.get_clock().now().to_msg()
+                ps.pose.position.x = float(p_bt_new[0])
+                ps.pose.position.y = float(p_bt_new[1])
+                ps.pose.position.z = float(p_bt_new[2])
+                ps.pose.orientation = q_bt  # 姿态保持
+
+                seed = self._get_seed()
+                if seed is None:
+                    self._warn_once("wait_js_center", "等待 /joint_states 作为 IK 种子（居中阶段）…")
+                    return
+
+                move_xy_cmd = (float(p_bt_new[0] - p_bt[0]), float(p_bt_new[1] - p_bt[1]))
+                self.get_logger().info(
+                    f"[CENTER] 触发首帧达标: score={score:.3f}, uv=({u:.1f},{v:.1f}), "
+                    f"moveXY_cmd=({move_xy_cmd[0]:.3f},{move_xy_cmd[1]:.3f})m"
+                    + (" [CLIPPED]" if clipped else "")
+                )
+
+                self._request_ik(ps, seed, tag="center")
+                self._phase = "center_moving"
+                return
+
+            if self._phase == "hover_needed":
+                # 发布 object_position（只在这帧）
+                C = C_raw.copy()
+                if ENABLE_BASE_BIAS:
+                    C[0] += float(BIAS_BASE_X); C[1] += float(BIAS_BASE_Y); C[2] += float(BIAS_BASE_Z)
+
+                tf_msg = TransformStamped()
+                tf_msg.header.stamp = self.get_clock().now().to_msg()
+                tf_msg.header.frame_id = BASE_FRAME
+                tf_msg.child_frame_id  = OBJECT_FRAME
+                tf_msg.transform.translation.x = float(C[0])
+                tf_msg.transform.translation.y = float(C[1])
+                tf_msg.transform.translation.z = float(C[2])
+                tf_msg.transform.rotation.x = 0.0
+                tf_msg.transform.rotation.y = 0.0
+                tf_msg.transform.rotation.z = 0.0
+                tf_msg.transform.rotation.w = 1.0
+                self.tf_broadcaster.sendTransform(tf_msg)
+                self._last_good_tf = tf_msg
+
+                # 基于这帧一次性求悬停位姿并移动
+                x, y, z = C[0], C[1], C[2] + HOVER_ABOVE
+                q_down = (1.0, 0.0, 0.0, 0.0)
+                q_yaw = quat_from_yaw(math.radians(YAW_DEG))
+                q = quat_mul(q_yaw, q_down)
+
+                ps = PoseStamped()
+                ps.header.frame_id = POSE_FRAME
+                ps.header.stamp = self.get_clock().now().to_msg()
+                ps.pose.position.x = float(x)
+                ps.pose.position.y = float(y)
+                ps.pose.position.z = float(z)
+                ps.pose.orientation.x, ps.pose.orientation.y, ps.pose.orientation.z, ps.pose.orientation.w = q
+
+                seed = self._get_seed()
+                if seed is None:
+                    self._warn_once("wait_js_hover", "等待 /joint_states 作为 IK 种子（hover 阶段）…")
+                    return
+                self.get_logger().info(
+                    f"[HOVER] 触发首帧达标: score={score:.3f}, p=({x:.3f},{y:.3f},{z:.3f}), yaw={YAW_DEG:.1f}°"
+                )
+                self._request_ik(ps, seed, tag="hover")
+                self._phase = "hover_moving"
+                return
 
         except Exception as e:
             self.get_logger().error(f"图像处理失败：{e}")
@@ -471,54 +501,44 @@ class SeeAnythingCenterThenHover(Node):
 
     # ---------- 主循环 ----------
     def _tick(self):
-        if self._done_all or self._inflight_ik:
+        if self._finished or self._inflight_ik:
             return
 
         now_ns = self.get_clock().now().nanoseconds
 
-        # ====== 初始位姿阶段 ======
+        # 初始位姿
         if self._phase == "init_needed":
-            # 发布一次初始位姿（不依赖 IK）
-            if not self._init_published:
-                self._publish_init_pose()
-                self._init_due_ns = now_ns + int((INIT_MOVE_TIME_SEC + INIT_EXTRA_WAIT_SEC) * 1e9)
-                self._phase = "init_moving"
-                return
+            self._publish_init_pose()
+            self._phase = "init_moving"
+            # 预计到位 + 静置
+            self._motion_due_ns = now_ns + int((INIT_MOVE_TIME_SEC + INIT_EXTRA_WAIT_SEC + SETTLE_EXTRA_SEC) * 1e9)
+            return
 
-        if self._phase == "init_moving" and self._init_due_ns is not None:
-            if now_ns >= self._init_due_ns:
+        if self._phase == "init_moving":
+            if self._is_stationary():
                 self._phase = "center_needed"
-                self.get_logger().info("初始位姿到位，开始阶段1（检测并平移居中）。")
+                self.get_logger().info("初始位姿到位，等待“静止一帧达标”用于居中。")
+                return
 
-        # ====== 居中阶段收敛等待 ======
-        if self._phase == "center_settling" and self._center_due_ns is not None:
-            if now_ns >= self._center_due_ns:
-                self._phase = "center_done"
-                self.get_logger().info("CENTER 运动完成，进入阶段2（再次检测并发布 object_position）。")
+        if self._phase == "center_moving":
+            if self._is_stationary():
+                self._phase = "hover_needed"
+                self.get_logger().info("居中完成，等待“静止一帧达标”用于悬停。")
+                return
 
-        # ====== 悬停触发 ======
-        if self._phase == "center_done" and self._hover_requested and self._last_good_tf is not None:
-            if not self._ensure_ik_client():
+        if self._phase == "hover_moving":
+            if self._is_stationary():
+                self._finished = True
+                self.get_logger().info("悬停运动完成，流程结束。")
+                self.create_timer(0.5, self._shutdown_once)
                 return
-            seed = self._get_seed()
-            if seed is None:
-                self._warn_once("wait_js_hover", "等待 /joint_states 作为 IK 种子（hover 阶段）…")
-                return
-            ps = self._make_hover_pose()
-            if ps is None:
-                return
-            self.get_logger().info(
-                f"[HOVER] p=({ps.pose.position.x:.3f},{ps.pose.position.y:.3f},{ps.pose.position.z:.3f}), "
-                f"yaw={YAW_DEG:.1f}°, hover={HOVER_ABOVE:.3f}m"
-            )
-            self._request_ik(ps, seed, tag="hover")
-            self._hover_requested = False  # 防多次触发
 
     # ---------- IK/种子 ----------
     def _ensure_ik_client(self) -> bool:
         if self._ik_client:
             return True
-        for name in self._ik_candidates:
+        candidates = [IK_SERVICE_EXPLICIT] if IK_SERVICE_EXPLICIT else ["/compute_ik", "/move_group/compute_ik"]
+        for name in candidates:
             if not name:
                 continue
             cli = self.create_client(GetPositionIK, name)
@@ -527,7 +547,7 @@ class SeeAnythingCenterThenHover(Node):
                 self._ik_service_name = name
                 self.get_logger().info(f"IK 服务可用：{name}")
                 return True
-        self._warn_once("wait_ik", f"等待 IK 服务…（尝试：{self._ik_candidates}）")
+        self._warn_once("wait_ik", "等待 IK 服务…")
         return False
 
     def _get_seed(self) -> Optional[JointState]:
@@ -550,32 +570,6 @@ class SeeAnythingCenterThenHover(Node):
         js.header.stamp = self.get_clock().now().to_msg()
         return js
 
-    # ---------- 生成悬停位姿 ----------
-    def _make_hover_pose(self) -> Optional[PoseStamped]:
-        try:
-            tf = self.tf_buffer.lookup_transform(POSE_FRAME, OBJECT_FRAME, Time(),
-                                                 timeout=RclDuration(seconds=0.5))
-        except TransformException as ex:
-            self._warn_once("tf_object", f"TF 未就绪：{POSE_FRAME} <- {OBJECT_FRAME} ：{ex}")
-            return None
-
-        x = tf.transform.translation.x
-        y = tf.transform.translation.y
-        z = tf.transform.translation.z + HOVER_ABOVE
-
-        q_down = (1.0, 0.0, 0.0, 0.0)
-        q_yaw  = quat_from_yaw(math.radians(YAW_DEG))
-        q      = quat_mul(q_yaw, q_down)
-
-        ps = PoseStamped()
-        ps.header.frame_id = POSE_FRAME
-        ps.header.stamp = self.get_clock().now().to_msg()
-        ps.pose.position.x = x
-        ps.pose.position.y = y
-        ps.pose.position.z = z
-        ps.pose.orientation.x, ps.pose.orientation.y, ps.pose.orientation.z, ps.pose.orientation.w = q
-        return ps
-
     # ---------- 发起 IK ----------
     def _request_ik(self, pose: PoseStamped, seed: JointState, tag: str):
         if not self._ensure_ik_client():
@@ -591,24 +585,22 @@ class SeeAnythingCenterThenHover(Node):
             nanosec=int((IK_TIMEOUT_SEC % 1.0) * 1e9),
         )
         self._inflight_ik = True
-        self._pending_motion_tag = tag
         fut = self._ik_client.call_async(req)
-        fut.add_done_callback(self._on_ik_done)
+        fut.add_done_callback(lambda f: self._on_ik_done(f, tag))
 
     # ---------- IK 回调 ----------
-    def _on_ik_done(self, fut):
+    def _on_ik_done(self, fut, tag: str):
         self._inflight_ik = False
-        tag = self._pending_motion_tag
-        self._pending_motion_tag = None
-
         try:
             res = fut.result()
         except Exception as e:
             self.get_logger().error(f"IK 调用异常[{tag}]：{e}")
+            self._shutdown_once()
             return
         if res is None or res.error_code.val != 1:
             code = None if res is None else res.error_code.val
-            self.get_logger().error(f"IK 未找到解[{tag}]，error_code={code}")
+            self.get_logger().error(f"IK 未找到解[{tag}]，error_code={code}。退出。")
+            self._shutdown_once()
             return
 
         name_to_idx: Dict[str, int] = {n: i for i, n in enumerate(res.solution.joint_state.name)}
@@ -620,7 +612,8 @@ class SeeAnythingCenterThenHover(Node):
             else:
                 target_positions.append(res.solution.joint_state.position[name_to_idx[jn]])
         if missing:
-            self.get_logger().error(f"IK 结果缺少关节[{tag}]: {missing}")
+            self.get_logger().error(f"IK 结果缺少关节[{tag}]: {missing}。退出。")
+            self._shutdown_once()
             return
 
         traj = JointTrajectory()
@@ -634,17 +627,16 @@ class SeeAnythingCenterThenHover(Node):
         traj.points = [pt]
         self.pub_traj.publish(traj)
 
-        self.get_logger().info(
-            f"已发布关节目标[{tag}]："
-            + "[" + ", ".join(f"{v:.6f}" for v in target_positions) + f"], T={MOVE_TIME_SEC:.1f}s"
-        )
+        # 设定“预计到位时刻” + 额外静置
+        now_ns = self.get_clock().now().nanoseconds
+        self._motion_due_ns = now_ns + int((MOVE_TIME_SEC + SETTLE_EXTRA_SEC) * 1e9)
+
+        self.get_logger().info(f"已发布关节目标[{tag}]，T={MOVE_TIME_SEC:.1f}s")
 
         if tag == "center":
-            self._phase = "center_settling"
-            self._center_due_ns = self.get_clock().now().nanoseconds + int((MOVE_TIME_SEC + CENTER_SETTLE_EXTRA_SEC)*1e9)
+            self._phase = "center_moving"
         elif tag == "hover":
-            self._done_all = True
-            self.create_timer(0.5, self._shutdown_once)
+            self._phase = "hover_moving"
 
     # ---------- 启动时发布初始位姿（不走 IK） ----------
     def _publish_init_pose(self):
@@ -658,16 +650,13 @@ class SeeAnythingCenterThenHover(Node):
         )
         traj.points = [pt]
         self.pub_traj.publish(traj)
-        self._init_published = True
-        self.get_logger().info(
-            "已发布初始位姿：[" + ", ".join(f"{v:.6f}" for v in INIT_POS) +
-            f"], T={INIT_MOVE_TIME_SEC:.1f}s"
-        )
+        self.get_logger().info("已发布初始位姿，等待到位…")
 
     # ---------- 收尾 ----------
     def _shutdown_once(self):
-        self.get_logger().info("全部完成，退出节点。")
-        rclpy.shutdown()
+        if rclpy.ok():
+            self.get_logger().info("退出节点。")
+            rclpy.shutdown()
 
     def destroy_node(self):
         try:
