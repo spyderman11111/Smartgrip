@@ -2,20 +2,39 @@
 # -*- coding: utf-8 -*-
 
 """
-seeanything_minimal_clean.py — GroundingDINO + 虚拟平面投影（稳健版，含XY硬补偿）
+seeanything_minimal_clean.py — GroundingDINO + 虚拟平面投影（稳健版，含XY硬补偿 + UV径向补偿）
 
 功能要点：
 - 只使用“最高置信度”目标来计算并发布 TF（object_position），其余目标忽略
 - 丢帧限速 + 最近一次有效 TF 周期性重广播，避免 RViz TF 断线
 - 处理手眼外参坐标系差异（tool->camera_optical vs tool->camera_link）
-- 在 base_link 下对求得的 3D 点做常量平移补偿（默认 X/Y 各 +0.15 m，Z 不补偿）
+- 在 base_link 下对求得的 3D 点做常量平移补偿（默认 X/Y 各 -0.05/-0.17 m）
+- 新增：UV 径向/非等向补偿（离中心越远补偿越强，长边方向更强）以修正“靠近长边达不到”的误差
 """
 
-# ====== 快速误差补偿（默认启用，X/Y 各 +0.15 m；Z 不补偿） ======
+# ====== 快速误差补偿（base 下的 XYZ 常量位移） ======
 ENABLE_BASE_BIAS = True
 BIAS_BASE_X = -0.05   # +X 前/右，单位米
-BIAS_BASE_Y = -0.17  # +Y 左/侧，单位米
-BIAS_BASE_Z = 0.00   # Z 平面误差（通常为 0）
+BIAS_BASE_Y = -0.17   # +Y 左/侧，单位米
+BIAS_BASE_Z = 0.00    # Z 平面误差（通常为 0）
+
+# ====== UV 径向/非等向补偿（像素域→光学域之前；默认启用） ======
+ENABLE_UV_RADIAL_FIX = True
+# 等向（圆对称）分量：r^2 = x^2 + y^2，x=(u-CX)/FX, y=(v-CY)/FY
+# 正常“长边达不到”→ 往外拉一丢丢：K1_ISO 取正且较小；K2_ISO 先置 0
+K1_ISO = 0.02       # 0.00~0.08 之间调；正值 = 向外拉
+K2_ISO = 0.00
+
+# 非等向分量：对图像的“长边”方向增强补偿
+ENABLE_UV_ANISO = True
+LONG_EDGE_AXIS = 'auto'  # 'auto' | 'x' | 'y'；auto=根据图像宽高自动判断
+R_ECC = 1.35             # 椭圆半径拉伸比例（>1 表示长边半径更“远”）
+KX1 = 0.08               # x 方向附加系数（长边若为 x 建议更大）
+KY1 = 0.02               # y 方向附加系数（短边方向较小）
+
+# 安全限幅（避免过度拉伸/收缩）
+UV_SCALE_MIN = 0.85      # 允许的最小缩放
+UV_SCALE_MAX = 1.35      # 允许的最大放大
 
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
@@ -68,7 +87,7 @@ DEBUG_WINDOW         = False      # 是否弹本地窗口（默认关）
 DRAW_BEST_BOX        = False      # 只画“最佳”那个框（默认不画，以免卡顿）
 DEBUG_HZ             = 5.0        # 调试窗口最大刷新 Hz
 TF_REBROADCAST_HZ    = 20.0       # 最近一次有效 TF 的重广播频率
-FLIP_X               = False       # 若左右镜像，可把这里改为 True
+FLIP_X               = False      # 若左右镜像，可把这里改为 True
 FLIP_Y               = False      # 若上下镜像，可把这里改为 True
 
 # ================== 你的 DINO 封装 ==================
@@ -106,6 +125,58 @@ R_CL_CO = np.array([
     [-1.0, 0.0,  0.0],
     [0.0, -1.0,  0.0]
 ], dtype=float)
+
+
+def correct_uv_with_radial(u: float, v: float, cx: float, cy: float,
+                           fx: float, fy: float,
+                           img_w: int, img_h: int) -> Tuple[float, float]:
+    """
+    对 (u,v) 做半径相关的等向 + 非等向缩放补偿，返回校正后的 (u', v')。
+    - 先将像素坐标归一化到光学平面 (x,y)，做缩放，再映回像素。
+    - 等向项用 K1_ISO/K2_ISO；非等向项在判定的长边方向更强（KX1/KY1, R_ECC）。
+    """
+    if not ENABLE_UV_RADIAL_FIX:
+        return u, v
+
+    # 归一化
+    x = (u - cx) / fx
+    y = (v - cy) / fy
+
+    # 等向半径
+    r2 = x*x + y*y
+    scale_iso = 1.0 + K1_ISO * r2 + K2_ISO * (r2*r2)
+
+    # 非等向增强（沿长边方向更强）
+    sx, sy = scale_iso, scale_iso
+    if ENABLE_UV_ANISO:
+        # 确定长边轴
+        if LONG_EDGE_AXIS == 'x':
+            long_x = True
+        elif LONG_EDGE_AXIS == 'y':
+            long_x = False
+        else:  # auto
+            long_x = (img_w >= img_h)
+
+        # 定义椭圆半径：把长边方向半径拉伸 R_ECC 倍
+        if long_x:
+            r2_e = (x * R_ECC) ** 2 + (y ** 2)
+            sx = scale_iso * (1.0 + KX1 * r2_e)
+            sy = scale_iso * (1.0 + KY1 * r2_e)
+        else:
+            r2_e = (x ** 2) + (y * R_ECC) ** 2
+            sx = scale_iso * (1.0 + KX1 * r2_e)  # 这里依然允许单独调 x/y
+            sy = scale_iso * (1.0 + KY1 * r2_e)
+
+    # 限幅
+    sx = min(max(sx, UV_SCALE_MIN), UV_SCALE_MAX)
+    sy = min(max(sy, UV_SCALE_MIN), UV_SCALE_MAX)
+
+    # 应用缩放，再映回像素
+    x_corr = x * sx
+    y_corr = y * sy
+    u_corr = cx + x_corr * fx
+    v_corr = cy + y_corr * fy
+    return float(u_corr), float(v_corr)
 
 
 class SeeAnythingMinimal(Node):
@@ -153,7 +224,8 @@ class SeeAnythingMinimal(Node):
 
         self.get_logger().info(
             f"[seeanything_minimal_clean] topic={IMAGE_TOPIC}, prompt='{TEXT_PROMPT}', "
-            f"tf_time_mode={TF_TIME_MODE}, stride={FRAME_STRIDE}, hand_eye={HAND_EYE_FRAME}"
+            f"tf_time_mode={TF_TIME_MODE}, stride={FRAME_STRIDE}, hand_eye={HAND_EYE_FRAME}; "
+            f"UVfix={'on' if ENABLE_UV_RADIAL_FIX else 'off'} aniso={'on' if ENABLE_UV_ANISO else 'off'}"
         )
 
     # 定时重广播最近一次有效 TF（防断）
@@ -205,18 +277,20 @@ class SeeAnythingMinimal(Node):
             v = 0.5 * (y0 + y1)
             sc = s[best]
 
-            # 4) 像素 → 光学系视线
+            # 3.5) UV 径向/非等向补偿（先校正 uv，再做后续）
+            h, w = rgb.shape[:2]
+            u, v = correct_uv_with_radial(u, v, CX, CY, FX, FY, w, h)
+
+            # 4) 像素 → 光学系视线（先标准归一化）
             x_n0 = (u - CX) / FX
             y_n0 = (v - CY) / FY
 
-            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-            # ★ 仅此处修改：在光学平面做 +90° 旋转以修正“上->左, 左->下, 右->上, 下->右”的错位
-            # ★ 公式： (x, y) = (-y0, x0)
-            # ★ 说明：这是一致的二维线性旋转，不做镜像，不改其余任何逻辑。
-            # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+            # ★ 与原脚本一致：在光学平面做 +90° 的轴旋转
+            #   公式： (x, y) = ( +y0, -x0 )
             x_n =  y_n0
-            y_n =  -x_n0
-            # （如你开启了 FLIP_X/FLIP_Y，下两行仍然保留原行为）
+            y_n = -x_n0
+
+            # 可选镜像修正
             if FLIP_X: x_n = -x_n
             if FLIP_Y: y_n = -y_n
 
@@ -280,7 +354,7 @@ class SeeAnythingMinimal(Node):
 
             self.get_logger().info(
                 f"[best only] score={(sc if sc>=0 else float('nan')):.3f} "
-                f"uv=({u:.1f},{v:.1f}) "
+                f"uv_corr=({u:.1f},{v:.1f}) "
                 f"C_raw=({C_raw[0]:.3f},{C_raw[1]:.3f},{C_raw[2]:.3f}) "
                 f"C_corr=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f}) -> {OBJECT_FRAME}"
             )
@@ -292,11 +366,12 @@ class SeeAnythingMinimal(Node):
                     dbg = cv2.cvtColor(rgb.copy(), cv2.COLOR_RGB2BGR)
                     x0i, y0i, x1i, y1i = map(int, [x0, y0, x1, y1])
                     txt = f"{sc:.2f}" if sc >= 0 else ""
-                    cv2.rectangle(dbg, (x0i, y0i), (x1i, y1i), 2)
+                    color = (0, 255, 0)
+                    cv2.rectangle(dbg, (x0i, y0i), (x1i, y1i), color, 2)
                     if txt:
                         cv2.putText(dbg, txt, (x0i, max(0, y0i-6)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                    cv2.circle(dbg, (int(round(u)), int(round(v))), 5, -1)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    cv2.circle(dbg, (int(round(u)), int(round(v))), 5, (255,0,0), -1)  # 画校正后的 uv
                     cv2.imshow("DINO Debug", dbg)
                     cv2.waitKey(1)
                     self._last_debug_pub = now
