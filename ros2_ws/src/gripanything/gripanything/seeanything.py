@@ -5,11 +5,10 @@
 seeanything_minimal_clean.py — 一次检测 + 悬停 + N点圆周逐点IK + 返回初始姿态（不闭合）
 
 更新要点：
-- 取消“回到起点”的闭合点；
-- 不添加 MoveIt JointConstraint，避免 IK 失败；
-- 用“上一次发布的解”做下一步 IK 的软件种子，并做 2π 邻近展开；
-- 若某一步关节跳变过大，则跳过该顶点（不发布轨迹），继续下一个顶点；
-- 保持 yaw 连续（不 wrap 到 [-π,π]），减少姿态突变导致的分支切换。
+- 圆周**起点 = 开始圆周前“当前末端执行器（tool X 轴）在XY平面上的朝向”**；
+- 顺序与方向严格一致（POLY_DIR），不闭合；
+- EE 朝向默认“径向朝内”(ORIENT_MODE='radial_in')，始终指向圆心；可选 radial_out/tangent；
+- 关节跳变检测忽略末端轴（默认忽略 wrist_3_joint），仅限制其它关节；保留 2π 邻近展开。
 """
 
 from typing import Optional, Tuple, List
@@ -34,10 +33,10 @@ from PIL import Image as PILImage
 
 from moveit_msgs.srv import GetPositionIK
 
-# ====== 误差补偿 ======
+# ====== 误差补偿（保留可改） ======
 ENABLE_BASE_BIAS = True
 BIAS_BASE_X = -0.05
-BIAS_BASE_Y = -0.17
+BIAS_BASE_Y = -0.25
 BIAS_BASE_Z = 0.00
 
 # ================== 基本配置 ==================
@@ -75,8 +74,8 @@ TF_REBROADCAST_HZ    = 20.0
 FLIP_X               = False
 FLIP_Y               = False
 
-# IK / 控制
-HOVER_ABOVE      = 0.40                 # 悬停高度（m）
+# ===== IK / 控制 =====
+HOVER_ABOVE      = 0.30                 # 悬停高度（m）
 GROUP_NAME       = 'ur_manipulator'
 IK_LINK_NAME     = 'tool0'
 IK_TIMEOUT       = 2.0                  # s
@@ -107,20 +106,24 @@ INIT_EXTRA_WAIT = 0.3  # s
 REQUIRE_STATIONARY  = True
 VEL_EPS_RAD_PER_SEC = 0.02
 
-# ====== N 点圆周 + 逐点IK（轻量） ======
-POLY_N_VERTICES      = 8        # 4–16 之间为宜
+# ====== N 点圆周 + 逐点IK ======
+POLY_N_VERTICES      = 4        # 4–16 之间为宜
+# 起点方向相对“当前EE朝向”的额外旋转（在 base_link XY 平面；正=CCW）
+START_DIR_OFFSET_DEG = -90.0
 POLY_NUM_TURNS       = 1        # 旋转圈数
-POLY_START_DEG       = -90      # 起始角（0=+X 方向）
 POLY_DIR             = 'ccw'    # 'ccw' 或 'cw'
-CIRCLE_RADIUS        = 0.05     # 圆半径（m）
-ORIENT_WITH_PATH     = True     # True：末端旋转方向与轨迹方向一致；False：相反
-TOOL_Z_SIGN          = '-'      # 工具 Z 与 world Z 对齐方向（'-' = 朝下）
-DWELL_TIME           = 0.25     # 每个顶点停顿（拍照）秒
-EDGE_MOVE_TIME       = 1.5      # 单段移动时间（s）
+CIRCLE_RADIUS        = 0.15     # 圆半径（m）
 
-# 跳变监测阈值（不发布过大跳变的解）
-MAX_SAFE_JUMP_RAD    = 1.2      # 单关节与上一步的最大允许跳变（弧度），建议 0.8~1.5
-MAX_WARN_JUMP_RAD    = 2.2      # 仅用于打印更醒目的警告
+# EE 朝向模式：径向朝内/朝外/切向（默认径向朝内，指向圆心）
+ORIENT_MODE          = 'radial_in'       # 'radial_in' | 'radial_out' | 'tangent'
+TOOL_Z_SIGN          = '-'               # 工具 Z 与 world Z 对齐方向（'-' = 朝下）
+DWELL_TIME           = 0.25              # 每个顶点停顿（拍照）秒
+EDGE_MOVE_TIME       = 3.0               # 单段移动时间（s）
+
+# 跳变监测阈值（对“非忽略关节”生效）
+MAX_SAFE_JUMP_RAD    = 1.2
+MAX_WARN_JUMP_RAD    = 2.2
+SAFE_JUMP_IGNORE_JOINTS = ['wrist_3_joint']  # 默认忽略末端一轴的跳变
 
 # ================== DINO 封装 ==================
 try:
@@ -157,7 +160,7 @@ def tfmsg_to_Rp(transform: TransformStamped) -> Tuple[np.ndarray, np.ndarray]:
     p = np.array([t.x, t.y, t.z], dtype=float)
     return R, p
 
-# camera_link <- camera_optical 的固定旋转（REP-105）
+# camera_link <- camera_optical（REP-105）
 R_CL_CO = np.array([
     [0.0,  0.0,  1.0],
     [-1.0, 0.0,  0.0],
@@ -166,7 +169,6 @@ R_CL_CO = np.array([
 
 TWO_PI = 2.0 * math.pi
 def _wrap_to_near(angle: float, ref: float) -> float:
-    """将 angle 映射到与 ref 最接近的等效角（差 k·2π 等价）"""
     return angle + round((ref - angle) / TWO_PI) * TWO_PI
 
 def _quat_mul(q1_wxyz, q2_wxyz):
@@ -180,10 +182,7 @@ def _quat_mul(q1_wxyz, q2_wxyz):
     ], dtype=float)
 
 def yaw_to_quat_wxyz(yaw: float, sign: str = "-") -> np.ndarray:
-    """
-    连续 yaw：q = Rz(yaw) 或 Rz(yaw)*Rx(pi)（工具Z朝下）
-    返回 [w,x,y,z]。
-    """
+    """q = Rz(yaw) 或 Rz(yaw)*Rx(pi)（工具Z朝下），返回 [w,x,y,z]。"""
     c = math.cos(0.5*yaw)
     s = math.sin(0.5*yaw)
     qz = np.array([c, 0.0, 0.0, s], dtype=float)
@@ -242,15 +241,16 @@ class SeeAnythingMinimal(Node):
         self._last_js: Optional[JointState] = None
         self.create_subscription(JointState, '/joint_states', self._on_js, qos_js)
 
-        # —— 新增：保存“上一次发布的解”，用于下一步 IK 的软件种子 ——
+        # —— 软种子（上一解），用于 2π 邻近展开 ——
         self._seed_hint: Optional[np.ndarray] = None
 
-        # 圆心与圆周
+        # 圆心/圆周数据
         self._circle_center: Optional[np.ndarray] = None  # 仅初始帧，已加 bias
         self._ring_z: Optional[float] = None
         self._poly_wps: List[PoseStamped] = []
         self._poly_idx: int = 0
         self._poly_dwell_due_ns: Optional[int] = None
+        self._start_yaw: Optional[float] = None  #  圆周起点的 yaw = 开始时 EE 朝向
 
         # 状态机
         # init_needed -> init_moving -> wait_detect -> hover_to_center -> poly_prepare -> poly_moving -> return_init -> done
@@ -261,13 +261,14 @@ class SeeAnythingMinimal(Node):
         self._done = False
         self._warned_once = set()
         self._fixed_hover_pose: Optional[PoseStamped] = None
+        self._frame_count = 0
 
         self.create_timer(0.05, self._tick)
 
         self.get_logger().info(
             f"[seeanything_minimal_clean] topic={IMAGE_TOPIC}, hover={HOVER_ABOVE:.3f}m, "
             f"bias=({BIAS_BASE_X:.3f},{BIAS_BASE_Y:.3f},{BIAS_BASE_Z:.3f}); N={POLY_N_VERTICES}, R={CIRCLE_RADIUS:.3f}m, "
-            f"orient_with_path={ORIENT_WITH_PATH}"
+            f"orient={ORIENT_MODE}, dir={POLY_DIR}"
         )
 
     # ---------- TF 重广播 ----------
@@ -307,6 +308,20 @@ class SeeAnythingMinimal(Node):
         except Exception:
             return True
 
+    # ---------- 读取当前 tool0 的 XY 平面 yaw（以工具 X 轴为“前向”） ----------
+    def _get_tool_yaw_xy(self) -> Optional[float]:
+        try:
+            T_bt = self.tf_buffer.lookup_transform(BASE_FRAME, TOOL_FRAME, Time(),
+                                                   timeout=RclDuration(seconds=0.2))
+            R_bt, _ = tfmsg_to_Rp(T_bt)
+            ex = R_bt[:, 0]  # tool x 轴在 base 下的方向
+            yaw = math.atan2(float(ex[1]), float(ex[0]))  # [-pi, pi]
+            # 不 wrap，交给下游保持连续
+            return float(yaw)
+        except Exception as ex:
+            self.get_logger().warn(f"读取当前 tool yaw 失败：{ex}")
+            return None
+
     # ---------- 主循环 ----------
     def _tick(self):
         if self._done or self._inflight:
@@ -337,14 +352,15 @@ class SeeAnythingMinimal(Node):
         if self._phase == 'hover_to_center':
             if not self._is_stationary():
                 return
+            # 记录开始圆周前的“当前 EE 朝向”
+            self._start_yaw = self._get_tool_yaw_xy()
             # 准备圆周顶点
-            if self._circle_center is not None and self._ring_z is not None:
-                self._poly_wps = self._make_polygon_vertices(self._circle_center, self._ring_z)
+            if self._circle_center is not None and self._ring_z is not None and self._start_yaw is not None:
+                self._poly_wps = self._make_polygon_vertices(self._circle_center, self._ring_z, self._start_yaw)
                 self._poly_idx = 0
-                self.get_logger().info(f"顶点序列生成：{len(self._poly_wps)} 个。")
+                self.get_logger().info(f"顶点序列生成：{len(self._poly_wps)} 个，start_yaw={self._start_yaw:.3f} rad。")
                 self._phase = 'poly_prepare'
             else:
-                # 没有圆心就退出
                 self._done = True
                 self.create_timer(0.5, self._shutdown_once)
             return
@@ -375,8 +391,7 @@ class SeeAnythingMinimal(Node):
 
             # 下一步或结束
             if self._poly_idx >= len(self._poly_wps):
-                # 直接回初始姿态（5s）
-                self._publish_init_pose(INIT_MOVE_TIME)
+                self._publish_init_pose(INIT_MOVE_TIME)  # 回初始位姿
                 self._phase = 'return_init'
                 return
 
@@ -403,8 +418,7 @@ class SeeAnythingMinimal(Node):
         self.get_logger().info(f"已发布关节初始位姿（T={move_time:.1f}s）…")
         now_ns = self.get_clock().now().nanoseconds
         self._motion_due_ns = now_ns + int((move_time + INIT_EXTRA_WAIT) * 1e9)
-        # 初始化软件种子为初始位姿（让第一步也稳定）
-        self._seed_hint = np.array(INIT_POS, dtype=float)
+        self._seed_hint = np.array(INIT_POS, dtype=float)  # 第一解作为软种子
 
     # ---------- 图像回调：只在“初始位姿静止”后触发一次 ----------
     def _cb_image(self, msg: Image):
@@ -415,8 +429,6 @@ class SeeAnythingMinimal(Node):
         if not self._is_stationary():
             return
         if FRAME_STRIDE > 1:
-            if not hasattr(self, '_frame_count'):
-                self._frame_count = 0
             self._frame_count += 1
             if (self._frame_count % FRAME_STRIDE) != 0:
                 return
@@ -449,7 +461,7 @@ class SeeAnythingMinimal(Node):
             u = 0.5 * (x0 + x1)
             v = 0.5 * (y0 + y1)
 
-            # 像素 -> 光学系视线
+            # 像素 -> 光学系视线（与你原先一致）
             x_n0 = (u - CX) / FX
             y_n0 = (v - CY) / FY
             x_n =  y_n0
@@ -590,7 +602,6 @@ class SeeAnythingMinimal(Node):
         )
         self._inflight = True
         fut = self._ik_client.call_async(req)
-        # 把 seed 一起带进回调用于 2π 邻近映射与跳变判定
         fut.add_done_callback(lambda f, sd=seed, mt=move_time: self._on_ik_done(f, mt, sd))
 
     def _on_ik_done(self, fut, move_time: float, seed: JointState):
@@ -613,8 +624,8 @@ class SeeAnythingMinimal(Node):
             ref = {n: float(p) for n, p in zip(seed.name, seed.position)}
 
         target_positions: List[float] = []
-        missing = []
         jumps = []
+        missing = []
         for jn in UR5E_JOINT_ORDER:
             if jn not in name_to_idx:
                 missing.append(jn)
@@ -622,13 +633,14 @@ class SeeAnythingMinimal(Node):
             raw = float(res.solution.joint_state.position[name_to_idx[jn]])
             near = _wrap_to_near(raw, ref.get(jn, raw))
             target_positions.append(near)
-            jumps.append(abs(near - ref.get(jn, near)))
+            if jn not in SAFE_JUMP_IGNORE_JOINTS:
+                jumps.append(abs(near - ref.get(jn, near)))
 
         if missing:
             self.get_logger().error(f"IK 结果缺少关节: {missing}")
             return
 
-        # 跳变检测：若任一关节超阈值，则跳过该顶点以避免危险动作
+        # 跳变检测（仅非忽略关节）
         max_jump = max(jumps) if jumps else 0.0
         if max_jump > MAX_WARN_JUMP_RAD:
             self.get_logger().warn(
@@ -664,37 +676,57 @@ class SeeAnythingMinimal(Node):
             return
         self._request_ik(ps, seed, move_time)
 
-    # ---------- 生成 N 个等分顶点（不闭合；姿态与轨迹方向可一致/相反） ----------
-    def _make_polygon_vertices(self, C: np.ndarray, ring_z: float) -> List[PoseStamped]:
+    # ---------- 生成 N 个等分顶点（不闭合；起点=当前EE朝向） ----------
+    def _make_polygon_vertices(self, C: np.ndarray, ring_z: float, start_yaw: float) -> List[PoseStamped]:
+        """
+        令顶点角 θ 的位置 p = C + r[cosθ, sinθ]。
+        - ORIENT_MODE='radial_in'  → 期望 yaw = θ + π
+        - ORIENT_MODE='radial_out' → 期望 yaw = θ
+        - ORIENT_MODE='tangent'    → 期望 yaw = θ + s·π/2，s=+1(ccw) / -1(cw)
+
+        这里引入 START_DIR_OFFSET_DEG（正=逆时针）对 θ 统一加偏移，同时 yaw 减同样的偏移，
+        从而满足：起点处 yaw(θ0) = start_yaw，且第一步位移方向可按偏移动。
+        """
         n = max(3, int(POLY_N_VERTICES))
         turns = max(1, int(POLY_NUM_TURNS))
         total_deg = 360.0 * turns
         ccw = (POLY_DIR.strip().lower() == 'ccw')
-        step = total_deg / n
-        start = float(POLY_START_DEG)
+        step = math.radians(total_deg / n)
+        dir_sign = +1.0 if ccw else -1.0
+        s_tan = +1.0 if ccw else -1.0
 
-        dir_sign = 1.0 if ORIENT_WITH_PATH else -1.0  # True: 与路径同向；False: 反向
+        offset = math.radians(START_DIR_OFFSET_DEG)
+
+        # 由“当前 yaw”反解基础起点角，再叠加 offset 作为真实起点角 θ0
+        if ORIENT_MODE == 'radial_in':
+            theta0 = (start_yaw - math.pi) + offset
+        elif ORIENT_MODE == 'radial_out':
+            theta0 = start_yaw + offset
+        else:  # tangent
+            theta0 = (start_yaw - s_tan * (math.pi / 2)) + offset
+
         wps: List[PoseStamped] = []
         for i in range(n):
-            deg = start + (i*step if ccw else -i*step)
-            th = math.radians(deg)
+            th = theta0 + dir_sign * (i * step)       # 顶点位置角
             px = C[0] + CIRCLE_RADIUS * math.cos(th)
             py = C[1] + CIRCLE_RADIUS * math.sin(th)
             p  = np.array([px, py, ring_z], dtype=float)
 
-            # 工具 X 轴沿切线：yaw = 方位角 + 90°(ccw)/-90°(cw)，再乘 dir_sign 控制一致/相反
-            s = 1.0 if ccw else -1.0
-            theta = math.atan2(py - C[1], px - C[0])
-            yaw = theta + dir_sign * s * (math.pi/2)
-            # 关键：不 wrap，保持整圈连续
-            q_wxyz = yaw_to_quat_wxyz(yaw, sign=TOOL_Z_SIGN)
+            # yaw 减去相同的 offset，保证 i=0 时 yaw == start_yaw
+            if ORIENT_MODE == 'radial_in':
+                yaw = th + math.pi - offset
+            elif ORIENT_MODE == 'radial_out':
+                yaw = th - offset
+            else:
+                yaw = th + s_tan * (math.pi/2) - offset
 
+            q_wxyz = yaw_to_quat_wxyz(yaw, sign=TOOL_Z_SIGN)
             ps = pose_from_pq(p, q_wxyz, POSE_FRAME)
             ps.header.stamp = self.get_clock().now().to_msg()
             wps.append(ps)
 
-        # 不闭合：不追加回到起点
-        return wps
+        return wps  # 不闭合
+
 
     # ---------- 收尾 ----------
     def _shutdown_once(self):

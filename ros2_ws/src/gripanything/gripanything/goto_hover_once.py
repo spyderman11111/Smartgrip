@@ -20,7 +20,7 @@ seeanything_minimal_clean.py — GroundingDINO + 虚拟平面投影
 # ====== 快速误差补偿（默认启用） ======
 ENABLE_BASE_BIAS = True
 BIAS_BASE_X = -0.03   # 工作台左右，-为往右（单位 m）
-BIAS_BASE_Y = -0.17   # 工作台前后/上下（单位 m）
+BIAS_BASE_Y = -0.17   # 工作台上下（单位 m）
 BIAS_BASE_Z = 0.00    # Z 平面误差（通常 0）
 
 # ====== UV 径向/非等向补偿（像素域→光学域之前；默认启用） ======
