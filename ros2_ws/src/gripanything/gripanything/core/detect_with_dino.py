@@ -5,7 +5,6 @@ import inspect
 class GroundingDinoPredictor:
     """
     Wrapper for using a GroundingDINO model for zero-shot object detection.
-    兼容不同 transformers 版本的后处理参数名（box_threshold/box_thresh 等）。
     """
 
     def __init__(self, model_id="IDEA-Research/grounding-dino-tiny", device="cuda"):
@@ -21,7 +20,6 @@ class GroundingDinoPredictor:
         self._post_sig_params = set(inspect.signature(self._post).parameters.keys())
 
     def _to_device(self, inputs):
-        """把 processor 输出搬到 device。兼容老版本 BatchFeature 没 .to 的情况。"""
         if hasattr(inputs, "to"):
             return inputs.to(self.device)
         return {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
@@ -57,9 +55,9 @@ class GroundingDinoPredictor:
             results = self._post(outputs, input_ids, [image.size[::-1]], **thresh_kwargs)
 
         out = results[0]
-        boxes  = out["boxes"]                      # (N, 4) tensor
-        labels = out.get("labels", [])             # List[str]（多数实现）
-        scores = out.get("scores", None)           # (N,) tensor —— 置信度
+        boxes  = out["boxes"]                      
+        labels = out.get("labels", [])             
+        scores = out.get("scores", None)           
 
         return boxes, labels, scores
 
@@ -73,7 +71,7 @@ if __name__ == "__main__":
 
     image_path = "/home/MA_SmartGrip/orange.png"
     image = Image.open(image_path).convert("RGB")
-    prompt = "orange object ."   # DINO 更偏好 'class .' 形式
+    prompt = "orange object ."   
 
     predictor = GroundingDinoPredictor(model_id="IDEA-Research/grounding-dino-tiny")
     boxes, labels, scores = predictor.predict(image, prompt, box_threshold=0.20, text_threshold=0.20)
