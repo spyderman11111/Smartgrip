@@ -2,10 +2,10 @@
 vision_geom.py — Single-shot detection + ray casting to z=Z_VIRT to get circle center.
 
 Purpose:
-- Run GroundingDINO once to detect the highest-score box for the given prompt.
-- Convert pixel center to optical-ray, then to base frame using tool->camera extrinsics.
-- Intersect the ray with a virtual plane z=Z_VIRT to get C, add bias, and build:
-  (1) a hover pose over C with tool-Z-down, (2) object and circle TFs for visualization.
+- Run GroundingDINO once for the prompt.
+- Convert pixel to an optical ray, transform to base, intersect with z=Z_VIRT.
+- If the best detection confidence is below a configured threshold, skip execution.
+- Otherwise, return (C, hover pose, object TF, circle TF).
 """
 
 from typing import Optional, Tuple
@@ -58,7 +58,7 @@ class SingleShotDetector:
         return d_opt / (np.linalg.norm(d_opt) + 1e-12)
 
     def detect_once(self, img_msg: Image, tf_buffer: tf2_ros.Buffer) -> Optional[Tuple[np.ndarray, PoseStamped, TransformStamped, TransformStamped]]:
-        """Return (C, hover_pose, tf_object, tf_circle) or None."""
+        """Return (C, hover_pose, tf_object, tf_circle) or None when not confident enough."""
         rgb = self._bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
         pil = PILImage.fromarray(rgb)
 
@@ -78,6 +78,16 @@ class SingleShotDetector:
 
         s = np.array([_safe_float(z) for z in scores], dtype=float)
         best = int(np.argmax(s))
+        best_score = float(s[best]) if np.isfinite(s[best]) else -1.0
+
+        # NEW: hard gate on execution confidence
+        if best_score < float(self._cfg.dino.min_exec_score):
+            self._node.get_logger().warn(
+                f"Low detection confidence: {best_score:.2f} < {self._cfg.dino.min_exec_score:.2f}. Skipping execution."
+            )
+            return None
+
+        # Use the best box center
         x0, y0, x1, y1 = (boxes[best].tolist() if hasattr(boxes[best], 'tolist') else boxes[best])
         u = 0.5 * (x0 + x1)
         v = 0.5 * (y0 + y1)
@@ -140,5 +150,7 @@ class SingleShotDetector:
         tf_circle.transform.translation.x, tf_circle.transform.translation.y, tf_circle.transform.translation.z = float(C[0]), float(C[1]), float(C[2])
         tf_circle.transform.rotation.w = 1.0
 
-        self._node.get_logger().info(f"[detect once] C=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f}), hover_z={hover.pose.position.z:.3f}")
+        self._node.get_logger().info(
+            f"[detect once] score={best_score:.2f}, C=({C[0]:.3f},{C[1]:.3f},{C[2]:.3f}), hover_z={hover.pose.position.z:.3f}"
+        )
         return C, hover, tf_obj, tf_circle

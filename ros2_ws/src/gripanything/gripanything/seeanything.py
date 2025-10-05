@@ -6,15 +6,21 @@ seeanything.py — Main ROS 2 node (thin controller) for:
 - hover above detected center -> N-vertex circular path via IK (non-closed) ->
 - return to INIT and exit.
 
-Key additions in this revision:
-- Interactive text prompt at startup (terminal input) so the user specifies the target.
-  You can disable interactivity by passing: --ros-args -p require_prompt:=false -p text_prompt:="your target"
-- Clean separation of concerns via core/ modules.
+Additions in this revision:
+- Interactive text prompt at startup (can be disabled with require_prompt:=false).
+- Snapshot capture: when the robot reaches each vertex and starts the dwell,
+  save the current camera frame to "<this_script_dir>/ur5image" as a PNG.
+  If there are N dwell points, N images are saved.
 """
 
 from typing import Optional, List
 import math
+import os
+import re
+from datetime import datetime
+
 import numpy as np
+import cv2
 
 import rclpy
 from rclpy.node import Node
@@ -24,10 +30,11 @@ from rclpy.time import Time
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from cv_bridge import CvBridge
 
 import tf2_ros
 
-# Your existing DINO wrapper
+# DINO wrapper
 try:
     from gripanything.core.detect_with_dino import GroundingDinoPredictor
 except Exception:
@@ -61,7 +68,21 @@ class SeeAnythingNode(Node):
         else:
             self.get_logger().info(f"Interactive prompt disabled. Using: \"{self.cfg.dino.text_prompt}\"")
 
-        # Image subscription (trigger only)
+        # Prepare image saving directory next to this script
+        self._script_dir = os.path.dirname(os.path.abspath(__file__))
+        self._img_dir = os.path.join(self._script_dir, 'ur5image')
+        os.makedirs(self._img_dir, exist_ok=True)
+
+        # Filename prefix (prompt + timestamp)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        safe_prompt = re.sub(r'[^A-Za-z0-9._-]+', '_', self.cfg.dino.text_prompt.strip()) or 'target'
+        self._capture_prefix = f"{ts}_{safe_prompt}_N{self.cfg.circle.n_vertices}_R{int(round(self.cfg.circle.radius*1000))}mm"
+
+        # Rolling camera frame buffer (BGR for cv2.imwrite)
+        self._bridge = CvBridge()
+        self._latest_bgr: Optional[np.ndarray] = None
+
+        # Image subscription (trigger + buffer)
         qos_img = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(Image, self.cfg.frames.image_topic, self._on_image, qos_img)
 
@@ -139,6 +160,54 @@ class SeeAnythingNode(Node):
             self.get_logger().warn(f"Read tool yaw failed: {ex}")
             return None
 
+    # ---------- image callback: buffer latest frame + run detection trigger ----------
+    def _on_image(self, msg: Image):
+        # Always update the rolling buffer first (BGR for saving)
+        try:
+            self._latest_bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception as _:
+            # Keep previous frame if conversion fails
+            pass
+
+        # After buffering, handle detection logic
+        if self._done or self._inflight:
+            return
+        if self._phase != 'wait_detect':
+            return
+        if not self.motion.is_stationary():
+            return
+        self._frame_count += 1
+        if self.cfg.runtime.frame_stride > 1 and (self._frame_count % self.cfg.runtime.frame_stride) != 0:
+            return
+
+        out = self.detector.detect_once(msg, self.tf_buffer)
+        if out is None:
+            return
+        C, hover, tf_obj, tf_circle = out
+
+        self._fixed_hover = hover
+        self._circle_center = C.copy()
+        self._ring_z = float(C[2] + self.cfg.control.hover_above)
+
+        self.tf_brd.sendTransform(tf_obj); self._last_obj_tf = tf_obj
+        self.tf_brd.sendTransform(tf_circle); self._last_circle_tf = tf_circle
+
+    # ---------- Save snapshot at dwell start ----------
+    def _save_snapshot(self, vertex_index: int):
+        if self._latest_bgr is None:
+            self.get_logger().warn("No camera frame available to save.")
+            return
+        fname = f"{self._capture_prefix}_v{vertex_index:02d}.png"
+        fpath = os.path.join(self._img_dir, fname)
+        try:
+            ok = cv2.imwrite(fpath, self._latest_bgr)
+            if ok:
+                self.get_logger().info(f"Saved snapshot: {fpath}")
+            else:
+                self.get_logger().error(f"cv2.imwrite returned False for: {fpath}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save snapshot to {fpath}: {e}")
+
     # ---------- FSM ----------
     def _tick(self):
         if self._done or self._inflight:
@@ -207,10 +276,13 @@ class SeeAnythingNode(Node):
             now = self.get_clock().now().nanoseconds
             if not self.motion.is_stationary():
                 return
-            # dwell at vertex
+            # At vertex -> start dwell -> save snapshot once
             if self._poly_dwell_due_ns is None:
                 self._poly_dwell_due_ns = now + int(self.cfg.circle.dwell_time * 1e9)
-                self.get_logger().info("At vertex, dwell for capture…")
+                # current vertex is (poly_idx - 1) because we incremented after sending the previous goal
+                curr_vertex = max(0, self._poly_idx - 1)
+                self.get_logger().info(f"At vertex {curr_vertex}, dwell for capture…")
+                self._save_snapshot(curr_vertex)
                 return
             if now < self._poly_dwell_due_ns:
                 return
@@ -254,30 +326,6 @@ class SeeAnythingNode(Node):
         self.motion.set_seed_hint(joint_positions)
         self.motion.set_motion_due(self.cfg.circle.edge_move_time, 0.3)
         self._inflight = False
-
-    # ---------- image callback: single-shot detection ----------
-    def _on_image(self, msg: Image):
-        if self._done or self._inflight:
-            return
-        if self._phase != 'wait_detect':
-            return
-        if not self.motion.is_stationary():
-            return
-        self._frame_count += 1
-        if self.cfg.runtime.frame_stride > 1 and (self._frame_count % self.cfg.runtime.frame_stride) != 0:
-            return
-
-        out = self.detector.detect_once(msg, self.tf_buffer)
-        if out is None:
-            return
-        C, hover, tf_obj, tf_circle = out
-
-        self._fixed_hover = hover
-        self._circle_center = C.copy()
-        self._ring_z = float(C[2] + self.cfg.control.hover_above)
-
-        self.tf_brd.sendTransform(tf_obj); self._last_obj_tf = tf_obj
-        self.tf_brd.sendTransform(tf_circle); self._last_circle_tf = tf_circle
 
 def main():
     rclpy.init()

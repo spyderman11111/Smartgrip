@@ -36,9 +36,10 @@ class Camera:
 class Dino:
     model_id: str = 'IDEA-Research/grounding-dino-tiny'
     device: str = 'cuda'
-    text_prompt: str = 'orange object .'  # will be interactively overridden unless disabled
+    text_prompt: str = 'orange object .'
     box_threshold: float = 0.25
     text_threshold: float = 0.25
+    min_exec_score: float = 0.5  # NEW: below this, skip execution
 
 @dataclass
 class Bias:
@@ -57,7 +58,7 @@ class Control:
     hover_above: float = 0.30
     init_move_time: float = 5.0
     init_extra_wait: float = 0.3
-    joint_order: List[str] = (
+    joint_order: List[float] = (
         'shoulder_pan_joint',
         'shoulder_lift_joint',
         'elbow_joint',
@@ -82,11 +83,11 @@ class Control:
 class Circle:
     n_vertices: int = 4
     num_turns: int = 1
-    poly_dir: str = 'ccw'          # 'ccw'|'cw'
+    poly_dir: str = 'ccw'
     start_dir_offset_deg: float = -90.0
     radius: float = 0.15
-    orient_mode: str = 'radial_in' # 'radial_in'|'radial_out'|'tangent'
-    tool_z_sign: str = '-'         # '-' means tool Z down
+    orient_mode: str = 'radial_in'
+    tool_z_sign: str = '-'
     dwell_time: float = 0.25
     edge_move_time: float = 3.0
 
@@ -99,7 +100,7 @@ class JumpGuard:
 @dataclass
 class Runtime:
     frame_stride: int = 2
-    require_prompt: bool = True  # ask user for prompt at startup by default
+    require_prompt: bool = True
 
 @dataclass
 class Config:
@@ -114,15 +115,13 @@ class Config:
 
 def load_from_ros_params(node) -> Config:
     """
-    Load a Config with selective overrides from ROS parameters. Only the most
-    commonly changed parameters are declared here to keep startup light.
+    Load a Config with selective overrides from ROS parameters.
     """
     cfg = Config()
-    # interactive prompt control
     cfg.runtime.require_prompt = node.declare_parameter('require_prompt', cfg.runtime.require_prompt).value
-
-    # detection & geometry knobs
     cfg.dino.text_prompt = node.declare_parameter('text_prompt', cfg.dino.text_prompt).value
+    cfg.dino.min_exec_score = float(node.declare_parameter('min_exec_score', cfg.dino.min_exec_score).value)  # NEW
+
     cfg.circle.n_vertices = int(node.declare_parameter('N', cfg.circle.n_vertices).value)
     cfg.circle.radius = float(node.declare_parameter('R', cfg.circle.radius).value)
     cfg.circle.orient_mode = node.declare_parameter('orient_mode', cfg.circle.orient_mode).value
