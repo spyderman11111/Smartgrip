@@ -80,7 +80,7 @@ class SingleShotDetector:
         best = int(np.argmax(s))
         best_score = float(s[best]) if np.isfinite(s[best]) else -1.0
 
-        # NEW: hard gate on execution confidence
+        #  hard gate on execution confidence
         if best_score < float(self._cfg.dino.min_exec_score):
             self._node.get_logger().warn(
                 f"Low detection confidence: {best_score:.2f} < {self._cfg.dino.min_exec_score:.2f}. Skipping execution."

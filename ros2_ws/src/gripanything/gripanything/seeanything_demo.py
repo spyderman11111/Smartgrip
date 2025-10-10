@@ -61,7 +61,7 @@ T_TOOL_CAM_QUAT = np.array([-0.0036165657530785695, -0.000780788838366878,
 HAND_EYE_FRAME  = 'optical'   # 'optical' 或 'link'
 
 # DINO
-TEXT_PROMPT    = 'orange object .'
+TEXT_PROMPT    = 'green object .'
 DINO_MODEL_ID  = 'IDEA-Research/grounding-dino-tiny'
 DINO_DEVICE    = 'cuda'
 BOX_THRESHOLD  = 0.25
@@ -107,7 +107,7 @@ REQUIRE_STATIONARY  = True
 VEL_EPS_RAD_PER_SEC = 0.02
 
 # ====== N 点圆周 + 逐点IK ======
-POLY_N_VERTICES      = 4        # 4–16 之间为宜
+POLY_N_VERTICES      = 8     # 4–16 之间为宜
 # 起点方向相对“当前EE朝向”的额外旋转（在 base_link XY 平面；正=CCW）
 START_DIR_OFFSET_DEG = -90.0
 POLY_NUM_TURNS       = 1        # 旋转圈数

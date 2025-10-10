@@ -5,7 +5,7 @@ ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
 export SETUPTOOLS_USE_DISTUTILS=stdlib
 python -m colcon build --packages-select gripanything --symlink-install
 
-ros2 run gripanything seeanything_demo
+ros2 run gripanything seeanything
 
 
 

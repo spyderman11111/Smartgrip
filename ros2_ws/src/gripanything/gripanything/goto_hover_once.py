@@ -80,7 +80,7 @@ T_TOOL_CAM_QUAT = np.array([-0.0036165657530785695, -0.000780788838366878,
 HAND_EYE_FRAME  = 'optical'   # 'optical' 或 'link'
 
 # DINO
-TEXT_PROMPT    = 'yellow object .'
+TEXT_PROMPT    = 'orange object .'
 DINO_MODEL_ID  = 'IDEA-Research/grounding-dino-tiny'
 DINO_DEVICE    = 'cuda'
 BOX_THRESHOLD  = 0.25

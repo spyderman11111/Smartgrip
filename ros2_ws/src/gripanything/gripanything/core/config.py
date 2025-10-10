@@ -36,16 +36,16 @@ class Camera:
 class Dino:
     model_id: str = 'IDEA-Research/grounding-dino-tiny'
     device: str = 'cuda'
-    text_prompt: str = 'orange object .'
+    text_prompt: str = 'yellow object .'
     box_threshold: float = 0.25
     text_threshold: float = 0.25
-    min_exec_score: float = 0.5  # NEW: below this, skip execution
+    min_exec_score: float = 0.5  
 
 @dataclass
 class Bias:
     enable: bool = True
-    bx: float = -0.05
-    by: float = -0.25
+    bx: float = -0.03
+    by: float = -0.23
     bz: float = 0.0
 
 @dataclass
@@ -81,14 +81,14 @@ class Control:
 
 @dataclass
 class Circle:
-    n_vertices: int = 4
+    n_vertices: int = 8
     num_turns: int = 1
     poly_dir: str = 'ccw'
     start_dir_offset_deg: float = -90.0
-    radius: float = 0.15
+    radius: float = 0.10
     orient_mode: str = 'radial_in'
     tool_z_sign: str = '-'
-    dwell_time: float = 0.25
+    dwell_time: float = 1.5
     edge_move_time: float = 3.0
 
 @dataclass
@@ -120,7 +120,7 @@ def load_from_ros_params(node) -> Config:
     cfg = Config()
     cfg.runtime.require_prompt = node.declare_parameter('require_prompt', cfg.runtime.require_prompt).value
     cfg.dino.text_prompt = node.declare_parameter('text_prompt', cfg.dino.text_prompt).value
-    cfg.dino.min_exec_score = float(node.declare_parameter('min_exec_score', cfg.dino.min_exec_score).value)  # NEW
+    cfg.dino.min_exec_score = float(node.declare_parameter('min_exec_score', cfg.dino.min_exec_score).value) 
 
     cfg.circle.n_vertices = int(node.declare_parameter('N', cfg.circle.n_vertices).value)
     cfg.circle.radius = float(node.declare_parameter('R', cfg.circle.radius).value)
