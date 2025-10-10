@@ -23,8 +23,8 @@
         ],
         [
           0.0,
-          901.90869140625,
-          363.46759033203125
+          552.6896362304688,
+          323.0177307128906
         ],
         [
           0.0,
@@ -32,38 +32,16 @@
           1.0
         ]
       ],
-      "source_extrinsics": "external_json"
-    },
-    {
-      "start_index": 4,
-      "count": 4,
-      "intrinsics_used_sample": [
-        [
-          554.131591796875,
-          0.0,
-          197.79150390625
-        ],
-        [
-          0.0,
-          901.90869140625,
-          363.46759033203125
-        ],
-        [
-          0.0,
-          0.0,
-          1.0
-        ]
-      ],
-      "source_extrinsics": "external_json"
+      "source_extrinsics": "external_json_wfc"
     }
   ],
-  "points_count": 1000000,
+  "points_count": 500000,
   "outputs": {
     "ply": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/vggt_output/points.ply",
-    "txt": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/vggt_output/points_xyzrgb.txt"
+    "txt": null
   },
   "external": {
     "json_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/image_jointstates.json",
-    "frames_used": 8
+    "frames_used": 4
   }
 }

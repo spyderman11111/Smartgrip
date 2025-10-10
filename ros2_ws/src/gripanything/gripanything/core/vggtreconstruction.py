@@ -18,7 +18,7 @@ from PIL import Image as PILImage
 # 如果 vggt 不在默认 sys.path，可按需启用这两行（确保路径正确）
 import sys
 VGGT_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'vggt'))
-if os.path.isdir(VGGT_path) and os.path.isdir(VGGT_path) and VGGT_path not in sys.path:
+if os.path.isdir(VGGT_path) and VGGT_path not in sys.path:
     sys.path.append(VGGT_path)
 
 from vggt.models.vggt import VGGT
@@ -200,7 +200,7 @@ class VGGTReconstructor:
             if idx is None:
                 continue
             items.append((idx, v))
-        items.sort(key=lambda x: x: x[0])
+        items.sort(key=lambda x: x[0])
 
         image_paths, extrinsics_44, stamps = [], [], []
         # 默认图片目录（ur5image）
@@ -225,10 +225,18 @@ class VGGTReconstructor:
                 # 数据不完整，跳过该帧
                 continue
 
-            # world_from_cam（X_w = R_wc X_c + t_wc）=（R_bc, t_bc），不要取逆
-            T = np.eye(4, dtype=float)
-            T[:3, :3] = R_bc
-            T[:3, 3] = t_bc
+            # 统一使用 world_from_cam（T_wc）：X_w = R_bc * X_c + t_bc
+            USE_CFW = True  #  设为 False：避免把 cam_from_world 当 world_from_cam 用
+            if USE_CFW:
+                R_cw = R_bc.T
+                t_cw = -R_bc.T @ t_bc
+                T = np.eye(4, dtype=float)
+                T[:3, :3] = R_cw
+                T[:3, 3] = t_cw
+            else:
+                T = np.eye(4, dtype=float)
+                T[:3, :3] = R_bc
+                T[:3, 3] = t_bc
 
             image_paths.append(img_path)
             extrinsics_44.append(T)
@@ -240,23 +248,37 @@ class VGGTReconstructor:
 
         ext["enabled"] = True
         ext["image_paths"] = image_paths
-        ext["extrinsics_wfc"] = np.stack(extrinsics_44, axis=0)
+        ext["extrinsics_cfw"] = np.stack(extrinsics_44, axis=0)
         ext["stamps"] = stamps
         print(f"[Info] 已加载外参与图片：{len(image_paths)} 帧。")
         return ext
 
     # ---------- K 构造：原图尺寸 -> 网络分辨率 ----------
     def _build_intrinsics_from_camera(self, batch_image_paths: List[str], res: int) -> np.ndarray:
+        """
+        与 load_and_preprocess_images_square(batch_paths, res) 对齐的 K：
+        假设该函数把原图按最长边等比缩放到 res，并对另一边做居中填充（letterbox）。
+        """
         Ks = []
         for p in batch_image_paths:
             with PILImage.open(p) as im:
                 W, H = im.size
-            sx = res / float(W)
-            sy = res / float(H)
-            fx = self.camera.fx * sx
-            fy = self.camera.fy * sy
-            cx = self.camera.cx * sx
-            cy = self.camera.cy * sy
+
+            s0 = float(res) / float(max(W, H))
+            if W < H:
+                pad_x = 0.5 * (res - W * s0)
+                pad_y = 0.0
+            elif H < W:
+                pad_x = 0.0
+                pad_y = 0.5 * (res - H * s0)
+            else:
+                pad_x = 0.0
+            cx = self.camera.cx * s0 + (pad_x if W < H else 0.0)
+            cy = self.camera.cy * s0 + (0.5 * (res - H * s0) if H < W else 0.0)
+
+            fx = self.camera.fx * s0
+            fy = self.camera.fy * s0
+
             K = np.array([[fx, 0.0, cx],
                           [0.0, fy, cy],
                           [0.0, 0.0, 1.0]], dtype=np.float32)
@@ -285,8 +307,8 @@ class VGGTReconstructor:
         return (
             extrinsic.squeeze(0).cpu().numpy(),   # [N,4,4] (不一定使用)
             intrinsic.squeeze(0).cpu().numpy(),   # [N,3,3] (不一定使用)
-            depth_map.squeeze(0).cpu().numpy(),   # [N,1,R,R]
-            depth_conf.squeeze(0).cpu().numpy(),  # [N,1,R,R]
+            depth_map.squeeze(0).cpu().numpy(),   # e.g. [N,1,R,R] 或 [N,R,R,1]
+            depth_conf.squeeze(0).cpu().numpy(),  # e.g. [N,1,R,R] 或 [N,R,R,1]
         )
 
     # ---------- 输出 ----------
@@ -326,7 +348,7 @@ class VGGTReconstructor:
         # 准备图像列表
         if self.external["enabled"]:
             image_paths_all = self.external["image_paths"]
-            extrinsics_all = self.external["extrinsics_wfc"]   # [N,4,4] world_from_cam
+            extrinsics_all = self.external["extrinsics_cfw"]   # [N,4,4] world_from_cam
         else:
             images_dir = self._resolve_images_dir(self.images_dir)
             image_paths_all = self._gather_image_paths(images_dir)
@@ -345,11 +367,37 @@ class VGGTReconstructor:
         for i in tqdm(range(0, len(image_paths_all), self.batch_size)):
             batch_paths = image_paths_all[i:i + self.batch_size]
 
-            # 读图（1024 正方形），VGGT 内部再到 self.resolution
-            images, _ = load_and_preprocess_images_square(batch_paths, 1024)
+            # 读图（按分辨率预处理）
+            images, _ = load_and_preprocess_images_square(batch_paths, self.resolution)
             images = images.to(self.device)
 
+            # 前向
             extr_vggt, intr_vggt, depth_map, depth_conf = self._run_model_on_batch(images)
+
+            # —— 把深度/置信度统一成 (N,H,W,1) —— #
+            depth_map = np.asarray(depth_map)
+            depth_conf = np.asarray(depth_conf)
+
+            # depth_map
+            if depth_map.ndim == 4 and depth_map.shape[1] == 1:          # (N,1,H,W) -> (N,H,W,1)
+                depth_map = np.transpose(depth_map, (0, 2, 3, 1))
+            elif depth_map.ndim == 3:                                     # (N,H,W) -> (N,H,W,1)
+                depth_map = depth_map[..., None]
+            elif depth_map.ndim == 4 and depth_map.shape[-1] == 1:        # already (N,H,W,1)
+                pass
+            else:
+                raise ValueError(f"Unexpected depth_map shape {depth_map.shape}")
+
+            # depth_conf
+            if depth_conf.ndim == 4 and depth_conf.shape[1] == 1:
+                depth_conf = np.transpose(depth_conf, (0, 2, 3, 1))
+            elif depth_conf.ndim == 3:
+                depth_conf = depth_conf[..., None]
+            elif depth_conf.ndim == 4 and depth_conf.shape[-1] == 1:
+                pass
+            else:
+                # 若没有置信度，构造全 1
+                depth_conf = np.ones_like(depth_map, dtype=depth_map.dtype)
 
             # 选择使用的外参/内参
             if self.external["enabled"]:
@@ -364,11 +412,11 @@ class VGGTReconstructor:
             else:
                 intr_used = intr_vggt
 
-            # 反投影到世界坐标（expects world_from_cam）
-            points_3d = unproject_depth_map_to_point_map(depth_map, extr_used, intr_used)
+            # 反投影到世界坐标（expects world_from_cam + NHW1 深度）
+            points_3d = unproject_depth_map_to_point_map(depth_map, extr_used, intr_used)  # -> (N,H,W,3)
 
             # 置信度筛选 + 下采样
-            mask = depth_conf >= self.conf_thresh
+            mask = (depth_conf[..., 0] >= self.conf_thresh)  # (N,H,W)
             mask = randomly_limit_trues(mask, self.max_points)
 
             # 颜色（与深度同分辨率）
@@ -433,11 +481,11 @@ if __name__ == "__main__":
         conf_thresh=2.5,
         img_limit=None,
         out_dir=None,                 # None => 默认同级 vggt_output（不可写自动回退）
-        write_txt=True,
+        write_txt=False,
         txt_filename="points_xyzrgb.txt",
         camera=cam,
-        prefer_external_poses=True,   # 打开：优先用 JSON 外参（world_from_cam）
-        use_known_intrinsics=True,    # 打开：使用你的内参
+        prefer_external_poses=True,   # 优先用 JSON 外参（world_from_cam）
+        use_known_intrinsics=True,    # 使用你的内参
     )
     with torch.no_grad():
         reconstructor.run()
