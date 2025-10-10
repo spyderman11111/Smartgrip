@@ -18,7 +18,7 @@ from PIL import Image as PILImage
 # 如果 vggt 不在默认 sys.path，可按需启用这两行（确保路径正确）
 import sys
 VGGT_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'vggt'))
-if os.path.isdir(VGGT_path) and VGGT_path not in sys.path:
+if os.path.isdir(VGGT_path) and os.path.isdir(VGGT_path) and VGGT_path not in sys.path:
     sys.path.append(VGGT_path)
 
 from vggt.models.vggt import VGGT
@@ -104,7 +104,8 @@ class VGGTReconstructor:
         # 模型
         self.model = VGGT()
         state = torch.hub.load_state_dict_from_url(
-            "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+            "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt",
+            map_location=self.device
         )
         self.model.load_state_dict(state)
         self.model.eval().to(self.device)
@@ -163,16 +164,16 @@ class VGGTReconstructor:
     def _try_load_external_trajectory(self, json_path: Optional[str], images_dir: str):
         """
         读取 image_jointstates.json，提取每帧 base->camera_optical 的 R、t，
-        并生成 cam_from_world（extrinsic）与对应图片路径。
+        并生成 world_from_cam（extrinsic，直接=R_bc,t_bc）与对应图片路径。
         返回结构：
           {
             "enabled": True/False,
             "image_paths": [str...],
-            "extrinsics_cfw": np.ndarray [N,4,4],
+            "extrinsics_wfc": np.ndarray [N,4,4],  # world_from_cam
             "stamps": [{"sec":..,"nanosec":..}, ...]
           }
         """
-        ext = {"enabled": False, "image_paths": [], "extrinsics_cfw": None, "stamps": []}
+        ext = {"enabled": False, "image_paths": [], "extrinsics_wfc": None, "stamps": []}
         if not self.prefer_external_poses:
             return ext
 
@@ -199,7 +200,7 @@ class VGGTReconstructor:
             if idx is None:
                 continue
             items.append((idx, v))
-        items.sort(key=lambda x: x[0])
+        items.sort(key=lambda x: x: x[0])
 
         image_paths, extrinsics_44, stamps = [], [], []
         # 默认图片目录（ur5image）
@@ -216,7 +217,7 @@ class VGGTReconstructor:
                 # 找不到该帧图片就跳过
                 continue
 
-            # R_bc, t_bc
+            # R_bc, t_bc  （base <- camera_optical）
             cam = entry.get("camera_pose", {})
             R_bc = np.array(cam.get("R", []), dtype=float)
             t_bc = np.array(cam.get("t", []), dtype=float).reshape(-1)
@@ -224,12 +225,10 @@ class VGGTReconstructor:
                 # 数据不完整，跳过该帧
                 continue
 
-            # cam_from_world (world=base): x_c = R_cw * x_w + t_cw
-            R_cw = R_bc.T
-            t_cw = -R_bc.T @ t_bc
+            # world_from_cam（X_w = R_wc X_c + t_wc）=（R_bc, t_bc），不要取逆
             T = np.eye(4, dtype=float)
-            T[:3, :3] = R_cw
-            T[:3, 3] = t_cw
+            T[:3, :3] = R_bc
+            T[:3, 3] = t_bc
 
             image_paths.append(img_path)
             extrinsics_44.append(T)
@@ -241,7 +240,7 @@ class VGGTReconstructor:
 
         ext["enabled"] = True
         ext["image_paths"] = image_paths
-        ext["extrinsics_cfw"] = np.stack(extrinsics_44, axis=0)
+        ext["extrinsics_wfc"] = np.stack(extrinsics_44, axis=0)
         ext["stamps"] = stamps
         print(f"[Info] 已加载外参与图片：{len(image_paths)} 帧。")
         return ext
@@ -327,7 +326,7 @@ class VGGTReconstructor:
         # 准备图像列表
         if self.external["enabled"]:
             image_paths_all = self.external["image_paths"]
-            extrinsics_all = self.external["extrinsics_cfw"]   # [N,4,4]
+            extrinsics_all = self.external["extrinsics_wfc"]   # [N,4,4] world_from_cam
         else:
             images_dir = self._resolve_images_dir(self.images_dir)
             image_paths_all = self._gather_image_paths(images_dir)
@@ -354,7 +353,7 @@ class VGGTReconstructor:
 
             # 选择使用的外参/内参
             if self.external["enabled"]:
-                # 外参：来自 JSON（cam_from_world）
+                # 外参：来自 JSON（world_from_cam）
                 extr_used = extrinsics_all[i:i + len(batch_paths)]
             else:
                 # 退回 VGGT 自估外参
@@ -365,7 +364,7 @@ class VGGTReconstructor:
             else:
                 intr_used = intr_vggt
 
-            # 反投影到世界坐标
+            # 反投影到世界坐标（expects world_from_cam）
             points_3d = unproject_depth_map_to_point_map(depth_map, extr_used, intr_used)
 
             # 置信度筛选 + 下采样
@@ -385,7 +384,7 @@ class VGGTReconstructor:
                 "start_index": i,
                 "count": len(batch_paths),
                 "intrinsics_used_sample": intr_used[0].tolist(),
-                "source_extrinsics": "external_json" if self.external["enabled"] else "vggt_pred",
+                "source_extrinsics": "external_json_wfc" if self.external["enabled"] else "vggt_pred",
             })
 
         # 汇总导出
@@ -437,7 +436,7 @@ if __name__ == "__main__":
         write_txt=True,
         txt_filename="points_xyzrgb.txt",
         camera=cam,
-        prefer_external_poses=True,   # 打开：优先用 JSON 外参
+        prefer_external_poses=True,   # 打开：优先用 JSON 外参（world_from_cam）
         use_known_intrinsics=True,    # 打开：使用你的内参
     )
     with torch.no_grad():
