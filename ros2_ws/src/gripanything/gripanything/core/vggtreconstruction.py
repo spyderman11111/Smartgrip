@@ -628,12 +628,12 @@ if __name__ == "__main__":
         write_txt=False,              # 明确关闭 TXT
         txt_filename="points_xyzrgb.txt",
         camera=cam,
-        prefer_external_poses=True,   # 优先用 JSON 外参（T_cw）
-        use_known_intrinsics=True,    # 使用你的内参
+        prefer_external_poses=False,   # 优先用 JSON 外参（T_cw）
+        use_known_intrinsics=False,    # 使用你的内参
 
         # ===== BA 相关开关 =====
         use_ba=True,                  # 开启 BA（仅计算，不导出 COLMAP）
-        shared_camera=False,
+        shared_camera=True,
         camera_type="SIMPLE_PINHOLE",
         vis_thresh=0.2,
         query_frame_num=8,
