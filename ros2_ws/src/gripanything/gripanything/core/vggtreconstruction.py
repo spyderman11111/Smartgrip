@@ -25,7 +25,25 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
-from vggt.utils.helper import randomly_limit_trues
+from vggt.utils.helper import randomly_limit_trues, create_pixel_coordinate_grid
+
+# 仅在导出 COLMAP / 执行 BA 时需要
+_HAS_PYCOLMAP = False
+try:
+    import pycolmap  # type: ignore
+    _HAS_PYCOLMAP = True
+except Exception:
+    pass
+
+try:
+    from vggt.dependency.track_predict import predict_tracks
+    from vggt.dependency.np_to_pycolmap import (
+        batch_np_matrix_to_pycolmap,
+        batch_np_matrix_to_pycolmap_wo_track,
+    )
+    _HAS_TRACKER = True
+except Exception:
+    _HAS_TRACKER = False
 
 
 # ======================== 用户相机参数 ========================
@@ -50,11 +68,11 @@ class VGGTReconstructor:
       1) 优先读取 JSON（每帧相机位姿 + 图像路径），并使用用户内参生成 K。
       2) VGGT 仅用于估计 depth_map；点云世界坐标用(外参,内参)做反投影。
       3) 若找不到 JSON 或图片，回退到纯 VGGT（自估内外参）。
-
+      4) （可选）执行 tracking + BA（仅计算，不导出 COLMAP）。
     产物：
       - points.ply
-      - points_xyzrgb.txt（可选）
       - meta.json（记录使用的模式、外参/内参来源等）
+      - （可选）points_xyzrgb.txt（当前默认关闭）
     """
 
     def __init__(
@@ -68,11 +86,21 @@ class VGGTReconstructor:
         conf_thresh: float = 3.5,
         img_limit: Optional[int] = None,
         out_dir: Optional[str] = None,
-        write_txt: bool = True,
+        write_txt: bool = False,               # TXT 默认关闭
         txt_filename: str = "points_xyzrgb.txt",
         camera: Optional[Camera] = None,
-        prefer_external_poses: bool = True,     # 优先使用 JSON 中外参
-        use_known_intrinsics: bool = True,      # 使用你的内参
+        prefer_external_poses: bool = True,    # 优先使用 JSON 中外参
+        use_known_intrinsics: bool = True,     # 使用你的内参
+
+        # === 融合官方 demo 的可选开关（不使用 argparse，入口处手动改） ===
+        use_ba: bool = True,                   # 开启 BA（计算，不导出 COLMAP）
+        shared_camera: bool = False,
+        camera_type: str = "SIMPLE_PINHOLE",
+        vis_thresh: float = 0.2,
+        query_frame_num: int = 8,
+        max_query_pts: int = 4096,
+        fine_tracking: bool = True,
+        img_load_resolution: int = 1024,       # 读取图像的大分辨率（用于 tracking/重命名缩放）
     ):
         self.images_dir = images_dir
         self.json_path = json_path
@@ -88,6 +116,16 @@ class VGGTReconstructor:
         self.prefer_external_poses = prefer_external_poses
         self.use_known_intrinsics = use_known_intrinsics
         self.last_paths = {}
+
+        # BA/track 设置
+        self.use_ba = use_ba
+        self.shared_camera = shared_camera
+        self.camera_type = camera_type
+        self.vis_thresh = vis_thresh
+        self.query_frame_num = query_frame_num
+        self.max_query_pts = max_query_pts
+        self.fine_tracking = fine_tracking
+        self.img_load_resolution = img_load_resolution
 
         # 随机种子
         torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
@@ -164,16 +202,16 @@ class VGGTReconstructor:
     def _try_load_external_trajectory(self, json_path: Optional[str], images_dir: str):
         """
         读取 image_jointstates.json，提取每帧 base->camera_optical 的 R、t，
-        并生成 world_from_cam（extrinsic，直接=R_bc,t_bc）与对应图片路径。
+        并生成（变量名沿用）extrinsics_cfw 与对应图片路径。
         返回结构：
           {
             "enabled": True/False,
             "image_paths": [str...],
-            "extrinsics_wfc": np.ndarray [N,4,4],  # world_from_cam
+            "extrinsics_cfw": np.ndarray [N,4,4],  # camera_from_world
             "stamps": [{"sec":..,"nanosec":..}, ...]
           }
         """
-        ext = {"enabled": False, "image_paths": [], "extrinsics_wfc": None, "stamps": []}
+        ext = {"enabled": False, "image_paths": [], "extrinsics_cfw": None, "stamps": []}
         if not self.prefer_external_poses:
             return ext
 
@@ -225,18 +263,12 @@ class VGGTReconstructor:
                 # 数据不完整，跳过该帧
                 continue
 
-            # 统一使用 world_from_cam（T_wc）：X_w = R_bc * X_c + t_bc
-            USE_CFW = True  #  设为 False：避免把 cam_from_world 当 world_from_cam 用
-            if USE_CFW:
-                R_cw = R_bc.T
-                t_cw = -R_bc.T @ t_bc
-                T = np.eye(4, dtype=float)
-                T[:3, :3] = R_cw
-                T[:3, 3] = t_cw
-            else:
-                T = np.eye(4, dtype=float)
-                T[:3, :3] = R_bc
-                T[:3, 3] = t_bc
+            # 统一为 camera_from_world (T_cw)
+            R_cw = R_bc.T
+            t_cw = -R_bc.T @ t_bc
+            T = np.eye(4, dtype=float)
+            T[:3, :3] = R_cw
+            T[:3, 3] = t_cw
 
             image_paths.append(img_path)
             extrinsics_44.append(T)
@@ -273,9 +305,10 @@ class VGGTReconstructor:
                 pad_y = 0.5 * (res - H * s0)
             else:
                 pad_x = 0.0
+                pad_y = 0.0
+
             cx = self.camera.cx * s0 + (pad_x if W < H else 0.0)
             cy = self.camera.cy * s0 + (0.5 * (res - H * s0) if H < W else 0.0)
-
             fx = self.camera.fx * s0
             fy = self.camera.fy * s0
 
@@ -309,6 +342,7 @@ class VGGTReconstructor:
             intrinsic.squeeze(0).cpu().numpy(),   # [N,3,3] (不一定使用)
             depth_map.squeeze(0).cpu().numpy(),   # e.g. [N,1,R,R] 或 [N,R,R,1]
             depth_conf.squeeze(0).cpu().numpy(),  # e.g. [N,1,R,R] 或 [N,R,R,1]
+            images,                                # 已经 resize 到 (resolution, resolution) 的图像（取颜色）
         )
 
     # ---------- 输出 ----------
@@ -330,6 +364,34 @@ class VGGTReconstructor:
         except Exception as e:
             print(f"[Warn] 写元数据失败：{e}")
 
+    # ---------- COLMAP 重命名/缩放（与官方逻辑一致） ----------
+    @staticmethod
+    def _rename_colmap_and_rescale(reconstruction, image_paths, original_coords, img_size, shift_point2d=True, shared_camera=False):
+        rescale_camera = True
+        for pyimageid in reconstruction.images:
+            pyimage = reconstruction.images[pyimageid]
+            pycamera = reconstruction.cameras[pyimage.camera_id]
+            pyimage.name = image_paths[pyimageid - 1]
+
+            pred_params = np.array(pycamera.params, dtype=np.float64)
+            real_image_size = original_coords[pyimageid - 1, -2:]
+            resize_ratio = max(real_image_size) / img_size
+            pred_params = pred_params * resize_ratio
+            real_pp = real_image_size / 2
+            pred_params[-2:] = real_pp
+            pycamera.params = pred_params
+            pycamera.width = int(real_image_size[0])
+            pycamera.height = int(real_image_size[1])
+
+            if shift_point2d:
+                top_left = original_coords[pyimageid - 1, :2]
+                for point2D in pyimage.points2D:
+                    point2D.xy = (point2D.xy - top_left) * resize_ratio
+
+            if shared_camera:
+                rescale_camera = False
+        return reconstruction
+
     # ---------- 主流程 ----------
     def run(self) -> str:
         meta_logs = {
@@ -337,6 +399,8 @@ class VGGTReconstructor:
             "resolution": self.resolution,
             "conf_thresh": self.conf_thresh,
             "use_known_intrinsics": self.use_known_intrinsics,
+            "use_ba": self.use_ba,
+            "img_load_resolution": self.img_load_resolution,
             "camera": {
                 "fx": self.camera.fx, "fy": self.camera.fy,
                 "cx": self.camera.cx, "cy": self.camera.cy,
@@ -348,7 +412,7 @@ class VGGTReconstructor:
         # 准备图像列表
         if self.external["enabled"]:
             image_paths_all = self.external["image_paths"]
-            extrinsics_all = self.external["extrinsics_cfw"]   # [N,4,4] world_from_cam
+            extrinsics_all = self.external["extrinsics_cfw"]   # [N,4,4] camera_from_world
         else:
             images_dir = self._resolve_images_dir(self.images_dir)
             image_paths_all = self._gather_image_paths(images_dir)
@@ -362,49 +426,50 @@ class VGGTReconstructor:
         if not image_paths_all:
             raise FileNotFoundError("没有可用图片。")
 
+        # 若需要 BA，准备较大分辨率的加载与 original_coords（只计算，不落盘）
+        if self.use_ba:
+            images_full, original_coords = load_and_preprocess_images_square(image_paths_all, self.img_load_resolution)
+            images_full = images_full.to(self.device)
+            original_coords = original_coords.to(self.device)
+            base_image_names = [os.path.basename(p) for p in image_paths_all]
+        else:
+            images_full = original_coords = None
+            base_image_names = None
+
         all_points, all_colors = [], []
+
+        # 供 BA/前馈构建所需的累积（仅内存计算）
+        extr_list, intr_list = [], []
+        depth_conf_list, pts3d_list, rgb_list = [], [], []
 
         for i in tqdm(range(0, len(image_paths_all), self.batch_size)):
             batch_paths = image_paths_all[i:i + self.batch_size]
 
-            # 读图（按分辨率预处理）
+            # 读图（按推理分辨率预处理）
             images, _ = load_and_preprocess_images_square(batch_paths, self.resolution)
             images = images.to(self.device)
 
             # 前向
-            extr_vggt, intr_vggt, depth_map, depth_conf = self._run_model_on_batch(images)
+            extr_vggt, intr_vggt, depth_map, depth_conf, images_resized = self._run_model_on_batch(images)
 
             # —— 把深度/置信度统一成 (N,H,W,1) —— #
             depth_map = np.asarray(depth_map)
             depth_conf = np.asarray(depth_conf)
-
-            # depth_map
             if depth_map.ndim == 4 and depth_map.shape[1] == 1:          # (N,1,H,W) -> (N,H,W,1)
                 depth_map = np.transpose(depth_map, (0, 2, 3, 1))
             elif depth_map.ndim == 3:                                     # (N,H,W) -> (N,H,W,1)
                 depth_map = depth_map[..., None]
-            elif depth_map.ndim == 4 and depth_map.shape[-1] == 1:        # already (N,H,W,1)
-                pass
-            else:
-                raise ValueError(f"Unexpected depth_map shape {depth_map.shape}")
-
-            # depth_conf
             if depth_conf.ndim == 4 and depth_conf.shape[1] == 1:
                 depth_conf = np.transpose(depth_conf, (0, 2, 3, 1))
             elif depth_conf.ndim == 3:
                 depth_conf = depth_conf[..., None]
-            elif depth_conf.ndim == 4 and depth_conf.shape[-1] == 1:
-                pass
-            else:
-                # 若没有置信度，构造全 1
+            elif depth_conf.ndim != 4 or depth_conf.shape[-1] != 1:
                 depth_conf = np.ones_like(depth_map, dtype=depth_map.dtype)
 
             # 选择使用的外参/内参
             if self.external["enabled"]:
-                # 外参：来自 JSON（world_from_cam）
                 extr_used = extrinsics_all[i:i + len(batch_paths)]
             else:
-                # 退回 VGGT 自估外参
                 extr_used = extr_vggt
 
             if self.use_known_intrinsics:
@@ -412,30 +477,35 @@ class VGGTReconstructor:
             else:
                 intr_used = intr_vggt
 
-            # 反投影到世界坐标（expects world_from_cam + NHW1 深度）
+            # 反投影到世界坐标
             points_3d = unproject_depth_map_to_point_map(depth_map, extr_used, intr_used)  # -> (N,H,W,3)
 
-            # 置信度筛选 + 下采样
+            # 置信度筛选 + 下采样（PLY）
             mask = (depth_conf[..., 0] >= self.conf_thresh)  # (N,H,W)
             mask = randomly_limit_trues(mask, self.max_points)
 
-            # 颜色（与深度同分辨率）
-            images_resized = F.interpolate(images, size=(self.resolution, self.resolution),
-                                           mode="bilinear", align_corners=False)
-            rgb = (images_resized.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)[mask]
+            rgb = (images_resized.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
 
             all_points.append(points_3d[mask])
-            all_colors.append(rgb)
+            all_colors.append(rgb[mask])
+
+            # BA 需要的累积
+            if self.use_ba:
+                extr_list.append(extr_used)
+                intr_list.append(intr_used)
+                depth_conf_list.append(depth_conf)
+                pts3d_list.append(points_3d)
+                rgb_list.append(rgb)
 
             # 记录样例
             meta_logs["batches"].append({
                 "start_index": i,
                 "count": len(batch_paths),
                 "intrinsics_used_sample": intr_used[0].tolist(),
-                "source_extrinsics": "external_json_wfc" if self.external["enabled"] else "vggt_pred",
+                "source_extrinsics": "external_json_cfw" if self.external["enabled"] else "vggt_pred",
             })
 
-        # 汇总导出
+        # 汇总导出（仅 PLY）
         all_points = np.concatenate(all_points, axis=0)
         all_colors = np.concatenate(all_colors, axis=0)
 
@@ -448,6 +518,79 @@ class VGGTReconstructor:
             txt_path = os.path.join(self.out_dir, self.txt_filename)
             n = self._save_txt_xyzrgb(all_points, all_colors, txt_path)
             print(f"[Done] 点云 TXT 已保存: {txt_path}  （共 {n} 行）")
+
+        # —— 仅计算 BA（不写 COLMAP 文件）——
+        if self.use_ba:
+            if not _HAS_PYCOLMAP or not _HAS_TRACKER or images_full is None:
+                print("[Warn] 缺少 pycolmap 或 tracker 依赖，BA 跳过（只导出 PLY）。")
+            else:
+                extr_all = np.concatenate(extr_list, axis=0)      # [N,4,4]
+                intr_all = np.concatenate(intr_list, axis=0)      # [N,3,3] at self.resolution
+                conf_all = np.concatenate(depth_conf_list, axis=0)  # [N,H,W,1]
+                pts3d_all = np.concatenate(pts3d_list, axis=0)    # [N,H,W,3]
+                rgb_all = np.concatenate(rgb_list, axis=0)        # [N,H,W,3]
+
+                # 把内参从 resolution 缩放到 img_load_resolution
+                scale = float(self.img_load_resolution) / float(self.resolution)
+                intr_scaled = intr_all.copy()
+                intr_scaled[:, :2, :] *= scale
+
+                with torch.no_grad():
+                    if self.device == "cuda":
+                        with torch.cuda.amp.autocast(dtype=self.dtype):
+                            pred_tracks, pred_vis_scores, pred_confs, points_3d_ba, points_rgb_ba = predict_tracks(
+                                images_full,
+                                conf=conf_all,
+                                points_3d=pts3d_all,
+                                masks=None,
+                                max_query_pts=self.max_query_pts,
+                                query_frame_num=self.query_frame_num,
+                                keypoint_extractor="aliked+sp",
+                                fine_tracking=self.fine_tracking,
+                            )
+                    else:
+                        pred_tracks, pred_vis_scores, pred_confs, points_3d_ba, points_rgb_ba = predict_tracks(
+                            images_full,
+                            conf=conf_all,
+                            points_3d=pts3d_all,
+                            masks=None,
+                            max_query_pts=self.max_query_pts,
+                            query_frame_num=self.query_frame_num,
+                            keypoint_extractor="aliked+sp",
+                            fine_tracking=self.fine_tracking,
+                        )
+
+                track_mask = pred_vis_scores > self.vis_thresh
+
+                reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
+                    points_3d_ba,
+                    extr_all,
+                    intr_scaled,
+                    pred_tracks,
+                    np.array(images_full.shape[-2:]),
+                    masks=track_mask,
+                    max_reproj_error=8.0,
+                    shared_camera=self.shared_camera,
+                    camera_type=self.camera_type,
+                    points_rgb=points_rgb_ba,
+                )
+
+                if reconstruction is None:
+                    print("[Warn] BA 构建失败，已跳过（仅保留 PLY）。")
+                else:
+                    # 在内存中执行 BA 优化，不写文件
+                    ba_options = pycolmap.BundleAdjustmentOptions()
+                    pycolmap.bundle_adjustment(reconstruction, ba_options)
+                    # 可选：按需在内存中做重命名/缩放，依你需要
+                    reconstruction = self._rename_colmap_and_rescale(
+                        reconstruction,
+                        base_image_names,
+                        original_coords.cpu().numpy(),
+                        img_size=self.img_load_resolution,
+                        shift_point2d=True,
+                        shared_camera=self.shared_camera,
+                    )
+                    print("[Info] BA 优化完成（未导出 COLMAP 文件，仅输出 PLY）。")
 
         # 元数据
         meta_path = os.path.join(self.out_dir, "meta.json")
@@ -472,6 +615,7 @@ if __name__ == "__main__":
 
     cam = Camera()  # 使用你给定的内参
 
+    # 仅输出 PLY、关闭 TXT、开启 BA；其余参数可在此手动调整
     reconstructor = VGGTReconstructor(
         images_dir=IMAGES_DIR,
         json_path=JSON_DEFAULT,
@@ -481,11 +625,22 @@ if __name__ == "__main__":
         conf_thresh=2.5,
         img_limit=None,
         out_dir=None,                 # None => 默认同级 vggt_output（不可写自动回退）
-        write_txt=False,
+        write_txt=False,              # 明确关闭 TXT
         txt_filename="points_xyzrgb.txt",
         camera=cam,
-        prefer_external_poses=True,   # 优先用 JSON 外参（world_from_cam）
+        prefer_external_poses=True,   # 优先用 JSON 外参（T_cw）
         use_known_intrinsics=True,    # 使用你的内参
+
+        # ===== BA 相关开关 =====
+        use_ba=True,                  # 开启 BA（仅计算，不导出 COLMAP）
+        shared_camera=False,
+        camera_type="SIMPLE_PINHOLE",
+        vis_thresh=0.2,
+        query_frame_num=8,
+        max_query_pts=4096,
+        fine_tracking=True,
+        img_load_resolution=1024,
     )
+
     with torch.no_grad():
         reconstructor.run()
