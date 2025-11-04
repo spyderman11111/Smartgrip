@@ -9,6 +9,7 @@ Pipeline:
 3) Wait stationary
 4) Stage-2 detection (fine): compute C2, set hover pose (tool-Z-down) with Z = C2.z + hover_above; IK + move
 5) Wait stationary -> compute start_yaw -> generate N-vertex circular path (non-closed)
+   * NEW: use configurable sweep_deg (< 360°) to avoid joint limit at the last vertex (default: 355°)
 6) Vertex-by-vertex IK; at each dwell: snapshot + save {joint positions + camera pose}
    - If IK abnormal jump on a vertex: skip that vertex and continue (no dwell)
 7) Done -> return to INIT -> exit
@@ -18,20 +19,8 @@ JSON log (image_jointstates.json):
   "note": "Per-image joint positions and camera pose at capture time.",
   "prompt": "<text prompt>",
   "created_at": "<ISO time>",
-  "joint_names": [ ... ],             # only once (filled on first save)
-  "shots": {
-    "image_1": {
-      "position": [ ... ],            # positions only
-      "camera_pose": {                # base->camera_optical at image timestamp
-        "R": [[...],[...],[...]],
-        "t": [tx,ty,tz],
-        "parent_frame": "...",
-        "child_frame": "camera_optical",
-        "stamp": {"sec":..., "nanosec":...}
-      }
-    },
-    "image_2": { ... }
-  }
+  "joint_names": [ ... ],
+  "shots": { "image_1": { "position": [...], "camera_pose": {...} }, ... }
 }
 """
 
@@ -71,12 +60,17 @@ from gripanything.core.polygon_path import make_polygon_vertices
 # === 复用你提供的 tf_ops 工具 ===
 from gripanything.core.tf_ops import tfmsg_to_Rp, R_CL_CO, quat_to_rot
 
+
 class SeeAnythingNode(Node):
     def __init__(self):
         super().__init__('seeanything_minimal_clean')
 
         # Load config (with some ROS param overrides)
         self.cfg = load_from_ros_params(self)
+
+        # 环绕角度（度），默认 355°，用于替代满圈 360°
+        # 若配置文件/ROS 参数中未提供 circle.sweep_deg，则使用默认值 355.0
+        self._sweep_deg: float = float(getattr(getattr(self.cfg, "circle", object()), "sweep_deg", 355.0))
 
         # Interactive prompt (unless disabled)
         if self.cfg.runtime.require_prompt:
@@ -101,8 +95,8 @@ class SeeAnythingNode(Node):
             "note": "Per-image joint positions and camera pose at capture time.",
             "prompt": self.cfg.dino.text_prompt,
             "created_at": datetime.now().isoformat(),
-            "joint_names": [],   # fill once
-            "shots": {}          # image_n -> {position, camera_pose}
+            "joint_names": [],
+            "shots": {}
         }
         self._flush_joint_log()
 
@@ -146,15 +140,13 @@ class SeeAnythingNode(Node):
         )
 
         # State
-        # init_needed -> init_moving -> wait_detect_stage1 -> stage1_moving
-        # -> wait_detect_stage2 -> hover_to_center (after IK) -> poly_prepare -> poly_moving -> return_init -> done
         self._phase = 'init_needed'
         self._inflight = False
         self._done = False
 
         # Stage-1 / Stage-2 cached poses and detection
-        self._pose_stage1: Optional[PoseStamped] = None  # XY to C1, keep current Z
-        self._fixed_hover: Optional[PoseStamped] = None  # hover at C2.z + hover_above
+        self._pose_stage1: Optional[PoseStamped] = None
+        self._fixed_hover: Optional[PoseStamped] = None
         self._circle_center: Optional[np.ndarray] = None
         self._ring_z: Optional[float] = None
 
@@ -163,7 +155,7 @@ class SeeAnythingNode(Node):
         self._poly_wps: List[PoseStamped] = []
         self._poly_idx: int = 0
         self._poly_dwell_due_ns: Optional[int] = None
-        self._skip_last_vertex = False  # if last IK skipped, jump to next without dwell
+        self._skip_last_vertex = False
 
         # TF rebroadcast
         self._last_obj_tf: Optional[TransformStamped] = None
@@ -178,7 +170,8 @@ class SeeAnythingNode(Node):
         self.get_logger().info(
             f"[seeanything] topic={self.cfg.frames.image_topic}, hover={self.cfg.control.hover_above:.3f}m, "
             f"bias=({self.cfg.bias.bx:.3f},{self.cfg.bias.by:.3f},{self.cfg.bias.bz:.3f}); "
-            f"N={self.cfg.circle.n_vertices}, R={self.cfg.circle.radius:.3f}m, orient={self.cfg.circle.orient_mode}, dir={self.cfg.circle.poly_dir}"
+            f"N={self.cfg.circle.n_vertices}, R={self.cfg.circle.radius:.3f}m, orient={self.cfg.circle.orient_mode}, "
+            f"dir={self.cfg.circle.poly_dir}, sweep={self._sweep_deg:.1f}°"
         )
 
     # ---------- TF rebroadcast ----------
@@ -430,7 +423,8 @@ class SeeAnythingNode(Node):
             # At hover; compute start yaw and make polygon vertices
             self._start_yaw = self._get_tool_yaw_xy()
             if self._circle_center is not None and self._ring_z is not None and self._start_yaw is not None:
-                self._poly_wps = make_polygon_vertices(
+                # 1) 先按原逻辑生成整圈顶点（可能是 360° * num_turns）
+                all_wps = make_polygon_vertices(
                     self.get_clock().now().to_msg,
                     self._circle_center, self._ring_z, self._start_yaw,
                     self.cfg.frames.pose_frame,
@@ -438,8 +432,23 @@ class SeeAnythingNode(Node):
                     self.cfg.circle.orient_mode, self.cfg.circle.start_dir_offset_deg,
                     self.cfg.circle.radius, self.cfg.circle.tool_z_sign
                 )
+                # 2) NEW: 按 sweep_deg 裁剪顶点数，避免到达满圈末端触限位
+                total_deg = 360.0 * float(self.cfg.circle.num_turns)
+                sweep_deg = max(0.0, min(float(self._sweep_deg), total_deg))  # clamp
+                if sweep_deg < total_deg and len(all_wps) > 1:
+                    keep = max(1, int(math.floor(len(all_wps) * (sweep_deg / total_deg))))
+                    # 确保至少保留 1 个顶点，且小于等于总数
+                    keep = min(keep, len(all_wps))
+                    self._poly_wps = all_wps[:keep]
+                    self.get_logger().info(
+                        f"Generated vertices: {len(all_wps)} -> trimmed to {len(self._poly_wps)} "
+                        f"for sweep {sweep_deg:.1f}° / {total_deg:.1f}°."
+                    )
+                else:
+                    self._poly_wps = all_wps
+                    self.get_logger().info(f"Generated vertices: {len(self._poly_wps)} (full sweep).")
+
                 self._poly_idx = 0
-                self.get_logger().info(f"Generated vertices: {len(self._poly_wps)} (start_yaw={self._start_yaw:.3f} rad).")
                 self._phase = 'poly_prepare'
             else:
                 self._phase = 'return_init'
@@ -505,7 +514,7 @@ class SeeAnythingNode(Node):
                 return
 
             if self._poly_idx >= len(self._poly_wps):
-                # 保险分支（正常不会走到；留作冗余）
+                # 保险分支
                 self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
                 self.motion.set_seed_hint(self.cfg.control.init_pos)
                 self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)

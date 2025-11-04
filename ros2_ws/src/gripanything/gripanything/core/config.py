@@ -36,7 +36,7 @@ class Camera:
 class Dino:
     model_id: str = 'IDEA-Research/grounding-dino-tiny'
     device: str = 'cuda'
-    text_prompt: str = 'yellow object .'
+    text_prompt: str = 'blue cylinder .'
     box_threshold: float = 0.25
     text_threshold: float = 0.25
     min_exec_score: float = 0.5  
@@ -81,14 +81,14 @@ class Control:
 
 @dataclass
 class Circle:
-    n_vertices: int = 8
+    n_vertices: int = 20
     num_turns: int = 1
     poly_dir: str = 'ccw'
     start_dir_offset_deg: float = -90.0
     radius: float = 0.10
     orient_mode: str = 'radial_in'
     tool_z_sign: str = '-'
-    dwell_time: float = 1.5
+    dwell_time: float = 1.0
     edge_move_time: float = 3.0
 
 @dataclass
