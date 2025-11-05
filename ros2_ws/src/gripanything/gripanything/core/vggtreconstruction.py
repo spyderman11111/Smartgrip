@@ -368,7 +368,7 @@ if __name__ == "__main__":
         batch_size=30,
         max_points=1_500_000,
         resolution=518,
-        conf_thresh=2.7,
+        conf_thresh=1.5,
         img_limit=None,
         out_dir=None,          # None => 默认同级 vggt_output
         auto_visualize=True,
