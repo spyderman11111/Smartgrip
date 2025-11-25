@@ -3,29 +3,33 @@
 """
 gaze_stream.py
 
-Real-time streaming from Aria over USB + online eye-gaze inference.
+Real-time streaming from Aria over USB + online eye-gaze inference
++ approximate gaze projection onto RGB image.
 
 功能：
-- 使用 Aria Client SDK 通过 USB 进行 live streaming；
+- 使用 Aria Client SDK 通过 USB/WiFi 进行 live streaming；
 - 复用 projectaria_client_sdk_samples 中的 AriaVisualizer 显示：
-  - Front RGB 图像
-  - EyeTrack 眼动相机图像
+  - Front RGB 图像 (camera-rgb)
+  - EyeTrack 眼动相机图像 (camera-et-*)
 - 对每一帧 EyeTrack 图像调用 EyeGazeInference 模型，实时打印 yaw / pitch；
-- 同时把当前 yaw/pitch 写到 EyeTrack 子图的标题中，方便观察。
+- 同时把当前 yaw/pitch 投影到 RGB 图像上，在 RGB 子图上画出一个绿色注视点；
+- 近似使用 factory_calibration.json 中的 camera-rgb 内参实现 2D 投影，
+  便于在线看效果。
 
-运行方式（示例）：
-  python gaze_stream.py --interface usb --update_iptables
-
-如需修改模型路径、projectaria_eyetracking 路径或设备（CPU/GPU），
-可以：
-  1) 直接改下面 DEFAULT_... 常量，或者
-  2) 通过命令行参数覆盖。
+注意：
+- 投影是“近似版”：假设 CPF 与 RGB 相机光心重合，只用内参做投影；
+- 若需要与 MPS 完全一致的“personalized gaze”精度，需要进一步接入
+  DeviceCalibration + CPF -> RGB 的完整外参链条。
 """
 
 import argparse
 import os
 import sys
+import json
+import math
+from dataclasses import dataclass
 
+import numpy as np
 import aria.sdk as aria
 
 from common import update_iptables
@@ -46,11 +50,77 @@ DEFAULT_MODEL_CFG = (
     "inference/model/pretrained_weights/social_eyes_uncertainty_v1/config.yaml"
 )
 
-# 默认推理设备：建议先用 CPU，确认没问题后再改成 "cuda:0"
+# 默认推理设备
 DEFAULT_DEVICE = "cuda:0"
 
 # 默认 streaming profile（保持和原 device_stream.py 一致）
 DEFAULT_PROFILE_NAME = "profile18"
+
+# 默认 factory / streaming 标定文件路径
+DEFAULT_FACTORY_CALIB_JSON = (
+    "/home/sz/Smartgrip/projectaria_client_sdk_samples/factory_calibration.json"
+)
+DEFAULT_STREAMING_CALIB_JSON = (
+    "/home/sz/Smartgrip/projectaria_client_sdk_samples/streaming_calibration.json"
+)
+
+
+# ===================== 简单相机内参结构体 =====================
+
+@dataclass
+class RgbIntrinsics:
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    width: int | None = None
+    height: int | None = None
+
+
+def load_rgb_intrinsics_from_calibration(
+    calib_path: str,
+    camera_label: str = "camera-rgb",
+) -> RgbIntrinsics:
+    """
+    从 JSON 标定文件中读取 camera-rgb 的内参 (近似假设: Params 前四项为 fx, fy, cx, cy)。
+
+    calib_path: factory_calibration.json 或 streaming_calibration.json 路径。
+    """
+    if not os.path.isfile(calib_path):
+        raise FileNotFoundError(f"Calibration JSON not found: {calib_path}")
+
+    with open(calib_path, "r") as f:
+        calib = json.load(f)
+
+    cameras = calib.get("CameraCalibrations", [])
+    if not cameras:
+        raise RuntimeError("No 'CameraCalibrations' entry in calibration JSON.")
+
+    for cam in cameras:
+        if cam.get("Label", "") != camera_label:
+            continue
+
+        proj = cam.get("Projection", {})
+        params = proj.get("Params", [])
+        if len(params) < 4:
+            raise RuntimeError(
+                f"Camera '{camera_label}' has fewer than 4 projection params."
+            )
+
+        fx, fy, cx, cy = params[:4]
+
+        # 有的 JSON 里可能还有图像宽高信息，这里尝试读取
+        width = cam.get("ImageWidth", None)
+        height = cam.get("ImageHeight", None)
+
+        print(
+            f"[Calib] Loaded intrinsics for '{camera_label}' from {calib_path}:\n"
+            f"        fx={fx:.3f}, fy={fy:.3f}, cx={cx:.3f}, cy={cy:.3f}, "
+            f"width={width}, height={height}"
+        )
+        return RgbIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, width=width, height=height)
+
+    raise RuntimeError(f"Camera label '{camera_label}' not found in calibration JSON.")
 
 
 # ===================== Gaze observer =====================
@@ -60,29 +130,123 @@ class GazeStreamingClientObserver(AriaVisualizerStreamingClientObserver):
     在原有 AriaVisualizerStreamingClientObserver 基础上，增加：
     - 对 EyeTrack 图像进行眼动推理；
     - 实时在终端打印 yaw/pitch；
-    - 更新 EyeTrack 子图标题显示当前 yaw/pitch。
+    - 更新 EyeTrack 子图标题显示当前 yaw/pitch；
+    - 使用 camera-rgb 内参将 yaw/pitch 近似投影到 RGB 图像上，并画一个绿色圆点。
     """
 
-    def __init__(self, visualizer: AriaVisualizer, eye_gaze_model):
+    def __init__(
+        self,
+        visualizer: AriaVisualizer,
+        eye_gaze_model,
+        rgb_intrinsics: RgbIntrinsics | None = None,
+        gaze_depth_m: float = 1.0,
+        draw_radius_px: int = 12,
+    ):
         super().__init__(visualizer)
         self.eye_gaze_model = eye_gaze_model
         self.last_eye_gaze = None  # 保存最近一次眼动结果
+        self.rgb_intrinsics = rgb_intrinsics
+        self.gaze_depth_m = gaze_depth_m
+        self.draw_radius_px = draw_radius_px
+
+    # ---------- 辅助函数：从 yaw/pitch → 像素坐标 ----------
+
+    def _gaze_to_rgb_pixel(
+        self,
+        yaw: float,
+        pitch: float,
+        img_w: int,
+        img_h: int,
+    ) -> tuple[int | None, int | None]:
+        """
+        使用 Project Aria yaw/pitch 的约定：
+        - 坐标系：X 左, Y 上, Z 前
+        - yaw = atan(x/z), pitch = atan(y/z)
+
+        因此可以直接反推：
+            x/z = tan(yaw)
+            y/z = tan(pitch)
+
+        再用 pinhole + 内参投影到像素坐标。
+        """
+        if self.rgb_intrinsics is None:
+            return None, None
+
+        fx, fy, cx, cy = (
+            self.rgb_intrinsics.fx,
+            self.rgb_intrinsics.fy,
+            self.rgb_intrinsics.cx,
+            self.rgb_intrinsics.cy,
+        )
+
+        # x_over_z, y_over_z 即方向比值，和深度无关
+        x_over_z = math.tan(yaw)
+        y_over_z = math.tan(pitch)
+
+        # 像素坐标（以像素中心为参照）
+        u = fx * x_over_z + cx
+        v = fy * y_over_z + cy
+
+        u_int = int(round(u))
+        v_int = int(round(v))
+
+        if 0 <= u_int < img_w and 0 <= v_int < img_h:
+            return u_int, v_int
+        else:
+            return None, None
+
+    def _draw_circle(self, image: np.ndarray, center_xy, radius: int = 8) -> np.ndarray:
+        """
+        在 image 上画一个简单的实心圆，使用绿色 (0,255,0)。
+        若 image 是灰度，自动扩展到三通道。
+        返回修改后的图像（可能是新数组）。
+        """
+        cx, cy = center_xy
+        h, w = image.shape[:2]
+
+        # 保证三通道
+        if image.ndim == 2:
+            img_rgb = np.stack([image] * 3, axis=-1)
+        elif image.shape[2] == 1:
+            img_rgb = np.repeat(image, 3, axis=-1)
+        else:
+            img_rgb = image
+
+        y_min = max(0, cy - radius)
+        y_max = min(h - 1, cy + radius)
+        x_min = max(0, cx - radius)
+        x_max = min(w - 1, cx + radius)
+
+        rr = radius * radius
+        for y in range(y_min, y_max + 1):
+            dy = y - cy
+            for x in range(x_min, x_max + 1):
+                dx = x - cx
+                if dx * dx + dy * dy <= rr:
+                    img_rgb[y, x, 0] = 0   # R
+                    img_rgb[y, x, 1] = 255 # G
+                    img_rgb[y, x, 2] = 0   # B
+
+        return img_rgb
+
+    # ---------- 回调：每帧图像 ----------
 
     def on_image_received(self, image, record) -> None:
-        # 保留一份原始图像给模型用（不做旋转）
+        """
+        注意：
+        - 使用 raw_image 做眼动推理和绘制；
+        - super().on_image_received(...) 负责旋转/显示。
+        """
         raw_image = image.copy()
+        cam_id = record.camera_id
 
-        # 先调用父类实现完成图像旋转 + 可视化
-        super().on_image_received(image, record)
-
-        # 仅对 EyeTrack 图像做眼动推理
+        # ========== 1) EyeTrack 图像：做眼动推理 ==========
         if (
             self.eye_gaze_model is not None
-            and record.camera_id == aria.CameraId.EyeTrack
+            and cam_id == aria.CameraId.EyeTrack
         ):
             import torch
 
-            # 离线 demo 中就是直接 torch.tensor(image)，这里保持一致
             img_tensor = torch.tensor(
                 raw_image, device=self.eye_gaze_model.device
             )
@@ -94,7 +258,7 @@ class GazeStreamingClientObserver(AriaVisualizerStreamingClientObserver):
             yaw = float(preds[0, 0].detach().cpu().numpy())
             pitch = float(preds[0, 1].detach().cpu().numpy())
 
-            # 不确定区间（目前只是保存，方便后面扩展）
+            # 不确定区间
             yaw_low, pitch_low = [
                 float(x) for x in lower[0].detach().cpu().numpy()
             ]
@@ -120,24 +284,42 @@ class GazeStreamingClientObserver(AriaVisualizerStreamingClientObserver):
                 f"high=({yaw_high:.3f},{pitch_high:.3f}))"
             )
 
-            # 尝试把当前 yaw/pitch 写到 EyeTrack 子图标题中
+            # 更新 EyeTrack 子图标题
             try:
-                # AriaVisualizer 中第 0 行第 3 列是 Eye Track 视图
                 et_axes = self.visualizer.plots[0, 3]
                 et_axes.set_title(
                     f"Eye Track\n"
                     f"yaw={yaw:.2f} rad, pitch={pitch:.2f} rad"
                 )
             except Exception:
-                # 即使这里失败，也不影响主流程
                 pass
+
+        # ========== 2) RGB 图像：使用最近一次 gaze 做投影并画点 ==========
+        if (
+            self.last_eye_gaze is not None
+            and self.rgb_intrinsics is not None
+            and cam_id == aria.CameraId.Rgb
+        ):
+            h, w = raw_image.shape[:2]
+            yaw = self.last_eye_gaze["yaw"]
+            pitch = self.last_eye_gaze["pitch"]
+
+            u, v = self._gaze_to_rgb_pixel(yaw, pitch, img_w=w, img_h=h)
+            if u is not None and v is not None:
+                raw_image = self._draw_circle(
+                    raw_image, center_xy=(u, v), radius=self.draw_radius_px
+                )
+
+        # 最后交给父类做旋转 + 可视化
+        super().on_image_received(raw_image, record)
 
 
 # ===================== Argument parsing =====================
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Aria live gaze streaming with online eye-gaze inference."
+        description="Aria live gaze streaming with online eye-gaze inference "
+                    "and approximate RGB gaze projection."
     )
     parser.add_argument(
         "--interface",
@@ -193,7 +375,21 @@ def parse_args() -> argparse.Namespace:
         "--device",
         type=str,
         default=DEFAULT_DEVICE,
-        help="Device for eye-gaze inference, e.g. 'cpu' or 'cuda:0'. Default: cpu",
+        help="Device for eye-gaze inference, e.g. 'cpu' or 'cuda:0'.",
+    )
+
+    # 标定文件路径
+    parser.add_argument(
+        "--factory-calib-json",
+        type=str,
+        default=DEFAULT_FACTORY_CALIB_JSON,
+        help="Path to factory_calibration.json for camera-rgb intrinsics.",
+    )
+    parser.add_argument(
+        "--streaming-calib-json",
+        type=str,
+        default=DEFAULT_STREAMING_CALIB_JSON,
+        help="(Optional) Path to streaming_calibration.json (currently unused).",
     )
 
     return parser.parse_args()
@@ -204,7 +400,7 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    # 根据需要更新 iptables（和原 device_stream.py 一致）
+    # 根据需要更新 iptables
     if args.update_iptables and sys.platform.startswith("linux"):
         update_iptables()
 
@@ -212,14 +408,14 @@ def main():
     aria.set_log_level(aria.Level.Info)
 
     # ---------- 导入 EyeGazeInference ----------
-    # 把 projectaria_eyetracking 的父目录加入 sys.path
     if args.et_root_parent and os.path.isdir(args.et_root_parent):
         if args.et_root_parent not in sys.path:
             sys.path.insert(0, args.et_root_parent)
 
     try:
-        # 推荐方式：通过 projectaria_eyetracking 包导入
-        from projectaria_eyetracking.projectaria_eyetracking.inference import infer as eye_infer
+        from projectaria_eyetracking.projectaria_eyetracking.inference import (
+            infer as eye_infer,
+        )
     except ImportError as e:
         print(
             "ERROR: 无法导入 'projectaria_eyetracking.inference.infer'。\n"
@@ -231,12 +427,24 @@ def main():
         print("详细 ImportError:", e)
         sys.exit(1)
 
-    # 初始化眼动推理模型
     eye_model = eye_infer.EyeGazeInference(
         args.model_checkpoint_path,
         args.model_config_path,
         device=args.device,
     )
+
+    # ---------- 读取 camera-rgb 内参（来自 factory_calibration.json） ----------
+    rgb_intrinsics = None
+    try:
+        rgb_intrinsics = load_rgb_intrinsics_from_calibration(
+            args.factory_calib_json,
+            camera_label="camera-rgb",
+        )
+    except Exception as e:
+        print(
+            f"[WARN] Failed to load RGB intrinsics from {args.factory_calib_json}: {e}\n"
+            "       将禁用 gaze → RGB 投影，仅显示 yaw/pitch 数值。"
+        )
 
     # ---------- 建立 DeviceClient 连接 ----------
     device_client = aria.DeviceClient()
@@ -259,7 +467,6 @@ def main():
     if args.streaming_interface == "usb":
         streaming_config.streaming_interface = aria.StreamingInterface.Usb
     else:
-        # WiFi 模式（根据 SDK 版本可能叫 Wifi 或 WifiStation，视本地 API 而定）
         streaming_config.streaming_interface = aria.StreamingInterface.Wifi
 
     # 使用 ephemeral 证书
@@ -276,6 +483,9 @@ def main():
     gaze_observer = GazeStreamingClientObserver(
         aria_visualizer,
         eye_gaze_model=eye_model,
+        rgb_intrinsics=rgb_intrinsics,
+        gaze_depth_m=1.0,
+        draw_radius_px=12,
     )
     streaming_client.set_streaming_client_observer(gaze_observer)
     streaming_client.subscribe()
@@ -284,7 +494,6 @@ def main():
     try:
         aria_visualizer.render_loop()
     finally:
-        # ---------- 收尾 ----------
         print("Stop listening to image data")
         streaming_client.unsubscribe()
         streaming_manager.stop_streaming()

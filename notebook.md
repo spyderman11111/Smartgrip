@@ -14,6 +14,7 @@ ros2 control switch_controllers \
 ros2 run gripanything seeanything
 
 
+
 source /home/sz/Smartgrip/.aria/bin/activate
 # 2. 把示例代码解压到 Smartgrip 目录
 python -m aria.extract_sdk_samples --output /home/sz/Smartgrip
@@ -24,6 +25,8 @@ cd /home/sz/Smartgrip/projectaria_client_sdk_samples
 # 4. 安装依赖（建议先激活你的 venv 再执行）
 python3 -m pip install -r requirements.txt
 
+
+python gaze_stream.py --interface usb --update_iptables
 
 
 ros2 topic pub --once /scaled_joint_trajectory_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{
