@@ -26,6 +26,7 @@ setup(
             'seeanything = gripanything.seeanything:main',
             'seeanything_demo = gripanything.seeanything_demo:main',
             'goto_hover_once = gripanything.goto_hover_once:main',
+            'tool_to_camera_tf_publisher = gripanything.tool_to_camera_tf_publisher:main',
         ],
     },
 )

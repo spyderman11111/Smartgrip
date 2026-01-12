@@ -361,7 +361,7 @@ class VGGTMinimal:
 
 # -------------------- 入口 --------------------
 if __name__ == "__main__":
-    IMAGES_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/pictures/yellow_cube_30"
+    IMAGES_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/pictures/yellow_cube_30/out_rgb_masks"
 
     app = VGGTMinimal(
         images_dir=IMAGES_DIR,

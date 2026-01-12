@@ -1,20 +1,20 @@
 {
-  "input_ply": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/vggt_output/blue_cube_30_b30.ply",
-  "voxel": 0.008451994359493255,
+  "input_ply": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/pictures/vggt_output/points.ply",
+  "voxel": 0.0072646611928939816,
   "center": [
-    0.037416334204380175,
-    0.12200951002648408,
-    0.8809952575707356
+    -0.043716084499766446,
+    0.046623779658134364,
+    0.9067001265523568
   ],
   "obb_extent": [
-    0.34617643425101363,
-    0.19616039184658296,
-    0.185708775775414
+    0.18884589683346928,
+    0.1846427578745234,
+    0.14921019841536187
   ],
   "counts": {
-    "points_no_table": 106567,
-    "near_main_raw": 102140,
-    "main_cluster_raw": 102090,
-    "main_cluster_clean": 101510
+    "points_no_table": 49004,
+    "near_main_raw": 47133,
+    "main_cluster_raw": 47010,
+    "main_cluster_clean": 46645
   }
 }

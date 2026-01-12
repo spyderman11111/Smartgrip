@@ -20,7 +20,7 @@ import open3d as o3d
 
 
 # ===================== 可调参数 =====================
-PLY_PATH = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/vggt_output/blue_cube_30_b30.ply"
+PLY_PATH = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/pictures/vggt_output/points.ply"
 OUT_DIR  = "pc_out_simple"
 VISUALIZE = True
 
