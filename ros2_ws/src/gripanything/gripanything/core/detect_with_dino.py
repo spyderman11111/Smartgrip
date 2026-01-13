@@ -69,9 +69,9 @@ if __name__ == "__main__":
     print("transformers =", transformers.__version__)
     print("python =", sys.executable)
 
-    image_path = "/home/MA_SmartGrip/orange.png"
+    image_path = "/home/MA_SmartGrip/Smartgrip/image1.png"
     image = Image.open(image_path).convert("RGB")
-    prompt = "orange object ."   
+    prompt = "yellow object ."   
 
     predictor = GroundingDinoPredictor(model_id="IDEA-Research/grounding-dino-tiny")
     boxes, labels, scores = predictor.predict(image, prompt, box_threshold=0.20, text_threshold=0.20)

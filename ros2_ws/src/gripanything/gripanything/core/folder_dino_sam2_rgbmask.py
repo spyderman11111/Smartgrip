@@ -125,8 +125,8 @@ def process_one_image(image_path, prompt, dino, sam2,
 
 if __name__ == "__main__":
     # ======== 按需修改这里 ========
-    INPUT_DIR  = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/pictures/yellow_cube_30"   
-    OUTPUT_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/pictures/yellow_cube_30/out_rgb_masks"
+    INPUT_DIR  = "/home/MA_SmartGrip/Smartgrip/ur5_image_input"   
+    OUTPUT_DIR = "/home/MA_SmartGrip/Smartgrip/ur5_image_input"
     PROMPT     = "yellow cube ."                   # 文本提示
 
     DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
