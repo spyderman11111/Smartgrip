@@ -1,3 +1,13 @@
+# gripanything — Repository Overview & Pipeline README
+
+This repository contains a ROS 2 + Python perception–control pipeline for a UR5/UR5e wrist camera setup. It supports:
+
+* **Text-prompted detection** (GroundingDINO) to obtain target location candidates.
+* **Geometry utilities** to convert detections into robot-frame target points and hover poses.
+* **Motion execution** through IK + joint trajectory publishing.
+* **Multi-view image capture** along a polygon/circular scan path.
+* **Offline reconstruction** (VGGT) and **point-cloud post-processing** to estimate the object pose/center in `base_link`.
+
 # Setting Up the Environment
 
 ```bash
@@ -82,292 +92,334 @@ colcon build --symlink-install \
   --cmake-args -DPYTHON_EXECUTABLE="${PYTHON_EXECUTABLE}" \
   --cmake-force-configure
 
-## vision_part package Instructions
-
-### **extract_frames** 
-method, implemented in extract_frames.py, supports two modes: video file input (e.g., .mp4) and webcam stream input (e.g., '0'). It uses OpenCV to extract every N-th frame and saves them to a specified directory using the original frame index in the filename.
-
-### **GroundingDinoPredictor**
-
-This class wraps a **GroundingDINO** model for **zero-shot object detection** using natural language prompts.
 
 ---
 
-**Functionality:**
+## Directory Tree (as of your snapshot)
 
-- Uses `transformers.AutoModelForZeroShotObjectDetection` and `AutoProcessor`.
-- Takes an input RGB image and a **text prompt** (e.g., `"red box"`).
-- Outputs:
-  - `boxes`: Tensor of detected bounding boxes `[x0, y0, x1, y1]`
-  - `labels`: List of matched class strings
-
----
-
-**Key Parameters:**
-
-- `model_id`: Default is `"IDEA-Research/grounding-dino-tiny"`
-- `device`: `"cuda"` or `"cpu"`
-- `box_threshold`: Filter out boxes with low visual confidence
-- `text_threshold`: Filter out boxes with low textual alignment
-
----
-
-**Example Usage:**
-
-```python
-predictor = GroundingDinoPredictor()
-boxes, labels = predictor.predict(image, "red box")
+```text
+/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything
+├── gripanything
+│   ├── core
+│   │   ├── config.py
+│   │   ├── detect_with_dino.py
+│   │   ├── dino_sam_lg.py
+│   │   ├── extract_frames.py
+│   │   ├── folder_dino_sam2_rgbmask.py
+│   │   ├── ik_and_traj.py
+│   │   ├── LightGlueMatcher.py
+│   │   ├── point_processing.py
+│   │   ├── polygon_path.py
+│   │   ├── segment_with_sam2.py
+│   │   ├── tf_ops.py
+│   │   ├── vggtreconstruction.py
+│   │   └── vision_geom.py
+│   ├── output
+│   │   ├── image_jointstates.json
+│   │   ├── postprocess_output
+│   │   │   ├── main_cluster_clean.ply
+│   │   │   ├── object_in_base_link.json
+│   │   │   └── points_no_table.ply
+│   │   ├── ur5image
+│   │   │   ├── pose_1_image.png
+│   │   │   ├── ...
+│   │   │   └── pose_6_image.png
+│   │   └── vggt_output
+│   │       ├── cameras.json
+│   │       ├── cameras_lines.ply
+│   │       └── points.ply
+│   ├── seeanything.py
+│   ├── seeanything_debug.py
+│   └── utils
+│       ├── goto_point_from_object_json.py
+│       ├── publish_object_points_tf.py
+│       ├── tool_to_camera_tf_publisher.py
+│       └── vs.py
+├── package.xml
+├── resource
+│   └── gripanything
+├── setup.cfg
+└── setup.py
 ```
 
-### **SAM2ImagePredictorWrapper**
+---
 
-The `SAM2ImagePredictorWrapper` class wraps Meta AI's **SAM2** segmentation model to perform fine-grained mask prediction on RGB images, either using full images or cropped regions.
+## `gripanything/` Top-level Scripts
 
-**Functionality:**
+### `seeanything.py` (Main ROS 2 node)
 
-1. **Full Image Masking** (`run_inference`)
-   - Loads a full RGB image and a target bounding box (x1, y1, x2, y2).
-   - Predicts a segmentation mask using the SAM2 model.
-   - Saves grayscale binary mask as `*_mask_gray.png` in the specified directory.
-   - Returns a dictionary containing:
-     - `mask_array` (`np.uint8`): Binary mask of shape (H, W)
-     - `mask_score` (`float`): IoU confidence score
-     - `low_res_mask` (`np.ndarray`): Raw low-resolution logits (256×256)
+The main online pipeline script:
 
-2. **Cropped Region Contour Masking** (`run_on_crop`)
-   - Accepts a cropped RGB `PIL.Image` (e.g., extracted via a bounding box).
-   - Uses full image region as a dummy box to apply SAM2.
-   - Applies post-processing:
-     - Thresholding (`mask < 0.2`)
-     - Contour filtering by area (`> 700`)
-     - Draws filtered contours on the original crop.
-   - Saves result as an RGB image with drawn contours.
+* Moves UR5 to an initial pose.
+* Runs a **two-stage (coarse→fine)** detection to estimate the target center in `base_link`.
+* Moves to a hover pose above the target.
+* Executes an **active viewpoint scan** (polygon/circle) around the target.
+* At each viewpoint: saves an image and logs robot joint state + camera pose into a JSON file.
 
-**Initialization Parameters:**
+Output artifacts are typically written under:
 
-- `model_id` (str): Pretrained SAM2 model ID (e.g., `"facebook/sam2.1-hiera-large"`)
-- `device` (str): `"cuda"` or `"cpu"`
-- `mask_threshold` (float): Binarization threshold for masks
-- `max_hole_area` (float): Max allowed hole size in masks
-- `max_sprinkle_area` (float): Max allowed sprinkle noise in masks
-- `multimask_output` (bool): Whether to output multiple masks per input
-- `return_logits` (bool): Whether to return raw logits (used for low-resolution masks)
+* `gripanything/output/ur5image/` (images)
+* `gripanything/output/image_jointstates.json` (per-image robot state + camera pose)
 
-### **LightGlueMatcher**
+### `seeanything_debug.py`
 
-The `LightGlueMatcher` class provides a modular wrapper around LightGlue and SuperPoint for image matching tasks. It allows configurable transformer architecture and inference settings and supports feature extraction and matching with minimal code.
+A debug-friendly variant of the main node, usually used to:
 
-**Functionality:**
-
-1. **Feature Extraction**  
-   - Loads and normalizes an image using `load_image`.
-   - Uses `SuperPoint` to extract keypoints and descriptors.
-   - Returns a feature dictionary including:
-     - `keypoints` (Tensor): shape `[1, N, 2]`  
-     - `descriptors` (Tensor): shape `[1, N, D]`  
-     - `image_size` (Tensor): shape `[1, 2]` (width, height)
-
-2. **Feature Matching**  
-   - Accepts two sets of keypoints, descriptors, and image sizes.
-   - Feeds them to `LightGlue` for matching.
-   - Returns a dictionary including:
-     - `matches`: matched keypoint indices per image
-     - `scores`: confidence scores per match
-
-3. **Optional Compilation**  
-   - `matcher.compile("reduce-overhead")` speeds up inference via Torch 2.0 graph compilation.
-
-**Initialization Parameters:**
-
-- `feature_type` (str): Only `'superpoint'` is currently supported.
-- `device` (str): `'cuda'` or `'cpu'`
-- `descriptor_dim`, `n_layers`, `num_heads`: Transformer config
-- `flash`, `mp`: Optimization flags (e.g., FlashAttention, mixed precision)
-- `depth_confidence`, `width_confidence`, `filter_threshold`: Matching quality thresholds
-- `weights`: Path to custom pretrained weights
-
-### **vggtreconstruction**
-
-This script runs **VGGT-based monocular 3D reconstruction** and exports a **COLMAP-compatible sparse model**.
+* Test perception modules without full motion,
+* Verify topic/TF availability,
+* Run a shorter or simplified motion/capture routine.
 
 ---
 
-**Pipeline Overview:**
+## `gripanything/core/` Modules
 
-1. **Load Config & Model**
-   - Uses pretrained VGGT-1B weights (auto-download).
-   - Reads images from `scene_dir/images`.
+### `core/config.py`
 
-2. **VGGT Inference**
-   - Predicts camera extrinsics, intrinsics, depth, and confidence.
-   - Supports `float16` / `bfloat16` based on GPU capability.
+Configuration loading utilities:
 
-3. **Point Cloud Generation**
-   - Converts depth to 3D point cloud.
-   - Applies confidence threshold and random sampling.
+* Defines how parameters are read (ROS parameters and/or local defaults).
+* Central place to manage topics, frame names, thresholds, motion times, scan settings, etc.
 
-4. **COLMAP Structure Creation**
-   - Builds `pycolmap.Reconstruction` with optional shared camera.
-   - Rescales intrinsics to match original image resolution.
+### `core/detect_with_dino.py`
 
-5. **Export**
-   - Saves:
-     - `sparse/`: COLMAP binary model + `points.ply`
-     - `sparse_txt/`: TXT model via `colmap model_converter`
+GroundingDINO wrapper:
+
+* Loads the DINO model and runs open-vocabulary detection from a text prompt.
+* Returns candidate boxes, scores, and associated metadata.
+
+### `core/segment_with_sam2.py`
+
+SAM2 wrapper:
+
+* Performs segmentation given an input image and prompt signals (often box prompts).
+* Produces masks used for downstream filtering or visualization.
+
+### `core/dino_sam_lg.py`
+
+Integration module (DINO + SAM2 + LightGlue):
+
+* A higher-level orchestration file that typically:
+
+  * Detects with DINO,
+  * Segments with SAM2,
+  * Optionally runs feature matching with LightGlue to validate target identity or cross-view consistency.
+
+### `core/LightGlueMatcher.py`
+
+LightGlue-based feature matcher:
+
+* Provides feature extraction + matching interface (e.g., SuperPoint + LightGlue).
+* Used for cross-view association or match scoring.
+
+### `core/vision_geom.py`
+
+Vision-to-geometry conversion utilities (online geometry step):
+
+* Takes image-space detections and TF transforms and produces:
+
+  * Target point `C` in a robot frame (often `base_link`),
+  * A hover pose above that point,
+  * TF frames for visualization in RViz (e.g., object center frame, circle center frame).
+* This is where camera-ray geometry, frame conversion, and bias compensation often live.
+
+### `core/tf_ops.py`
+
+TF / geometry helpers:
+
+* Convert ROS TF messages into rotation/translation (`R`, `p`),
+* Quaternion to rotation, common fixed transforms (e.g., camera_link ↔ camera_optical),
+* Small math utilities used across the pipeline.
+
+### `core/ik_and_traj.py`
+
+Motion primitives and execution:
+
+* `IKClient`: requests IK solutions (typically via MoveIt service).
+* `TrajectoryPublisher`: publishes joint trajectories to the UR controller.
+* `MotionContext`: reads `/joint_states`, checks stationarity, builds IK seeds, and handles safety checks (e.g., jump detection).
+
+### `core/polygon_path.py`
+
+Active scan path generator:
+
+* Generates a sequence of poses on a circle/polygon around a center in a chosen plane.
+* Supports direction, number of vertices, radius, and orientation mode.
+
+### `core/point_processing.py`
+
+Point cloud post-processing utilities:
+
+* Filters, clustering, centroid computation, bounding boxes, etc.
+* Often used by your offline postprocess step (table removal, main cluster extraction, robust center).
+
+### `core/extract_frames.py`
+
+Frame extraction helper:
+
+* Extracts frames from videos into image files for offline experiments.
+
+### `core/folder_dino_sam2_rgbmask.py`
+
+Folder-based batch inference:
+
+* Runs DINO + SAM2 over a directory of images.
+* Saves per-image masks/overlays and possibly JSON logs.
+
+### `core/vggtreconstruction.py`
+
+VGGT reconstruction script/module:
+
+* Reconstructs a point cloud from the captured multi-view images in `output/ur5image`.
+* Produces:
+
+  * `output/vggt_output/points.ply`
+  * `output/vggt_output/cameras.json`
+  * (optional) `output/vggt_output/cameras_lines.ply` for visualization
 
 ---
 
-## **main.py - Aria & UR5e Multi-View Object Matching Pipeline**
+## `gripanything/utils/` Tools
 
-This script performs **multi-view object detection, segmentation, feature extraction, and feature matching** between an **ARIA** glasses image and three selected **UR5e** arm camera frames. It integrates **GroundingDINO**, **SAM2**, and **LightGlue** into a complete matching pipeline.
+### `utils/tool_to_camera_tf_publisher.py`
 
----
+Publishes a static TF:
 
-### **Pipeline Overview**
+* Typically `tool0` → `camera_link` or `camera_optical`.
+* Used for RViz visualization and to ensure consistent TF availability.
 
-1. **Frame Selection**  
-   Function: `select_frame_paths(aria_dir, ur5e_dir)`  
-   - Randomly selects **1 frame** from ARIA camera folder  
-   - Selects **3 UR5e frames** (first, middle, last) for coverage  
-   → Input to the downstream detection pipeline
+### `utils/publish_object_points_tf.py`
 
-2. **Model Initialization**  
-   - Loads GroundingDINO (object detection), SAM2 (segmentation), and LightGlue (feature matching).
-   - Device set automatically (`cuda` or `cpu`)  
-   → Prepares all models for zero-shot visual-language inference.
+Publishes TF frames for object results:
 
-3. **Object Detection + Segmentation + Feature Extraction**  
-   Function: `extract_features(...)`  
-   - Runs GroundingDINO with a text prompt (e.g., `"ball"`) to detect objects.  
-   - Crops the detected bounding box → feeds into SAM2 to generate segmentation mask.  
-   - Extracts keypoints + descriptors from the masked region using LightGlue.  
-   → For each input image (ARIA or UR5e), returns a feature dictionary.
+* Reads object outputs (e.g., center/corners) and publishes them as TF frames
+  for RViz visualization or downstream motion scripts.
 
-4. **Feature Matching**  
-   Function: `match_and_report(...)`  
-   - For each UR5e frame:
-     - Matches its features with ARIA features.
-     - Calculates number of matches and average score.
-     - Saves match visualization (using `draw_matches`) to output directory.
-   → Provides quantitative and qualitative comparison between views.
+### `utils/goto_point_from_object_json.py`
 
-5. **Result Export**  
-   - All match scores and image paths saved to a JSON file:  
-     `outputs/match_confidence_result.json`  
-   - Contains:
-     - match count
-     - average confidence score
-     - image and mask paths
-     - path to match visualization image
+Simple motion utility:
+
+* Loads `object_in_base_link.json` (or similar) and commands the robot to move to:
+
+  * object center,
+  * hover above center,
+  * or a selected corner/point.
+
+### `utils/vs.py`
+
+Miscellaneous helper / scratch utility:
+
+* Often used for quick tests, visualization, or ad-hoc experiments.
 
 ---
 
-### **Step Relationships**
+## `gripanything/output/` Artifacts
 
-| Step | Input | Output | Used In |
-|------|-------|--------|---------|
-| 1. select_frame_paths | image folders | ARIA frame + 3 UR5e frames | → Step 3 |
-| 2. model init | model names | loaded models | → Step 3–4 |
-| 3. extract_features | image path, prompt | features (keypoints, descriptors, image size) | → Step 4 |
-| 4. match_and_report | two feature sets | match count + scores + visual | → Step 5 |
-| 5. save result | match data dict | JSON summary | — |
+This folder contains run outputs (examples from your snapshot):
+
+* `output/ur5image/pose_k_image.png`
+  Images captured at each scan waypoint.
+
+* `output/image_jointstates.json`
+  Per-image joint positions and camera pose (in `base_link`) at capture time.
+
+* `output/vggt_output/`
+  VGGT reconstruction outputs:
+
+  * `points.ply` (VGGT world)
+  * `cameras.json` (camera pose/intrinsics per frame)
+  * `cameras_lines.ply` (optional Open3D frustums)
+
+* `output/postprocess_output/`
+  Post-processing and alignment outputs:
+
+  * `points_no_table.ply` (table removed)
+  * `main_cluster_clean.ply` (main object cluster)
+  * `object_in_base_link.json` (final object center + OBB corners in `base_link`)
 
 ---
 
-### **Example Output (JSON structure)**
+## Main Pipeline: `seeanything.py`
 
-```json
-{
-  "First": {
-    "match_count": 34,
-    "score_mean": 0.72,
-    "aria_image": "...",
-    "ur5e_image": "...",
-    "match_vis": "outputs/aria_vs_first_matches.png"
-  },
-}
-```
-# ROS2 command
+Below is the conceptual pipeline implemented by `seeanything.py`:
 
-```bash
-source install/setup.bash
+1. **Move to INIT pose**
 
-conda deactivate
+   * Publish a joint trajectory to a predefined initial configuration.
+   * Wait until `/joint_states` indicates the robot is stationary.
 
-ros2 launch ur_robot_driver ur_control.launch.py ur_type:=ur5e robot_ip:=192.168.0.11 launch_rviz:=true
+2. **Stage-1 detection (coarse)**
 
-#Do not use vscode from app installer! Just install vscode from deb package.
+   * Capture an image from the wrist camera topic.
+   * Run GroundingDINO once to get a coarse target hypothesis.
+   * Convert the detection to a target point `C1` in `base_link` (via `vision_geom.py` + TF).
+   * Create a pose that updates **XY to `C1`** but keeps current tool **Z**.
+   * Solve IK and move.
 
-ros2 launch ur_moveit_config ur_moveit.launch.py ur_type:=ur5e launch_rviz:=true
+3. **Wait until stationary**
 
-ros2 launch ur_moveit_config ur_moveit.launch.py \
-  ur_type:=ur5e \
-  use_fake_hardware:=true \
-  description_package:=my_ur5e_description \
-  description_file:=ur5e_with_camera.urdf.xacro \
-  launch_rviz:=true
+   * Ensure the robot has settled before the fine stage.
 
-ros2 control switch_controllers \
-  --activate scaled_joint_trajectory_controller \
-  --deactivate joint_trajectory_controller
+4. **Stage-2 detection (fine)**
 
-ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
+   * Run detection again from the new viewpoint.
+   * Convert to refined target `C2` in `base_link`.
+   * Build a **hover pose** with Z = `C2.z + hover_above` (tool Z-down).
+   * Solve IK and move to hover.
 
-ros2 run pylon_ros2_camera pylon_ros2_camera_node \
-  --ros-args \
-  -p camera_info_url:=file:///home/MA_SmartGrip/calib_result/ost.yaml
+5. **Generate active scan path**
 
-export SETUPTOOLS_USE_DISTUTILS=stdlib
-python -m colcon build --packages-select gripanything --symlink-install \
-  --cmake-args -DPYTHON_EXECUTABLE="$(which python)" -DPython3_EXECUTABLE="$(which python)"
+   * Read current tool yaw in the XY plane.
+   * Generate an N-vertex polygon/circular path around the target center.
+   * Optionally trim by `sweep_deg` (< 360°) to avoid joint limits.
 
-```
-ros2 run camera_calibration cameracalibrator \
-    --size 7x10 \
-    --square 0.2 \
-    --ros-args \
-    --remap image:=/my_camera/pylon_ros2_camera_node/image_raw \
-    --remap camera:=/my_camera/pylon_ros2_camera_node
+6. **Capture loop over vertices**
 
-ros2 run xacro xacro \
-  /home/MA_SmartGrip/Smartgrip/ros2_ws/src/vision_to_ros/robot_description/ur.urdf.xacro \
-  ur_type:=ur5e name:=ur5e \
-  > /home/MA_SmartGrip/Smartgrip/ros2_ws/src/vision_to_ros/robot_description/ur5e_robot.urdf
+   * For each vertex:
+
+     * IK solve and move.
+     * Wait a dwell time.
+     * Save image to `output/ur5image/pose_k_image.png`.
+     * Log joint state + base→camera pose to `output/image_jointstates.json`.
+   * If an IK solution is flagged as an abnormal jump, skip that vertex (no capture).
+
+7. **Return to INIT and exit**
+
+   * Send the robot back to the initial pose and shutdown the node.
+
+---
+
+## Offline Pipeline (Typical Follow-up After `seeanything.py`)
+
+After the scan completes, a common offline workflow is:
+
+1. **VGGT reconstruction**
+
+* Input: `output/ur5image/*.png`
+* Script: `core/vggtreconstruction.py`
+* Output: `output/vggt_output/points.ply`, `cameras.json`, ...
+
+2. **Point-cloud post-process + alignment**
+
+* Input:
+
+  * `output/vggt_output/points.ply`
+  * `output/vggt_output/cameras.json`
+  * `output/image_jointstates.json`
+* Output:
+
+  * `output/postprocess_output/object_in_base_link.json`
+  * plus intermediate PLYs for debugging/visualization
+
+This offline stage yields the final object estimate in the robot base frame (`base_link`), suitable for grasping or evaluation.
+
+---
+
+## Notes on Naming & Imports
+
+* Anything meant to be *imported by the main pipeline* should live under `gripanything/core/` and expose clear functions/classes.
+* One-off scripts that are not part of the main pipeline should live under `gripanything/utils/`.
+* Outputs should remain under `gripanything/output/` to keep runs reproducible and easy to archive.
+
+---
 
 
-ros2 topic pub --once /scaled_joint_trajectory_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{
-  header: {stamp: {sec: 0, nanosec: 0}},
-  joint_names: [
-    'shoulder_pan_joint',
-    'shoulder_lift_joint',
-    'elbow_joint',
-    'wrist_1_joint',
-    'wrist_2_joint',
-    'wrist_3_joint'
-  ],
-  points: [{
-    positions: [0.9298571348, -1.3298700166, 1.9266884963, -2.1331087552, -1.6006286780, -1.0919039885],
-    time_from_start: {sec: 3, nanosec: 0}
-  }]
-}"
-
-
-header:
-  stamp:
-    sec: 1757332639
-    nanosec: 363394422
-  frame_id: base_link
-name:
-- shoulder_lift_joint
-- elbow_joint
-- wrist_1_joint
-- wrist_2_joint
-- wrist_3_joint
-- shoulder_pan_joint
-position:
-- -1.2545607549003144
-- 1.2091739813434046
-- -1.488419310455658
-- -1.5398953596698206
-- -0.6954544226275843
-- 0.9004912376403809
