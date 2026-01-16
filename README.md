@@ -343,6 +343,8 @@ This folder contains run outputs (examples from your snapshot):
 
 Below is the conceptual pipeline implemented by `seeanything.py`:
 
+`seeanything.py` first performs two-stage target localization and active viewpoint capture, then uses the captured images to reconstruct a point cloud (VGGT) and finally post-processes/alines it to output the object estimate in `base_link`.
+
 1. **Move to INIT pose**
 
    * Publish a joint trajectory to a predefined initial configuration.
@@ -364,7 +366,7 @@ Below is the conceptual pipeline implemented by `seeanything.py`:
 
    * Run detection again from the new viewpoint.
    * Convert to refined target `C2` in `base_link`.
-   * Build a **hover pose** with Z = `C2.z + hover_above` (tool Z-down).
+   * Build a hover pose with `Z = C2.z + hover_above` (tool Z-down).
    * Solve IK and move to hover.
 
 5. **Generate active scan path**
@@ -383,37 +385,35 @@ Below is the conceptual pipeline implemented by `seeanything.py`:
      * Log joint state + base→camera pose to `output/image_jointstates.json`.
    * If an IK solution is flagged as an abnormal jump, skip that vertex (no capture).
 
-7. **Return to INIT and exit**
+7. **VGGT reconstruction (from captured images)**
+
+   * Input: `output/ur5image/*.png`
+   * Module/script: `core/vggtreconstruction.py`
+   * Outputs (under `output/vggt_output/`):
+
+     * `points.ply` (reconstructed point cloud in VGGT world)
+     * `cameras.json` (per-frame camera entries)
+     * optional `cameras_lines.ply` (Open3D frustums)
+
+8. **Point-cloud post-process + alignment to `base_link`**
+
+   * Inputs:
+
+     * `output/vggt_output/points.ply`
+     * `output/vggt_output/cameras.json`
+     * `output/image_jointstates.json` (base→camera poses at capture time)
+   * Outputs (under `output/postprocess_output/`):
+
+     * `points_no_table.ply` (table removed)
+     * `main_cluster_clean.ply` (main object cluster)
+     * `object_in_base_link.json` (final object center + OBB corners in `base_link`)
+
+9. **Return to INIT and exit**
 
    * Send the robot back to the initial pose and shutdown the node.
 
----
+This end-to-end pipeline yields a final object estimate in the robot base frame (`base_link`), suitable for grasping, evaluation, and RViz visualization.
 
-## Offline Pipeline (Typical Follow-up After `seeanything.py`)
-
-After the scan completes, a common offline workflow is:
-
-1. **VGGT reconstruction**
-
-* Input: `output/ur5image/*.png`
-* Script: `core/vggtreconstruction.py`
-* Output: `output/vggt_output/points.ply`, `cameras.json`, ...
-
-2. **Point-cloud post-process + alignment**
-
-* Input:
-
-  * `output/vggt_output/points.ply`
-  * `output/vggt_output/cameras.json`
-  * `output/image_jointstates.json`
-* Output:
-
-  * `output/postprocess_output/object_in_base_link.json`
-  * plus intermediate PLYs for debugging/visualization
-
-This offline stage yields the final object estimate in the robot base frame (`base_link`), suitable for grasping or evaluation.
-
----
 
 ## Notes on Naming & Imports
 
