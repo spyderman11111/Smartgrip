@@ -1,6 +1,6 @@
 # gripanything — Repository Overview & Pipeline README
 
-This repository contains a ROS 2 + Python perception–control pipeline for a UR5/UR5e wrist camera setup. It supports:
+This repository contains a ROS 2 + Python perception–control pipeline for a UR5e wrist camera setup. It supports:
 
 * **Text-prompted detection** (GroundingDINO) to obtain target location candidates.
 * **Geometry utilities** to convert detections into robot-frame target points and hover poses.
@@ -95,7 +95,7 @@ colcon build --symlink-install \
 
 ---
 
-## Directory Tree (as of your snapshot)
+## Directory Tree 
 
 ```text
 /home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything
