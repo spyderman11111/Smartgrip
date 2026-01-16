@@ -427,8 +427,8 @@ if __name__ == "__main__":
         score_th=0.20,
         topk_quality=10,
         k_ref=20,
-        pass_threshold=0.40,     # t in your paper
-        consecutive_n=2,         # N in your paper
+        pass_threshold=0.40,     
+        consecutive_n=2,         
         max_frames=16,           # number of snapshots in the sweep
         save_best_viz_path="/home/MA_SmartGrip/Smartgrip/tmp/best_match_viz.png",
         viz_topk=200,

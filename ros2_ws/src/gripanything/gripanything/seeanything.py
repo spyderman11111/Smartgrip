@@ -68,9 +68,9 @@ class SeeAnythingNode(Node):
         # Load config (with some ROS param overrides)
         self.cfg = load_from_ros_params(self)
 
-        # 环绕角度（度），默认 355°，用于替代满圈 360°
+        # 环绕角度（度），默认 120°，用于替代满圈 360°
         # 若配置文件/ROS 参数中未提供 circle.sweep_deg，则使用默认值 355.0
-        self._sweep_deg: float = float(getattr(getattr(self.cfg, "circle", object()), "sweep_deg", 355.0))
+        self._sweep_deg: float = float(getattr(getattr(self.cfg, "circle", object()), "sweep_deg", 120.0))
 
         # Interactive prompt (unless disabled)
         if self.cfg.runtime.require_prompt:

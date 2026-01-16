@@ -21,5 +21,5 @@ def inspect_point_cloud(ply_path):
     o3d.visualization.draw_geometries([pcd])
 
 if __name__ == "__main__":
-    ply_file = "/home/MA_SmartGrip/Smartgrip/pc_out_simple/main_cluster_clean.ply"
+    ply_file = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/vggt_output/points.ply"
     inspect_point_cloud(ply_file)
