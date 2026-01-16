@@ -252,11 +252,6 @@ Point cloud post-processing utilities:
 * Filters, clustering, centroid computation, bounding boxes, etc.
 * Often used by your offline postprocess step (table removal, main cluster extraction, robust center).
 
-### `core/extract_frames.py`
-
-Frame extraction helper:
-
-* Extracts frames from videos into image files for offline experiments.
 
 ### `core/folder_dino_sam2_rgbmask.py`
 
@@ -279,6 +274,12 @@ VGGT reconstruction script/module:
 ---
 
 ## `gripanything/utils/` Tools
+
+### `utils/extract_frames.py`
+
+Frame extraction helper:
+
+* Extracts frames from videos into image files for offline experiments.
 
 ### `utils/tool_to_camera_tf_publisher.py`
 
