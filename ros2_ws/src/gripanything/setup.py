@@ -24,11 +24,10 @@ setup(
     entry_points={
         'console_scripts': [
             'seeanything = gripanything.seeanything:main',
-            'seeanything_demo = gripanything.seeanything_demo:main',
-            'goto_hover_once = gripanything.goto_hover_once:main',
-            'tool_to_camera_tf_publisher = gripanything.tool_to_camera_tf_publisher:main',
-            'goto_point_from_object_json = gripanything.core.goto_point_from_object_json:main',
-            'publish_object_points_tf = gripanything.core.publish_object_points_tf:main',
+            'seeanything_debug = gripanything.seeanything_debug:main',
+            'tool_to_camera_tf_publisher = gripanything.utils.tool_to_camera_tf_publisher:main',
+            'goto_point_from_object_json = gripanything.utils.goto_point_from_object_json:main',
+            'publish_object_points_tf = gripanything.utils.publish_object_points_tf:main',
         ],
     },
 )
