@@ -47,7 +47,7 @@ DEFAULT_VGGT_CAMERAS_JSON = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanythi
 DEFAULT_ROBOT_SHOTS_JSON = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/image_jointstates.json"
 
 # Output
-DEFAULT_OUT_DIR = "postprocess_output"
+DEFAULT_OUT_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/postprocess_output"
 DEFAULT_VISUALIZE = True
 DEFAULT_EXPORT_OBJECT_JSON = True
 DEFAULT_OBJECT_JSON_NAME = "object_in_base_link.json"
