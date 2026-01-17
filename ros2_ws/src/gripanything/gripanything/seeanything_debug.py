@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-seeanything.py — Two-pass detection + circular path + snapshots + VGGT + postprocess
+seeanything.py — Two-pass detection + circular path + snapshots + VGGT + postprocess + final goto
 
 Pipeline
 1) Move to INIT pose -> wait until stationary
@@ -17,15 +17,10 @@ Pipeline
    - Run VGGT reconstruction from captured images
    - Post-process + align to base_link
    - Export object center + 8 OBB corners in base_link
-
-JSON log (ur5camerajointstates.json)
-{
-  "note": "Per-image joint positions and camera pose at capture time.",
-  "prompt": "<text prompt>",
-  "created_at": "<ISO time>",
-  "joint_names": [ ... ],
-  "shots": { "image_1": { "position": [...], "camera_pose": {...} }, ... }
-}
+   - Apply an additional OFFLINE bias to exported coordinates (center + corners)
+9) Final goto:
+   - After object center is available, move to (offset above) object center (tool-Z-down)
+   - Wait until stationary, then exit
 """
 
 from typing import Optional, List, Dict, Any
@@ -49,14 +44,16 @@ from cv_bridge import CvBridge
 
 import tf2_ros
 
+
 # -----------------------------------------------------------------------------
 # Output paths (fixed)
 # -----------------------------------------------------------------------------
 OUTPUT_ROOT = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output"
 OUTPUT_IMG_DIR = os.path.join(OUTPUT_ROOT, "ur5image")
 OUTPUT_JSON_PATH = os.path.join(OUTPUT_ROOT, "ur5camerajointstates.json")
-OUTPUT_VGGT_DIR = os.path.join(OUTPUT_ROOT, "vggt_output")
+OUTPUT_VGGT_DIR = os.path.join(OUTPUT_ROOT, "offline_output")
 OUTPUT_OBJECT_JSON_NAME = "object_in_base_link.json"
+
 
 # -----------------------------------------------------------------------------
 # Offline pipeline toggles (recommended defaults for ROS)
@@ -75,18 +72,28 @@ VGGT_CONF_THRESH = 1.5
 POST_ALIGN_METHOD = "sim3"
 
 # IMPORTANT: Our VGGT cameras.json stores "cam_T_world" (cam <- world).
-# The postprocess loader expects world_T_cam, so we set vggt_pose_is_world_T_cam=False to invert it.
-POST_VGGT_POSE_IS_WORLD_T_CAM = False
+# The postprocess loader expects world_T_cam, so we set vggt_pose_is_world_T_cam accordingly.
+POST_VGGT_POSE_IS_WORLD_T_CAM = True
 
 
 # -----------------------------------------------------------------------------
-# DINO wrapper
+# Final goto (after offline pipeline)
+# -----------------------------------------------------------------------------
+FINAL_GOTO_ENABLE = True
+FINAL_GOTO_Z_OFFSET = 0.15          # meters above object center
+FINAL_GOTO_MOVE_TIME = 3.0          # seconds
+FINAL_GOTO_Z_MIN = 0.05             # safety clamp
+FINAL_GOTO_Z_MAX = 2.00             # safety clamp
+
+
+# -----------------------------------------------------------------------------
+# DINO wrapper (robust import)
 # -----------------------------------------------------------------------------
 try:
     from gripanything.core.detect_with_dino import GroundingDinoPredictor
 except Exception:
     import sys
-    sys.path.append('/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything')
+    sys.path.append("/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything")
     from gripanything.core.detect_with_dino import GroundingDinoPredictor
 
 from gripanything.core.config import load_from_ros_params
@@ -100,7 +107,6 @@ from gripanything.core.tf_ops import tfmsg_to_Rp, R_CL_CO, quat_to_rot
 
 # -----------------------------------------------------------------------------
 # Offline pipeline imports (VGGT + point cloud postprocess)
-# NOTE: Put these two scripts under gripanything/core/ so they can be imported.
 # -----------------------------------------------------------------------------
 def _import_offline_modules():
     """
@@ -108,8 +114,7 @@ def _import_offline_modules():
 
     Expected:
       - gripanything.core.vggtreconstruction provides: VGGTConfig, VGGTReconstructor
-      - gripanything.core.pc_postprocess_and_align provides: Config, process_pointcloud
-        (You need to place pc_postprocess_and_align.py under gripanything/core/)
+      - gripanything.core.point_processing provides: Config, process_pointcloud
     """
     try:
         from gripanything.core.vggtreconstruction import VGGTConfig as _VGGTConfig, VGGTReconstructor as _VGGTReconstructor
@@ -128,9 +133,50 @@ def _import_offline_modules():
     return _VGGTConfig, _VGGTReconstructor, _PostConfig, _process_pointcloud
 
 
+def _safe_remove(path: str) -> None:
+    """Remove a file if it exists; do nothing on failure."""
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _cleanup_outputs_for_new_run() -> None:
+    """
+    Ensure that a new run overwrites outputs cleanly:
+    - Remove old pose_* images so leftover frames do not contaminate the next run
+    - Remove old JSON log
+    - Remove old VGGT outputs that we generate (points/cameras/lines/object json)
+    """
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    os.makedirs(OUTPUT_IMG_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_VGGT_DIR, exist_ok=True)
+
+    # Images from previous run
+    try:
+        for fn in os.listdir(OUTPUT_IMG_DIR):
+            if fn.startswith("pose_") and ("_image." in fn or fn.endswith(".png") or fn.endswith(".jpg")):
+                _safe_remove(os.path.join(OUTPUT_IMG_DIR, fn))
+    except Exception:
+        pass
+
+    # Main shot log
+    _safe_remove(OUTPUT_JSON_PATH)
+
+    # VGGT outputs
+    _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "points.ply"))
+    _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "cameras.json"))
+    _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "cameras_lines.ply"))
+    _safe_remove(os.path.join(OUTPUT_VGGT_DIR, OUTPUT_OBJECT_JSON_NAME))
+
+
 class SeeAnythingNode(Node):
     def __init__(self):
-        super().__init__('seeanything_minimal_clean')
+        super().__init__("seeanything_minimal_clean")
+
+        # Always clean outputs at node startup to guarantee overwriting behavior.
+        _cleanup_outputs_for_new_run()
 
         # Load config (with some ROS param overrides)
         self.cfg = load_from_ros_params(self)
@@ -144,23 +190,18 @@ class SeeAnythingNode(Node):
             user_prompt = input("Enter the target text prompt (e.g., 'orange object'): ").strip()
             if user_prompt:
                 self.cfg.dino.text_prompt = user_prompt
-                self.set_parameters([Parameter('text_prompt', value=user_prompt)])
-                self.get_logger().info(f"Using user prompt: \"{user_prompt}\"")
+                self.set_parameters([Parameter("text_prompt", value=user_prompt)])
+                self.get_logger().info(f'Using user prompt: "{user_prompt}"')
             else:
-                self.get_logger().warn(f"No input given; using default prompt: \"{self.cfg.dino.text_prompt}\"")
+                self.get_logger().warn(f'No input given; using default prompt: "{self.cfg.dino.text_prompt}"')
         else:
-            self.get_logger().info(f"Interactive prompt disabled. Using: \"{self.cfg.dino.text_prompt}\"")
-
-        # Prepare output directories
-        os.makedirs(OUTPUT_ROOT, exist_ok=True)
-        os.makedirs(OUTPUT_IMG_DIR, exist_ok=True)
-        os.makedirs(OUTPUT_VGGT_DIR, exist_ok=True)
+            self.get_logger().info(f'Interactive prompt disabled. Using: "{self.cfg.dino.text_prompt}"')
 
         # Fixed output locations
         self._img_dir = OUTPUT_IMG_DIR
         self._js_path = OUTPUT_JSON_PATH
 
-        # JSON log (single file)
+        # JSON log (single file, always overwrite)
         self._joint_log: Dict[str, Any] = {
             "note": "Per-image joint positions and camera pose at capture time.",
             "prompt": self.cfg.dino.text_prompt,
@@ -210,7 +251,7 @@ class SeeAnythingNode(Node):
         )
 
         # FSM state
-        self._phase = 'init_needed'
+        self._phase = "init_needed"
         self._inflight = False
         self._done = False
 
@@ -236,15 +277,23 @@ class SeeAnythingNode(Node):
         if self.cfg.control.tf_rebroadcast_hz > 0:
             self.create_timer(1.0 / self.cfg.control.tf_rebroadcast_hz, self._rebroadcast_tfs)
 
+        # Final goto state
+        self._final_point_base: Optional[np.ndarray] = None   # (x,y,z) in base_link
+        self._final_pose: Optional[PoseStamped] = None
+        self._final_goto_requested = False
+
         # Main loop
         self.create_timer(0.05, self._tick)
 
         self._frame_count = 0
+
+        ob = self.cfg.offline_bias
         self.get_logger().info(
             f"[seeanything] topic={self.cfg.frames.image_topic}, hover={self.cfg.control.hover_above:.3f}m, "
-            f"bias=({self.cfg.bias.bx:.3f},{self.cfg.bias.by:.3f},{self.cfg.bias.bz:.3f}); "
+            f"online_bias=({self.cfg.bias.bx:.3f},{self.cfg.bias.by:.3f},{self.cfg.bias.bz:.3f}); "
+            f"offline_bias(enable={ob.enable}, ox={ob.ox:.3f}, oy={ob.oy:.3f}, oz={ob.oz:.3f}); "
             f"N={self.cfg.circle.n_vertices}, R={self.cfg.circle.radius:.3f}m, orient={self.cfg.circle.orient_mode}, "
-            f"dir={self.cfg.circle.poly_dir}, sweep={self._sweep_deg:.1f}°; "
+            f"dir={self.cfg.circle.poly_dir}, sweep={self._sweep_deg:.1f}deg; "
             f"out_img_dir={self._img_dir}, out_json={self._js_path}; "
             f"vggt_out_dir={OUTPUT_VGGT_DIR}"
         )
@@ -313,7 +362,7 @@ class SeeAnythingNode(Node):
         qx, qy, qz, qw = self.cfg.cam.t_tool_cam_quat_xyzw
         R_t_cam = quat_to_rot(qx, qy, qz, qw)
 
-        if str(self.cfg.cam.hand_eye_frame).lower() == 'optical':
+        if str(self.cfg.cam.hand_eye_frame).lower() == "optical":
             R_t_co = R_t_cam
         else:
             # convert camera_link to camera_optical
@@ -336,6 +385,72 @@ class SeeAnythingNode(Node):
             "t": [float(p_bc[0]), float(p_bc[1]), float(p_bc[2])]
         }
 
+    def _apply_offline_bias_to_object_json(self, obj_json_path: str, offset_xyz: np.ndarray) -> bool:
+        """
+        Apply an additive offset (in base_link) to the exported object JSON.
+        This modifies:
+          - object.center.base_link
+          - object.obb.corners_8.base_link  (if present)
+        The file is overwritten in-place.
+
+        Returns True if the file was modified and saved.
+        """
+        try:
+            if not obj_json_path or (not os.path.isfile(obj_json_path)):
+                return False
+
+            with open(obj_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            obj = data.get("object", {})
+            if not isinstance(obj, dict):
+                return False
+
+            ox, oy, oz = float(offset_xyz[0]), float(offset_xyz[1]), float(offset_xyz[2])
+            changed = False
+
+            # Center
+            c = obj.get("center", None)
+            if isinstance(c, dict) and isinstance(c.get("base_link", None), (list, tuple)) and len(c["base_link"]) == 3:
+                p = c["base_link"]
+                c["base_link"] = [float(p[0]) + ox, float(p[1]) + oy, float(p[2]) + oz]
+                changed = True
+            elif isinstance(obj.get("center_base", None), (list, tuple)) and len(obj["center_base"]) == 3:
+                p = obj["center_base"]
+                obj["center_base"] = [float(p[0]) + ox, float(p[1]) + oy, float(p[2]) + oz]
+                changed = True
+
+            # OBB corners (8)
+            corners = None
+            obb = obj.get("obb", None)
+            if isinstance(obb, dict):
+                c8 = obb.get("corners_8", None)
+                if isinstance(c8, dict):
+                    corners = c8.get("base_link", None)
+
+            if isinstance(corners, list) and len(corners) == 8:
+                new_corners = []
+                ok = True
+                for p in corners:
+                    if not isinstance(p, (list, tuple)) or len(p) != 3:
+                        ok = False
+                        break
+                    new_corners.append([float(p[0]) + ox, float(p[1]) + oy, float(p[2]) + oz])
+                if ok:
+                    obb["corners_8"]["base_link"] = new_corners
+                    changed = True
+
+            if not changed:
+                return False
+
+            with open(obj_json_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            return True
+        except Exception as ex:
+            self.get_logger().warn(f"[offline] Failed to apply offline bias to object JSON: {ex}")
+            return False
+
     # ---------- image callback: two-pass detection triggers ----------
     def _on_image(self, msg: Image):
         # Update rolling buffer + stamp
@@ -347,7 +462,7 @@ class SeeAnythingNode(Node):
 
         if self._done or self._inflight:
             return
-        if self._phase not in ('wait_detect_stage1', 'wait_detect_stage2'):
+        if self._phase not in ("wait_detect_stage1", "wait_detect_stage2"):
             return
         if not self.motion.is_stationary():
             return
@@ -368,7 +483,7 @@ class SeeAnythingNode(Node):
         self.tf_brd.sendTransform(tf_circle)
         self._last_circle_tf = tf_circle
 
-        if self._phase == 'wait_detect_stage1':
+        if self._phase == "wait_detect_stage1":
             # Stage-1: change XY to C, keep current Z (tool-Z-down)
             z_keep = self._get_tool_z_now()
             if z_keep is None:
@@ -388,14 +503,14 @@ class SeeAnythingNode(Node):
             self._pose_stage1 = ps
             self.get_logger().info(f"[Stage-1] Move XY->({C[0]:.3f},{C[1]:.3f}), keep Z={z_keep:.3f}")
 
-        elif self._phase == 'wait_detect_stage2':
+        elif self._phase == "wait_detect_stage2":
             # Stage-2: hover over C (XY = C, Z = C.z + hover_above)
             self._fixed_hover = hover
             self._circle_center = C.copy()
             self._ring_z = float(hover.pose.position.z)  # equals C.z + hover_above
             self.get_logger().info(f"[Stage-2] Move XY->({C[0]:.3f},{C[1]:.3f}), Z->{self._ring_z:.3f}")
 
-    # ---------- helper: write the joint log to disk ----------
+    # ---------- helper: write the joint log to disk (always overwrite) ----------
     def _flush_joint_log(self):
         try:
             with open(self._js_path, "w", encoding="utf-8") as f:
@@ -403,7 +518,7 @@ class SeeAnythingNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to write joint log JSON: {e}")
 
-    # ---------- Save snapshot ----------
+    # ---------- Save snapshot (cv2.imwrite overwrites by default) ----------
     def _save_snapshot(self, vertex_index_zero_based: int):
         idx1 = int(vertex_index_zero_based) + 1  # 1-based numbering for filenames
         if self._latest_bgr is None:
@@ -420,7 +535,7 @@ class SeeAnythingNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to save snapshot to {fpath}: {e}")
 
-    # ---------- Save joint positions (+ camera pose) into ONE JSON ----------
+    # ---------- Save joint positions (+ camera pose) into ONE JSON (always overwrite file) ----------
     def _save_joint_positions_and_cam(self, vertex_index_zero_based: int):
         idx1 = int(vertex_index_zero_based) + 1
         key = f"image_{idx1}"
@@ -457,6 +572,51 @@ class SeeAnythingNode(Node):
             self.get_logger().warn(f"Read tool yaw failed: {ex}")
             return None
 
+    # ---------- Parse object center from exported JSON ----------
+    def _read_center_from_object_json(self, obj_json_path: str) -> Optional[np.ndarray]:
+        try:
+            if not obj_json_path or (not os.path.isfile(obj_json_path)):
+                return None
+            with open(obj_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            obj = data.get("object", {})
+
+            # Preferred format: object.center.base_link
+            p = None
+            if isinstance(obj, dict):
+                c = obj.get("center", {})
+                if isinstance(c, dict):
+                    p = c.get("base_link", None)
+
+            # Backward compatibility
+            if p is None:
+                p = obj.get("center_base", None)
+
+            if p is None or len(p) != 3:
+                return None
+            return np.asarray([float(p[0]), float(p[1]), float(p[2])], dtype=float).reshape(3)
+        except Exception:
+            return None
+
+    # ---------- Build final hover pose (offset above object center) ----------
+    def _build_final_hover_pose(self, center_b: np.ndarray) -> PoseStamped:
+        x, y, z = float(center_b[0]), float(center_b[1]), float(center_b[2])
+        z_hover = z + float(FINAL_GOTO_Z_OFFSET)
+        z_hover = max(float(FINAL_GOTO_Z_MIN), min(float(FINAL_GOTO_Z_MAX), z_hover))
+
+        ps = PoseStamped()
+        ps.header.frame_id = self.cfg.frames.pose_frame
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = x
+        ps.pose.position.y = y
+        ps.pose.position.z = z_hover
+        # tool-Z-down quaternion
+        ps.pose.orientation.w = 0.0
+        ps.pose.orientation.x = 1.0
+        ps.pose.orientation.y = 0.0
+        ps.pose.orientation.z = 0.0
+        return ps
+
     # ---------- Offline pipeline: VGGT + postprocess ----------
     def _run_offline_pipeline_once(self):
         if not RUN_OFFLINE_PIPELINE:
@@ -467,8 +627,14 @@ class SeeAnythingNode(Node):
 
         self._offline_ran = True
 
-        # Block all image-triggered actions while running offline pipeline
+        # Block control while running offline pipeline
         self._inflight = True
+
+        # Ensure old outputs are removed (explicit overwrite behavior)
+        _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "points.ply"))
+        _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "cameras.json"))
+        _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "cameras_lines.ply"))
+        _safe_remove(os.path.join(OUTPUT_VGGT_DIR, OUTPUT_OBJECT_JSON_NAME))
 
         try:
             VGGTConfig, VGGTReconstructor, PostConfig, process_pointcloud = _import_offline_modules()
@@ -492,7 +658,16 @@ class SeeAnythingNode(Node):
                 seed=42,
             )
             recon = VGGTReconstructor(vcfg)
-            with torch.inference_mode():  # type: ignore[name-defined]
+
+            # Lazy import to avoid ROS startup issues and to fix "torch not defined"
+            try:
+                import torch
+            except Exception as e:
+                self.get_logger().error(f"[offline] torch import failed: {e}")
+                self._inflight = False
+                return
+
+            with torch.inference_mode():
                 vout = recon.run()
 
             points_ply = vout.get("points_ply", os.path.join(OUTPUT_VGGT_DIR, "points.ply"))
@@ -504,6 +679,7 @@ class SeeAnythingNode(Node):
             return
 
         # 2) Post-process + align to base_link
+        obj_json = os.path.join(OUTPUT_VGGT_DIR, OUTPUT_OBJECT_JSON_NAME)
         try:
             self.get_logger().info("[offline] Running point cloud postprocess + alignment to base_link...")
             pcfg = PostConfig(
@@ -518,15 +694,48 @@ class SeeAnythingNode(Node):
                 vggt_pose_is_world_T_cam=POST_VGGT_POSE_IS_WORLD_T_CAM,
             )
             pres = process_pointcloud(pcfg)
-            obj_json = pres.get("outputs", {}).get("object_json", os.path.join(OUTPUT_VGGT_DIR, OUTPUT_OBJECT_JSON_NAME))
+
+            obj_json = pres.get("outputs", {}).get("object_json", obj_json)
             center_b = pres.get("center_b", None)
 
+            # Parse center
+            center_np: Optional[np.ndarray] = None
             if center_b is not None:
                 try:
-                    cb = np.asarray(center_b, dtype=float).reshape(3)
-                    self.get_logger().info(f"[offline] Object center in base_link: ({cb[0]:.4f}, {cb[1]:.4f}, {cb[2]:.4f})")
+                    center_np = np.asarray(center_b, dtype=float).reshape(3)
                 except Exception:
-                    pass
+                    center_np = None
+            if center_np is None:
+                center_np = self._read_center_from_object_json(obj_json)
+
+            # Apply OFFLINE bias to exported coordinates (center + corners)
+            if bool(getattr(self.cfg, "offline_bias", None) and self.cfg.offline_bias.enable):
+                ob = self.cfg.offline_bias
+                offset = np.asarray([float(ob.ox), float(ob.oy), float(ob.oz)], dtype=float).reshape(3)
+
+                # Write back into object JSON to keep downstream tools consistent
+                changed = self._apply_offline_bias_to_object_json(obj_json, offset)
+                if changed:
+                    self.get_logger().info(
+                        f"[offline] Applied offline_bias to object JSON: "
+                        f"({offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f})"
+                    )
+                else:
+                    self.get_logger().warn("[offline] Offline bias enabled, but object JSON was not modified (schema not matched).")
+
+                # Re-read center from JSON to guarantee consistency
+                center_np = self._read_center_from_object_json(obj_json)
+
+            # Cache final point for the "final goto" step
+            self._final_point_base = center_np
+
+            if center_np is not None:
+                self.get_logger().info(
+                    f"[offline] Object center in base_link (after offline bias if enabled): "
+                    f"({center_np[0]:.4f}, {center_np[1]:.4f}, {center_np[2]:.4f})"
+                )
+            else:
+                self.get_logger().warn("[offline] Object center not found (parse failed).")
 
             self.get_logger().info(f"[offline] Postprocess done. Exported: {obj_json}")
         except Exception as e:
@@ -534,30 +743,71 @@ class SeeAnythingNode(Node):
         finally:
             self._inflight = False
 
+    # ---------- Final goto: request IK and move to hover above object ----------
+    def _request_final_goto(self):
+        if not FINAL_GOTO_ENABLE:
+            return
+        if self._final_goto_requested:
+            return
+        if self._final_point_base is None:
+            self.get_logger().warn("[final] No object center available; skipping final goto.")
+            self._final_goto_requested = True
+            return
+        if not self.ik.ready():
+            return
+
+        self._final_pose = self._build_final_hover_pose(self._final_point_base)
+        seed = self.motion.make_seed()
+        if seed is None:
+            self.get_logger().warn("[final] Waiting for /joint_states seed...")
+            return
+
+        self._final_goto_requested = True
+        self._inflight = True
+        self.get_logger().info(
+            f"[final] Request IK for hover above object: "
+            f"({self._final_pose.pose.position.x:.3f}, "
+            f"{self._final_pose.pose.position.y:.3f}, "
+            f"{self._final_pose.pose.position.z:.3f})"
+        )
+        self.ik.request_async(self._final_pose, seed, self._on_final_ik)
+
+    def _on_final_ik(self, joint_positions: Optional[List[float]]):
+        self._inflight = False
+        if joint_positions is None:
+            self.get_logger().warn("[final] IK failed/skipped for final goto. Exiting.")
+            self._phase = "shutdown"
+            return
+
+        self.traj.publish_positions(joint_positions, float(FINAL_GOTO_MOVE_TIME))
+        self.motion.set_seed_hint(joint_positions)
+        self.motion.set_motion_due(float(FINAL_GOTO_MOVE_TIME), 0.3)
+        self._phase = "final_moving"
+
     # ---------- FSM ----------
     def _tick(self):
         if self._done:
             return
 
-        # Prevent control FSM from running while IK is inflight
+        # Prevent control FSM from running while IK/offline is inflight
         if self._inflight and self._phase not in ("offline_pipeline",):
             return
 
-        if self._phase == 'init_needed':
+        if self._phase == "init_needed":
             self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
             self.motion.set_seed_hint(self.cfg.control.init_pos)
             self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)
-            self._phase = 'init_moving'
+            self._phase = "init_moving"
             return
 
-        if self._phase == 'init_moving':
+        if self._phase == "init_moving":
             if self.motion.is_stationary():
-                self._phase = 'wait_detect_stage1'
+                self._phase = "wait_detect_stage1"
                 self.get_logger().info("INIT reached. Waiting for Stage-1 detection (XY only)...")
             return
 
         # Stage-1 move (XY only, keep Z)
-        if self._phase == 'wait_detect_stage1' and self._pose_stage1 is not None:
+        if self._phase == "wait_detect_stage1" and self._pose_stage1 is not None:
             if not self.ik.ready():
                 return
             seed = self.motion.make_seed()
@@ -568,15 +818,15 @@ class SeeAnythingNode(Node):
             self.ik.request_async(self._pose_stage1, seed, self._on_ik_stage1)
             return
 
-        if self._phase == 'stage1_moving':
+        if self._phase == "stage1_moving":
             if self.motion.is_stationary():
                 self._pose_stage1 = None
-                self._phase = 'wait_detect_stage2'
+                self._phase = "wait_detect_stage2"
                 self.get_logger().info("Stage-1 done. Waiting for Stage-2 detection (XY + descend)...")
             return
 
         # Stage-2 move (hover over center)
-        if self._phase == 'wait_detect_stage2' and self._fixed_hover is not None:
+        if self._phase == "wait_detect_stage2" and self._fixed_hover is not None:
             if not self.ik.ready():
                 return
             seed = self.motion.make_seed()
@@ -587,14 +837,14 @@ class SeeAnythingNode(Node):
             self.ik.request_async(self._fixed_hover, seed, self._on_hover_ik)
             return
 
-        if self._phase == 'hover_to_center':
+        if self._phase == "hover_to_center":
             if not self.motion.is_stationary():
                 return
 
             # At hover; compute start yaw and build polygon vertices
             self._start_yaw = self._get_tool_yaw_xy()
             if self._circle_center is not None and self._ring_z is not None and self._start_yaw is not None:
-                # 1) Generate full vertices (potentially 360° * num_turns)
+                # 1) Generate full vertices (potentially 360deg * num_turns)
                 all_wps = make_polygon_vertices(
                     self.get_clock().now().to_msg,
                     self._circle_center, self._ring_z, self._start_yaw,
@@ -604,30 +854,30 @@ class SeeAnythingNode(Node):
                     self.cfg.circle.radius, self.cfg.circle.tool_z_sign
                 )
 
-                # 2) Trim vertices according to sweep_deg to avoid hitting joint limits at the last vertex
+                # 2) Trim vertices according to sweep_deg to avoid hitting joint limits
                 total_deg = 360.0 * float(self.cfg.circle.num_turns)
-                sweep_deg = max(0.0, min(float(self._sweep_deg), total_deg))  # clamp
+                sweep_deg = max(0.0, min(float(self._sweep_deg), total_deg))
                 if sweep_deg < total_deg and len(all_wps) > 1:
                     keep = max(1, int(math.floor(len(all_wps) * (sweep_deg / total_deg))))
                     keep = min(keep, len(all_wps))
                     self._poly_wps = all_wps[:keep]
                     self.get_logger().info(
                         f"Generated vertices: {len(all_wps)} -> trimmed to {len(self._poly_wps)} "
-                        f"for sweep {sweep_deg:.1f}° / {total_deg:.1f}°."
+                        f"for sweep {sweep_deg:.1f}deg / {total_deg:.1f}deg."
                     )
                 else:
                     self._poly_wps = all_wps
                     self.get_logger().info(f"Generated vertices: {len(self._poly_wps)} (full sweep).")
 
                 self._poly_idx = 0
-                self._phase = 'poly_prepare'
+                self._phase = "poly_prepare"
             else:
-                self._phase = 'return_init'
+                self._phase = "return_init"
             return
 
-        if self._phase == 'poly_prepare':
+        if self._phase == "poly_prepare":
             if not self._poly_wps:
-                self._phase = 'return_init'
+                self._phase = "return_init"
                 return
             if not self.ik.ready():
                 return
@@ -637,18 +887,18 @@ class SeeAnythingNode(Node):
             self._inflight = True
             self.ik.request_async(self._poly_wps[0], seed, self._on_poly_ik)
             self._poly_idx = 1
-            self._phase = 'poly_moving'
+            self._phase = "poly_moving"
             return
 
-        if self._phase == 'poly_moving':
-            # If the last IK was skipped due to abnormal jump, immediately move to the next vertex (no dwell)
+        if self._phase == "poly_moving":
+            # If the last IK was skipped due to abnormal jump, move to the next vertex without dwell
             if self._skip_last_vertex:
                 self._skip_last_vertex = False
                 if self._poly_idx >= len(self._poly_wps):
                     self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
                     self.motion.set_seed_hint(self.cfg.control.init_pos)
                     self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)
-                    self._phase = 'return_init'
+                    self._phase = "return_init"
                     return
                 if not self.ik.ready():
                     return
@@ -667,11 +917,10 @@ class SeeAnythingNode(Node):
             # Dwell at current vertex -> snapshot + (positions + camera pose)
             if self._poly_dwell_due_ns is None:
                 self._poly_dwell_due_ns = now + int(self.cfg.circle.dwell_time * 1e9)
-                curr_vertex0 = max(0, self._poly_idx - 1)  # zero-based
+                curr_vertex0 = max(0, self._poly_idx - 1)
                 self.get_logger().info(f"At vertex {curr_vertex0 + 1}, dwell for capture...")
                 self._save_snapshot(curr_vertex0)
                 self._save_joint_positions_and_cam(curr_vertex0)
-                # If this is the last vertex, return to INIT immediately after dwell ends
                 self._at_last_vertex = (self._poly_idx >= len(self._poly_wps))
                 return
 
@@ -679,20 +928,19 @@ class SeeAnythingNode(Node):
                 return
             self._poly_dwell_due_ns = None
 
-            # If already at the last point and capture is done -> return to INIT
+            # If already at the last point -> return to INIT
             if getattr(self, "_at_last_vertex", False):
                 self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
                 self.motion.set_seed_hint(self.cfg.control.init_pos)
                 self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)
-                self._phase = 'return_init'
+                self._phase = "return_init"
                 return
 
             if self._poly_idx >= len(self._poly_wps):
-                # Safety fallback
                 self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
                 self.motion.set_seed_hint(self.cfg.control.init_pos)
                 self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)
-                self._phase = 'return_init'
+                self._phase = "return_init"
                 return
 
             if not self.ik.ready():
@@ -705,8 +953,8 @@ class SeeAnythingNode(Node):
             self._poly_idx += 1
             return
 
-        # After returning to INIT, run offline pipeline, then shutdown
-        if self._phase == 'return_init':
+        # After returning to INIT, run offline pipeline and then optionally do final goto
+        if self._phase == "return_init":
             if not self.motion.is_stationary():
                 return
 
@@ -714,10 +962,34 @@ class SeeAnythingNode(Node):
                 self._phase = "offline_pipeline"
                 self.get_logger().info("Capture finished and INIT reached. Starting offline pipeline (VGGT + postprocess)...")
                 self._run_offline_pipeline_once()
-                # Fall through to shutdown
-            else:
-                self.get_logger().info("Capture finished and INIT reached. Offline pipeline skipped or already done.")
 
+                if FINAL_GOTO_ENABLE:
+                    self._phase = "final_goto_needed"
+                else:
+                    self._phase = "shutdown"
+                return
+
+            self._phase = "shutdown"
+            return
+
+        if self._phase == "final_goto_needed":
+            if not self.motion.is_stationary():
+                return
+            self._request_final_goto()
+            if self._final_goto_requested and self._inflight:
+                return
+            if self._final_goto_requested and (self._final_point_base is None):
+                self._phase = "shutdown"
+            return
+
+        if self._phase == "final_moving":
+            if not self.motion.is_stationary():
+                return
+            self.get_logger().info("[final] Final hover reached. Exiting.")
+            self._phase = "shutdown"
+            return
+
+        if self._phase == "shutdown":
             self._done = True
             self.get_logger().info("All done. Exiting.")
             rclpy.shutdown()
@@ -727,38 +999,35 @@ class SeeAnythingNode(Node):
     def _on_ik_stage1(self, joint_positions: Optional[List[float]]):
         self._inflight = False
         if joint_positions is None:
-            # Stage-1 failed or abnormal jump: return to INIT & exit
             self.get_logger().warn("Stage-1 IK skipped/failed. Returning to INIT and exiting.")
             self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
             self.motion.set_seed_hint(self.cfg.control.init_pos)
             self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)
-            self._phase = 'return_init'
+            self._phase = "return_init"
             return
 
         self.traj.publish_positions(joint_positions, self.cfg.control.move_time)
         self.motion.set_seed_hint(joint_positions)
         self.motion.set_motion_due(self.cfg.control.move_time, 0.3)
-        self._phase = 'stage1_moving'
+        self._phase = "stage1_moving"
 
     def _on_hover_ik(self, joint_positions: Optional[List[float]]):
         self._inflight = False
         if joint_positions is None:
-            # Hover IK could not be realized — exit gracefully
             self.get_logger().warn("Stage-2 hover IK skipped/failed. Returning to INIT and exiting.")
             self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
             self.motion.set_seed_hint(self.cfg.control.init_pos)
             self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)
-            self._phase = 'return_init'
+            self._phase = "return_init"
             return
 
         self.traj.publish_positions(joint_positions, self.cfg.control.move_time)
         self.motion.set_seed_hint(joint_positions)
         self.motion.set_motion_due(self.cfg.control.move_time, 0.3)
-        self._phase = 'hover_to_center'
+        self._phase = "hover_to_center"
 
     def _on_poly_ik(self, joint_positions: Optional[List[float]]):
         if joint_positions is None:
-            # Skip this vertex and continue with the next one without dwell/snapshot
             self.get_logger().warn("Vertex IK skipped after abnormal jump. Moving to next vertex.")
             self._inflight = False
             self._poly_dwell_due_ns = None
@@ -783,5 +1052,5 @@ def main():
             rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

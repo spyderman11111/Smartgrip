@@ -23,7 +23,7 @@ ros2 control switch_controllers \
   --deactivate joint_trajectory_controller
 
 ros2 run gripanything seeanything
-
+ros2 run gripanything seeanything_debug
 
 
 source /home/sz/Smartgrip/.aria/bin/activate
@@ -44,7 +44,7 @@ python3 -m pip install projectaria_client_sdk --no-cache-dir
 
 ros2 run gripanything publish_object_points_tf \
   --ros-args \
-  -p object_json:=/home/MA_SmartGrip/Smartgrip/ros2_ws/pc_out_simple/object_in_base_link.json \
+  -p object_json:=/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/object_in_base_link.json \
   -p parent_frame:=base_link \
   -p prefix:=obj \
   -p report_tool0:=true \
@@ -52,6 +52,6 @@ ros2 run gripanything publish_object_points_tf \
 
 ros2 run gripanything goto_point_from_object_json \
   --ros-args \
-  -p object_json:=/home/MA_SmartGrip/Smartgrip/ros2_ws/pc_out_simple/object_in_base_link.json \
+  -p object_json:=/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/object_in_base_link.json\
   -p use_point:=center \
-  -p z_offset:=0.70
+  -p z_offset:=0.20

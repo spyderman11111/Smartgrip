@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-seeanything.py — Two-pass detection + circular path + snapshots
+seeanything.py — Two-pass detection + circular path + snapshots + VGGT + postprocess
 
 Pipeline
 1) Move to INIT pose -> wait until stationary
@@ -12,7 +12,11 @@ Pipeline
    - Use sweep_deg (< 360°) to avoid joint limits near the last vertex
 6) Vertex-by-vertex IK; at each dwell: snapshot + save {joint positions + camera pose}
    - If IK indicates an abnormal jump on a vertex: skip that vertex and continue (no dwell)
-7) Done -> return to INIT -> exit
+7) Return to INIT
+8) Offline pipeline:
+   - Run VGGT reconstruction from captured images
+   - Post-process + align to base_link
+   - Export object center + 8 OBB corners in base_link
 
 JSON log (ur5camerajointstates.json)
 {
@@ -45,7 +49,39 @@ from cv_bridge import CvBridge
 
 import tf2_ros
 
+# -----------------------------------------------------------------------------
+# Output paths (fixed)
+# -----------------------------------------------------------------------------
+OUTPUT_ROOT = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output"
+OUTPUT_IMG_DIR = os.path.join(OUTPUT_ROOT, "ur5image")
+OUTPUT_JSON_PATH = os.path.join(OUTPUT_ROOT, "ur5camerajointstates.json")
+OUTPUT_VGGT_DIR = os.path.join(OUTPUT_ROOT, "vggt_output")
+OUTPUT_OBJECT_JSON_NAME = "object_in_base_link.json"
+
+# -----------------------------------------------------------------------------
+# Offline pipeline toggles (recommended defaults for ROS)
+# -----------------------------------------------------------------------------
+RUN_OFFLINE_PIPELINE = True
+VGGT_AUTO_VISUALIZE = False          # Avoid Open3D window blocking the ROS node
+POSTPROCESS_VISUALIZE = False        # Avoid Open3D window blocking the ROS node
+
+# VGGT reconstruction parameters (keep explicit and stable for reproducibility)
+VGGT_BATCH_SIZE = 30
+VGGT_MAX_POINTS = 1_500_000
+VGGT_RESOLUTION = 518
+VGGT_CONF_THRESH = 1.5
+
+# Alignment mode for VGGT-world -> base_link ("sim3" estimates scale; "se3" forces scale=1)
+POST_ALIGN_METHOD = "sim3"
+
+# IMPORTANT: Our VGGT cameras.json stores "cam_T_world" (cam <- world).
+# The postprocess loader expects world_T_cam, so we set vggt_pose_is_world_T_cam=False to invert it.
+POST_VGGT_POSE_IS_WORLD_T_CAM = False
+
+
+# -----------------------------------------------------------------------------
 # DINO wrapper
+# -----------------------------------------------------------------------------
 try:
     from gripanything.core.detect_with_dino import GroundingDinoPredictor
 except Exception:
@@ -58,16 +94,38 @@ from gripanything.core.vision_geom import SingleShotDetector
 from gripanything.core.ik_and_traj import MotionContext, TrajectoryPublisher, IKClient
 from gripanything.core.polygon_path import make_polygon_vertices
 
-# Reuse your TF utilities
+# Reuse TF utilities
 from gripanything.core.tf_ops import tfmsg_to_Rp, R_CL_CO, quat_to_rot
 
 
 # -----------------------------------------------------------------------------
-# Output paths (fixed)
+# Offline pipeline imports (VGGT + point cloud postprocess)
+# NOTE: Put these two scripts under gripanything/core/ so they can be imported.
 # -----------------------------------------------------------------------------
-OUTPUT_ROOT = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output"
-OUTPUT_IMG_DIR = os.path.join(OUTPUT_ROOT, "ur5image")
-OUTPUT_JSON_PATH = os.path.join(OUTPUT_ROOT, "ur5camerajointstates.json")
+def _import_offline_modules():
+    """
+    Imports offline pipeline modules based on the current repository tree.
+
+    Expected:
+      - gripanything.core.vggtreconstruction provides: VGGTConfig, VGGTReconstructor
+      - gripanything.core.pc_postprocess_and_align provides: Config, process_pointcloud
+        (You need to place pc_postprocess_and_align.py under gripanything/core/)
+    """
+    try:
+        from gripanything.core.vggtreconstruction import VGGTConfig as _VGGTConfig, VGGTReconstructor as _VGGTReconstructor
+    except Exception:
+        import sys
+        sys.path.append("/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything")
+        from gripanything.core.vggtreconstruction import VGGTConfig as _VGGTConfig, VGGTReconstructor as _VGGTReconstructor
+
+    try:
+        from gripanything.core.point_processing import Config as _PostConfig, process_pointcloud as _process_pointcloud
+    except Exception:
+        import sys
+        sys.path.append("/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything")
+        from gripanything.core.point_processing import Config as _PostConfig, process_pointcloud as _process_pointcloud
+
+    return _VGGTConfig, _VGGTReconstructor, _PostConfig, _process_pointcloud
 
 
 class SeeAnythingNode(Node):
@@ -96,6 +154,7 @@ class SeeAnythingNode(Node):
         # Prepare output directories
         os.makedirs(OUTPUT_ROOT, exist_ok=True)
         os.makedirs(OUTPUT_IMG_DIR, exist_ok=True)
+        os.makedirs(OUTPUT_VGGT_DIR, exist_ok=True)
 
         # Fixed output locations
         self._img_dir = OUTPUT_IMG_DIR
@@ -155,6 +214,9 @@ class SeeAnythingNode(Node):
         self._inflight = False
         self._done = False
 
+        # Offline pipeline state (avoid running twice)
+        self._offline_ran = False
+
         # Stage-1 / Stage-2 cached poses and detection outputs
         self._pose_stage1: Optional[PoseStamped] = None
         self._fixed_hover: Optional[PoseStamped] = None
@@ -183,7 +245,8 @@ class SeeAnythingNode(Node):
             f"bias=({self.cfg.bias.bx:.3f},{self.cfg.bias.by:.3f},{self.cfg.bias.bz:.3f}); "
             f"N={self.cfg.circle.n_vertices}, R={self.cfg.circle.radius:.3f}m, orient={self.cfg.circle.orient_mode}, "
             f"dir={self.cfg.circle.poly_dir}, sweep={self._sweep_deg:.1f}°; "
-            f"out_img_dir={self._img_dir}, out_json={self._js_path}"
+            f"out_img_dir={self._img_dir}, out_json={self._js_path}; "
+            f"vggt_out_dir={OUTPUT_VGGT_DIR}"
         )
 
     # ---------- TF rebroadcast ----------
@@ -380,9 +443,113 @@ class SeeAnythingNode(Node):
         self._flush_joint_log()
         self.get_logger().info(f'Saved positions & camera pose under key "{key}" -> {self._js_path}')
 
+    # ---------- current tool yaw (XY) ----------
+    def _get_tool_yaw_xy(self) -> Optional[float]:
+        try:
+            T_bt = self.tf_buffer.lookup_transform(
+                self.cfg.frames.base_frame, self.cfg.frames.tool_frame, Time(),
+                timeout=RclDuration(seconds=0.2)
+            )
+            R_bt, _ = tfmsg_to_Rp(T_bt)
+            ex = R_bt[:, 0]
+            return float(math.atan2(float(ex[1]), float(ex[0])))
+        except Exception as ex:
+            self.get_logger().warn(f"Read tool yaw failed: {ex}")
+            return None
+
+    # ---------- Offline pipeline: VGGT + postprocess ----------
+    def _run_offline_pipeline_once(self):
+        if not RUN_OFFLINE_PIPELINE:
+            self.get_logger().info("[offline] RUN_OFFLINE_PIPELINE=False, skipping VGGT + postprocess.")
+            return
+        if self._offline_ran:
+            return
+
+        self._offline_ran = True
+
+        # Block all image-triggered actions while running offline pipeline
+        self._inflight = True
+
+        try:
+            VGGTConfig, VGGTReconstructor, PostConfig, process_pointcloud = _import_offline_modules()
+        except Exception as e:
+            self.get_logger().error(f"[offline] Failed to import offline modules: {e}")
+            self._inflight = False
+            return
+
+        # 1) VGGT reconstruction
+        try:
+            self.get_logger().info("[offline] Running VGGT reconstruction...")
+            vcfg = VGGTConfig(
+                images_dir=self._img_dir,
+                out_dir=OUTPUT_VGGT_DIR,
+                batch_size=VGGT_BATCH_SIZE,
+                max_points=VGGT_MAX_POINTS,
+                resolution=VGGT_RESOLUTION,
+                conf_thresh=VGGT_CONF_THRESH,
+                img_limit=None,
+                auto_visualize=VGGT_AUTO_VISUALIZE,
+                seed=42,
+            )
+            recon = VGGTReconstructor(vcfg)
+            
+            try:
+                import torch
+            except Exception as e:
+                self.get_logger().error(f"[offline] torch import failed: {e}")
+                self._inflight = False
+                return
+
+            with torch.inference_mode():
+                vout = recon.run()
+
+
+            points_ply = vout.get("points_ply", os.path.join(OUTPUT_VGGT_DIR, "points.ply"))
+            cameras_json = vout.get("cameras_json", os.path.join(OUTPUT_VGGT_DIR, "cameras.json"))
+            self.get_logger().info(f"[offline] VGGT done: points_ply={points_ply}, cameras_json={cameras_json}")
+        except Exception as e:
+            self.get_logger().error(f"[offline] VGGT reconstruction failed: {e}")
+            self._inflight = False
+            return
+
+        # 2) Post-process + align to base_link
+        try:
+            self.get_logger().info("[offline] Running point cloud postprocess + alignment to base_link...")
+            pcfg = PostConfig(
+                ply_path=points_ply,
+                vggt_cameras_json=cameras_json,
+                robot_shots_json=self._js_path,
+                out_dir=OUTPUT_VGGT_DIR,
+                visualize=POSTPROCESS_VISUALIZE,
+                export_object_json=True,
+                object_json_name=OUTPUT_OBJECT_JSON_NAME,
+                align_method=POST_ALIGN_METHOD,
+                vggt_pose_is_world_T_cam=POST_VGGT_POSE_IS_WORLD_T_CAM,
+            )
+            pres = process_pointcloud(pcfg)
+            obj_json = pres.get("outputs", {}).get("object_json", os.path.join(OUTPUT_VGGT_DIR, OUTPUT_OBJECT_JSON_NAME))
+            center_b = pres.get("center_b", None)
+
+            if center_b is not None:
+                try:
+                    cb = np.asarray(center_b, dtype=float).reshape(3)
+                    self.get_logger().info(f"[offline] Object center in base_link: ({cb[0]:.4f}, {cb[1]:.4f}, {cb[2]:.4f})")
+                except Exception:
+                    pass
+
+            self.get_logger().info(f"[offline] Postprocess done. Exported: {obj_json}")
+        except Exception as e:
+            self.get_logger().error(f"[offline] Postprocess/alignment failed: {e}")
+        finally:
+            self._inflight = False
+
     # ---------- FSM ----------
     def _tick(self):
-        if self._done or self._inflight:
+        if self._done:
+            return
+
+        # Prevent control FSM from running while IK is inflight
+        if self._inflight and self._phase not in ("offline_pipeline",):
             return
 
         if self._phase == 'init_needed':
@@ -547,27 +714,23 @@ class SeeAnythingNode(Node):
             self._poly_idx += 1
             return
 
+        # After returning to INIT, run offline pipeline, then shutdown
         if self._phase == 'return_init':
             if not self.motion.is_stationary():
                 return
+
+            if RUN_OFFLINE_PIPELINE and not self._offline_ran:
+                self._phase = "offline_pipeline"
+                self.get_logger().info("Capture finished and INIT reached. Starting offline pipeline (VGGT + postprocess)...")
+                self._run_offline_pipeline_once()
+                # Fall through to shutdown
+            else:
+                self.get_logger().info("Capture finished and INIT reached. Offline pipeline skipped or already done.")
+
             self._done = True
-            self.get_logger().info("Circle finished. Returned to INIT. Exiting.")
+            self.get_logger().info("All done. Exiting.")
             rclpy.shutdown()
             return
-
-    # ---------- current tool yaw (XY) ----------
-    def _get_tool_yaw_xy(self) -> Optional[float]:
-        try:
-            T_bt = self.tf_buffer.lookup_transform(
-                self.cfg.frames.base_frame, self.cfg.frames.tool_frame, Time(),
-                timeout=RclDuration(seconds=0.2)
-            )
-            R_bt, _ = tfmsg_to_Rp(T_bt)
-            ex = R_bt[:, 0]
-            return float(math.atan2(float(ex[1]), float(ex[0])))
-        except Exception as ex:
-            self.get_logger().warn(f"Read tool yaw failed: {ex}")
-            return None
 
     # ---------- IK callbacks ----------
     def _on_ik_stage1(self, joint_positions: Optional[List[float]]):

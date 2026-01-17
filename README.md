@@ -307,9 +307,7 @@ Simple motion utility:
 
 ### `utils/vs.py`
 
-Miscellaneous helper / scratch utility:
-
-* Often used for quick tests, visualization, or ad-hoc experiments.
+Scripts for visualizing point cloud files
 
 ---
 
