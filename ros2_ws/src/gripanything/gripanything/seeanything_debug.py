@@ -3,6 +3,12 @@
 """
 seeanything.py — Two-pass detection + circular path + snapshots + VGGT + postprocess + final goto
 
+Key fix (time-binding stability):
+- Atomically bind {image, image_stamp} at capture time
+- Compute TF strictly at that image_stamp (NO fallback-to-latest)
+- Save image + json entry together in ONE atomic "shot" function
+- If TF at stamp is unavailable: skip saving that shot (avoid image<->pose mismatch)
+
 Pipeline
 1) Move to INIT pose -> wait until stationary
 2) Stage-1 detection (coarse): compute C1; build a pose that updates XY to C1 while keeping current tool Z; IK + move
@@ -10,14 +16,14 @@ Pipeline
 4) Stage-2 detection (fine): compute C2; set hover pose (tool-Z-down) with Z = C2.z + hover_above; IK + move
 5) Wait until stationary -> compute start_yaw -> generate an N-vertex polygon/circular path (non-closed)
    - Use sweep_deg (< 360°) to avoid joint limits near the last vertex
-6) Vertex-by-vertex IK; at each dwell: snapshot + save {joint positions + camera pose}
+6) Vertex-by-vertex IK; at each dwell: atomically capture {image + joint positions + camera pose @ image stamp}
    - If IK indicates an abnormal jump on a vertex: skip that vertex and continue (no dwell)
 7) Return to INIT
 8) Offline pipeline:
    - Run VGGT reconstruction from captured images
    - Post-process + align to base_link
-   - Export object center + 8 OBB corners in base_link
-   - Apply an additional OFFLINE bias to exported coordinates (center + corners)
+   - Export object center + shape vertices in base_link (new: prism/vertices, no OBB)
+   - Apply an additional OFFLINE bias to exported coordinates (center + vertices)
 9) Final goto:
    - After object center is available, move to (offset above) object center (tool-Z-down)
    - Wait until stationary, then exit
@@ -27,6 +33,7 @@ from typing import Optional, List, Dict, Any
 import math
 import os
 import json
+import threading
 from datetime import datetime
 
 import numpy as np
@@ -171,6 +178,13 @@ def _cleanup_outputs_for_new_run() -> None:
     _safe_remove(os.path.join(OUTPUT_VGGT_DIR, OUTPUT_OBJECT_JSON_NAME))
 
 
+def _stamp_to_ns(stamp_msg) -> int:
+    try:
+        return int(stamp_msg.sec) * 1_000_000_000 + int(stamp_msg.nanosec)
+    except Exception:
+        return -1
+
+
 class SeeAnythingNode(Node):
     def __init__(self):
         super().__init__("seeanything_minimal_clean")
@@ -211,10 +225,11 @@ class SeeAnythingNode(Node):
         }
         self._flush_joint_log()
 
-        # Rolling camera frame buffer (BGR for cv2.imwrite) + last image stamp
+        # Rolling camera frame buffer (BGR) + last image stamp (atomic via lock)
         self._bridge = CvBridge()
+        self._img_lock = threading.Lock()
         self._latest_bgr: Optional[np.ndarray] = None
-        self._last_img_stamp = None
+        self._latest_img_stamp = None   # msg.header.stamp
 
         # Image subscription (trigger + buffer)
         qos_img = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
@@ -330,31 +345,27 @@ class SeeAnythingNode(Node):
             self.get_logger().warn(f"Read tool Z failed: {ex}")
             return None
 
-    def _calc_camera_pose_for_last_image(self) -> Optional[Dict[str, Any]]:
+    def _calc_camera_pose_at_stamp(self, stamp_msg) -> Optional[Dict[str, Any]]:
         """
-        Compute base->camera_optical pose at the timestamp of the last received image.
+        Compute base->camera_optical pose strictly at the provided image stamp.
+        NO fallback-to-latest. If TF is not available at this stamp, return None.
+
         Uses cfg.cam.{t_tool_cam_xyz, t_tool_cam_quat_xyzw, hand_eye_frame}.
         """
-        if self._last_img_stamp is None:
+        if stamp_msg is None:
             return None
 
-        # 1) TF base<-tool0 at the image timestamp (try exact; fallback to latest on failure)
+        t_query = Time.from_msg(stamp_msg)
+
+        # 1) TF base<-tool0 at the image timestamp (exact)
         try:
-            t_query = Time.from_msg(self._last_img_stamp)
             T_bt = self.tf_buffer.lookup_transform(
                 self.cfg.frames.base_frame, self.cfg.frames.tool_frame, t_query,
                 timeout=RclDuration(seconds=0.3)
             )
         except Exception as ex:
-            self.get_logger().warn(f"TF lookup at image stamp failed ({ex}); using latest.")
-            try:
-                T_bt = self.tf_buffer.lookup_transform(
-                    self.cfg.frames.base_frame, self.cfg.frames.tool_frame, Time(),
-                    timeout=RclDuration(seconds=0.2)
-                )
-            except Exception as ex2:
-                self.get_logger().warn(f"TF latest lookup also failed: {ex2}")
-                return None
+            self.get_logger().warn(f"TF lookup at image stamp failed (no fallback): {ex}")
+            return None
 
         R_bt, p_bt = tfmsg_to_Rp(T_bt)
 
@@ -374,12 +385,15 @@ class SeeAnythingNode(Node):
         R_bc = R_bt @ R_t_co
         p_bc = R_bt @ p_t_co + p_bt
 
+        stamp_ns = _stamp_to_ns(stamp_msg)
+
         return {
             "parent_frame": self.cfg.frames.base_frame,
             "child_frame": "camera_optical",
             "stamp": {
-                "sec": int(self._last_img_stamp.sec) if self._last_img_stamp else None,
-                "nanosec": int(self._last_img_stamp.nanosec) if self._last_img_stamp else None
+                "sec": int(stamp_msg.sec),
+                "nanosec": int(stamp_msg.nanosec),
+                "stamp_ns": int(stamp_ns),
             },
             "R": R_bc.astype(float).round(12).tolist(),
             "t": [float(p_bc[0]), float(p_bc[1]), float(p_bc[2])]
@@ -388,9 +402,13 @@ class SeeAnythingNode(Node):
     def _apply_offline_bias_to_object_json(self, obj_json_path: str, offset_xyz: np.ndarray) -> bool:
         """
         Apply an additive offset (in base_link) to the exported object JSON.
-        This modifies:
+
+        New schema support:
           - object.center.base_link
-          - object.obb.corners_8.base_link  (if present)
+          - object.prism.*.base_link (e.g., vertices_8/corners_8/footprint_corners_4/top_corners_4/bottom_corners_4)
+        Backward compatibility:
+          - object.obb.corners_8.base_link
+
         The file is overwritten in-place.
 
         Returns True if the file was modified and saved.
@@ -407,38 +425,57 @@ class SeeAnythingNode(Node):
                 return False
 
             ox, oy, oz = float(offset_xyz[0]), float(offset_xyz[1]), float(offset_xyz[2])
+
+            def _is_num(x) -> bool:
+                return isinstance(x, (int, float))
+
+            def _is_vec3(p) -> bool:
+                return isinstance(p, (list, tuple)) and len(p) == 3 and all(_is_num(v) for v in p)
+
+            def _is_list_vec3(ps) -> bool:
+                return isinstance(ps, list) and len(ps) > 0 and all(_is_vec3(p) for p in ps)
+
+            def _add3(p):
+                return [float(p[0]) + ox, float(p[1]) + oy, float(p[2]) + oz]
+
             changed = False
 
-            # Center
+            # 1) Center (explicit)
             c = obj.get("center", None)
-            if isinstance(c, dict) and isinstance(c.get("base_link", None), (list, tuple)) and len(c["base_link"]) == 3:
-                p = c["base_link"]
-                c["base_link"] = [float(p[0]) + ox, float(p[1]) + oy, float(p[2]) + oz]
+            if isinstance(c, dict) and _is_vec3(c.get("base_link", None)):
+                c["base_link"] = _add3(c["base_link"])
                 changed = True
-            elif isinstance(obj.get("center_base", None), (list, tuple)) and len(obj["center_base"]) == 3:
-                p = obj["center_base"]
-                obj["center_base"] = [float(p[0]) + ox, float(p[1]) + oy, float(p[2]) + oz]
+            elif _is_vec3(obj.get("center_base", None)):
+                obj["center_base"] = _add3(obj["center_base"])
+                changed = True
+            elif _is_vec3(obj.get("center_base_link", None)):
+                obj["center_base_link"] = _add3(obj["center_base_link"])
                 changed = True
 
-            # OBB corners (8)
-            corners = None
+            # 2) Backward-compatible OBB corners if present
             obb = obj.get("obb", None)
             if isinstance(obb, dict):
                 c8 = obb.get("corners_8", None)
-                if isinstance(c8, dict):
-                    corners = c8.get("base_link", None)
-
-            if isinstance(corners, list) and len(corners) == 8:
-                new_corners = []
-                ok = True
-                for p in corners:
-                    if not isinstance(p, (list, tuple)) or len(p) != 3:
-                        ok = False
-                        break
-                    new_corners.append([float(p[0]) + ox, float(p[1]) + oy, float(p[2]) + oz])
-                if ok:
-                    obb["corners_8"]["base_link"] = new_corners
+                if isinstance(c8, dict) and _is_list_vec3(c8.get("base_link", None)):
+                    c8["base_link"] = [_add3(p) for p in c8["base_link"]]
                     changed = True
+
+            # 3) New prism/shape vertices: apply to any point-list under object subtree with key "base_link"
+            #    but ONLY when it is a list of 3D points (list[list[3]]). This avoids touching extents/scalars.
+            def _walk_apply_points(node):
+                nonlocal changed
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        if k == "base_link" and _is_list_vec3(v):
+                            node[k] = [_add3(p) for p in v]
+                            changed = True
+                        else:
+                            _walk_apply_points(v)
+                elif isinstance(node, list):
+                    for it in node:
+                        _walk_apply_points(it)
+
+            _walk_apply_points(obj)
 
             if not changed:
                 return False
@@ -453,12 +490,15 @@ class SeeAnythingNode(Node):
 
     # ---------- image callback: two-pass detection triggers ----------
     def _on_image(self, msg: Image):
-        # Update rolling buffer + stamp
+        # Update rolling buffer + stamp atomically
         try:
-            self._latest_bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception:
-            pass
-        self._last_img_stamp = msg.header.stamp
+            return
+
+        with self._img_lock:
+            self._latest_bgr = bgr
+            self._latest_img_stamp = msg.header.stamp
 
         if self._done or self._inflight:
             return
@@ -518,45 +558,84 @@ class SeeAnythingNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to write joint log JSON: {e}")
 
-    # ---------- Save snapshot (cv2.imwrite overwrites by default) ----------
-    def _save_snapshot(self, vertex_index_zero_based: int):
-        idx1 = int(vertex_index_zero_based) + 1  # 1-based numbering for filenames
-        if self._latest_bgr is None:
-            self.get_logger().warn("No camera frame available to save.")
-            return
-        fname = f"pose_{idx1}_image.png"
-        fpath = os.path.join(self._img_dir, fname)
-        try:
-            ok = cv2.imwrite(fpath, self._latest_bgr)
-            if ok:
-                self.get_logger().info(f"Saved snapshot: {fpath}")
-            else:
-                self.get_logger().error(f"cv2.imwrite returned False for: {fpath}")
-        except Exception as e:
-            self.get_logger().error(f"Failed to save snapshot to {fpath}: {e}")
+    # ---------- Atomic capture: image + joint positions + camera pose at image stamp ----------
+    def _capture_and_log_shot(self, vertex_index_zero_based: int) -> bool:
+        """
+        Atomically bind:
+          - image file (pose_{k}_image.png)
+          - image stamp
+          - camera_pose computed at that stamp (NO fallback)
+          - joint positions (latest) + joint stamp for debugging
 
-    # ---------- Save joint positions (+ camera pose) into ONE JSON (always overwrite file) ----------
-    def _save_joint_positions_and_cam(self, vertex_index_zero_based: int):
+        If TF at the exact image stamp is not available, skip saving this shot to avoid mismatched pairing.
+        """
         idx1 = int(vertex_index_zero_based) + 1
         key = f"image_{idx1}"
+        fname = f"pose_{idx1}_image.png"
+        fpath = os.path.join(self._img_dir, fname)
 
-        js = self.motion._last_js  # latest joint state on the topic
-        if js is None or not js.position or not js.name:
-            self.get_logger().warn("No /joint_states available to log positions.")
-            return
+        # 1) Freeze (bgr + stamp) atomically
+        with self._img_lock:
+            if self._latest_bgr is None or self._latest_img_stamp is None:
+                self.get_logger().warn("No camera frame/stamp available to capture.")
+                return False
+            bgr = self._latest_bgr.copy()
+            stamp_msg = self._latest_img_stamp
 
-        # Fill joint_names once
+        # 2) Compute camera pose at THIS image stamp (no fallback)
+        cam_pose = self._calc_camera_pose_at_stamp(stamp_msg)
+        if cam_pose is None:
+            self.get_logger().warn(f"[capture] Skip idx={idx1}: TF not available at this image stamp (no fallback).")
+            return False
+
+        # 3) Get joint state (latest). We log joint_stamp_ns for post-mortem checking.
+        js = self.motion._last_js
+        if js is None or (not js.position) or (not js.name):
+            self.get_logger().warn("[capture] No /joint_states available; skip shot.")
+            return False
+
         if not self._joint_log["joint_names"]:
             self._joint_log["joint_names"] = list(js.name)
 
+        joint_stamp_ns = -1
+        try:
+            joint_stamp_ns = _stamp_to_ns(js.header.stamp)
+        except Exception:
+            joint_stamp_ns = -1
+
+        # 4) Save image first (VGGT needs it), then write JSON entry.
+        try:
+            ok = cv2.imwrite(fpath, bgr)
+            if not ok:
+                self.get_logger().error(f"[capture] cv2.imwrite returned False for: {fpath}")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"[capture] Failed to save snapshot to {fpath}: {e}")
+            return False
+
         entry = {
+            "image_file": fname,
+            "image_stamp_ns": int(cam_pose["stamp"].get("stamp_ns", -1)),
+            "joint_stamp_ns": int(joint_stamp_ns),
             "position": [float(x) for x in js.position],
-            "camera_pose": self._calc_camera_pose_for_last_image()
+            "camera_pose": cam_pose,
         }
 
         self._joint_log["shots"][key] = entry
         self._flush_joint_log()
-        self.get_logger().info(f'Saved positions & camera pose under key "{key}" -> {self._js_path}')
+        self.get_logger().info(
+            f"[capture] Saved idx={idx1}: {fpath} | img_stamp_ns={entry['image_stamp_ns']} | joint_stamp_ns={entry['joint_stamp_ns']}"
+        )
+        return True
+
+    # ---------- Backward-compatible wrappers (keep your call sites intact) ----------
+    def _save_snapshot(self, vertex_index_zero_based: int):
+        # Capture atomically instead of saving image only
+        self._capture_and_log_shot(vertex_index_zero_based)
+
+    def _save_joint_positions_and_cam(self, vertex_index_zero_based: int):
+        # No-op: captured together with _save_snapshot() for atomic binding
+        return
 
     # ---------- current tool yaw (XY) ----------
     def _get_tool_yaw_xy(self) -> Optional[float]:
@@ -581,18 +660,23 @@ class SeeAnythingNode(Node):
                 data = json.load(f)
             obj = data.get("object", {})
 
-            # Preferred format: object.center.base_link
             p = None
+
+            # Preferred format: object.center.base_link
             if isinstance(obj, dict):
                 c = obj.get("center", {})
                 if isinstance(c, dict):
                     p = c.get("base_link", None)
 
-            # Backward compatibility
-            if p is None:
+            # Backward/alternate formats
+            if p is None and isinstance(obj, dict):
                 p = obj.get("center_base", None)
+            if p is None and isinstance(obj, dict):
+                p = obj.get("center_base_link", None)
+            if p is None and isinstance(obj, dict):
+                p = obj.get("center_b", None)
 
-            if p is None or len(p) != 3:
+            if p is None or (not isinstance(p, (list, tuple))) or len(p) != 3:
                 return None
             return np.asarray([float(p[0]), float(p[1]), float(p[2])], dtype=float).reshape(3)
         except Exception:
@@ -708,7 +792,7 @@ class SeeAnythingNode(Node):
             if center_np is None:
                 center_np = self._read_center_from_object_json(obj_json)
 
-            # Apply OFFLINE bias to exported coordinates (center + corners)
+            # Apply OFFLINE bias to exported coordinates (center + vertices)
             if bool(getattr(self.cfg, "offline_bias", None) and self.cfg.offline_bias.enable):
                 ob = self.cfg.offline_bias
                 offset = np.asarray([float(ob.ox), float(ob.oy), float(ob.oz)], dtype=float).reshape(3)
@@ -914,13 +998,15 @@ class SeeAnythingNode(Node):
             if not self.motion.is_stationary():
                 return
 
-            # Dwell at current vertex -> snapshot + (positions + camera pose)
+            # Dwell at current vertex -> atomic capture
             if self._poly_dwell_due_ns is None:
                 self._poly_dwell_due_ns = now + int(self.cfg.circle.dwell_time * 1e9)
                 curr_vertex0 = max(0, self._poly_idx - 1)
                 self.get_logger().info(f"At vertex {curr_vertex0 + 1}, dwell for capture...")
-                self._save_snapshot(curr_vertex0)
-                self._save_joint_positions_and_cam(curr_vertex0)
+
+                # Atomic capture (image + pose at exact image stamp). No fallback.
+                self._capture_and_log_shot(curr_vertex0)
+
                 self._at_last_vertex = (self._poly_idx >= len(self._poly_wps))
                 return
 
