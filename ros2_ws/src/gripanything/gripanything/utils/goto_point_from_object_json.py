@@ -14,6 +14,13 @@ Primary use cases:
    from gripanything.utils.goto_point_from_object_json import GotoPointConfig, GotoPointRunner
    runner = GotoPointRunner(node, GotoPointConfig(object_json="/path/to/object_in_base_link.json", z_offset=0.20))
    runner.start()  # async; publishes a trajectory once IK returns
+
+Update (new postprocess schema):
+- Supports corners from both:
+    object.prism.corners_8.base_link   (new method)
+    object.obb.corners_8.base_link     (legacy OBB)
+- Adds optional points:
+    use_point="top_center" / "bottom_center" computed from corners by z-sort (top4 / bottom4).
 """
 
 import os
@@ -57,18 +64,94 @@ def duration_from_sec(sec: float) -> Duration:
     return Duration(sec=sec_i, nanosec=nsec)
 
 
+# ------------------------- JSON loader helpers -------------------------
+def _as_xyz_list(p) -> List[float]:
+    if not isinstance(p, (list, tuple)) or len(p) != 3:
+        raise RuntimeError(f"Point must be a length-3 list/tuple, got: {type(p)} {p}")
+    return [float(p[0]), float(p[1]), float(p[2])]
+
+
+def _load_corners8_base(obj: Dict) -> Optional[List[List[float]]]:
+    """
+    Return corners_8 in base_link if available.
+    Priority: prism -> obb -> corners_base (legacy flat key).
+    """
+    corners = None
+
+    # New schema: object.prism.corners_8.base_link
+    prism = obj.get("prism", None)
+    if isinstance(prism, dict):
+        c8 = prism.get("corners_8", None)
+        if isinstance(c8, dict):
+            corners = c8.get("base_link", None)
+
+    # Legacy schema: object.obb.corners_8.base_link
+    if corners is None:
+        obb = obj.get("obb", None)
+        if isinstance(obb, dict):
+            c8 = obb.get("corners_8", None)
+            if isinstance(c8, dict):
+                corners = c8.get("base_link", None)
+
+    # Very old legacy: object.corners_base
+    if corners is None:
+        corners = obj.get("corners_base", None)
+
+    if corners is None:
+        return None
+    if not isinstance(corners, list) or len(corners) != 8:
+        return None
+
+    out = []
+    for p in corners:
+        out.append(_as_xyz_list(p))
+    return out
+
+
+def _top_bottom_center_from_corners(corners8: List[List[float]], which: str) -> List[float]:
+    """
+    Robustly compute top/bottom center from 8 corners using z-sorting:
+      - top_center: mean of 4 corners with largest z
+      - bottom_center: mean of 4 corners with smallest z
+    This works for both prism corners (ordered) and legacy OBB corners (unordered).
+    """
+    if corners8 is None or len(corners8) != 8:
+        raise RuntimeError("corners8 must be a list of 8 points")
+
+    pts = [(float(p[0]), float(p[1]), float(p[2])) for p in corners8]
+    pts_sorted = sorted(pts, key=lambda t: t[2])  # ascending z
+
+    if which == "bottom":
+        sel = pts_sorted[:4]
+    elif which == "top":
+        sel = pts_sorted[-4:]
+    else:
+        raise RuntimeError(f"Unknown which={which}")
+
+    cx = sum(p[0] for p in sel) / 4.0
+    cy = sum(p[1] for p in sel) / 4.0
+    cz = sum(p[2] for p in sel) / 4.0
+    return [float(cx), float(cy), float(cz)]
+
+
 # ------------------------- JSON loader -------------------------
 def read_target_point_from_object_json(
     object_json_path: str,
-    use_point: str = "center",      # "center" or "corner"
+    use_point: str = "center",      # "center" | "corner" | "top_center" | "bottom_center"
     corner_index: int = 0,
 ) -> List[float]:
     """
     Read a target point from your exported object_in_base_link.json.
 
-    Supported layouts (compatible with your previous versions):
-    - center: object.center.base_link or center_base
-    - corners: object.obb.corners_8.base_link or corners_base
+    Supported layouts:
+    - center:
+        object.center.base_link or object.center_base
+    - corner (8 corners):
+        object.prism.corners_8.base_link (new method), OR
+        object.obb.corners_8.base_link   (legacy), OR
+        object.corners_base              (very old legacy)
+    - top_center / bottom_center:
+        computed from corners by z-sorting (top4/bottom4 average).
     """
     if not object_json_path or not os.path.exists(object_json_path):
         raise RuntimeError(f"object_json not found: {object_json_path}")
@@ -77,29 +160,46 @@ def read_target_point_from_object_json(
         data = json.load(f)
 
     obj = data.get("object", {})
+    if not isinstance(obj, dict):
+        raise RuntimeError("Invalid JSON schema: key 'object' is missing or not a dict.")
+
+    use_point = str(use_point).strip().lower()
 
     if use_point == "center":
-        p = obj.get("center", {}).get("base_link", None)
+        p = None
+        c = obj.get("center", None)
+        if isinstance(c, dict):
+            p = c.get("base_link", None)
         if p is None:
             p = obj.get("center_base", None)
         if p is None:
             raise RuntimeError("Cannot find center in json (object.center.base_link or center_base).")
-        return [float(p[0]), float(p[1]), float(p[2])]
+        return _as_xyz_list(p)
+
+    # corners-based options
+    corners8 = _load_corners8_base(obj)
 
     if use_point == "corner":
-        corners = None
-        if "obb" in obj and "corners_8" in obj["obb"] and "base_link" in obj["obb"]["corners_8"]:
-            corners = obj["obb"]["corners_8"]["base_link"]
-        elif "corners_base" in obj:
-            corners = obj["corners_base"]
-
-        if corners is None or len(corners) != 8:
-            raise RuntimeError("Cannot find corners (expect 8) in json.")
-
+        if corners8 is None:
+            raise RuntimeError(
+                "Cannot find corners in json. Expect one of:\n"
+                "  object.prism.corners_8.base_link (new)\n"
+                "  object.obb.corners_8.base_link (legacy)\n"
+                "  object.corners_base (very old)"
+            )
         idx = int(corner_index)
         idx = max(0, min(7, idx))
-        p = corners[idx]
-        return [float(p[0]), float(p[1]), float(p[2])]
+        return _as_xyz_list(corners8[idx])
+
+    if use_point == "top_center":
+        if corners8 is None:
+            raise RuntimeError("top_center requires corners_8 in base_link (prism/obb).")
+        return _top_bottom_center_from_corners(corners8, which="top")
+
+    if use_point == "bottom_center":
+        if corners8 is None:
+            raise RuntimeError("bottom_center requires corners_8 in base_link (prism/obb).")
+        return _top_bottom_center_from_corners(corners8, which="bottom")
 
     raise RuntimeError(f"Unknown use_point: {use_point}")
 
@@ -111,8 +211,9 @@ class GotoPointConfig:
     object_json: str = ""
 
     # Which point to use from the json
-    use_point: str = "center"     # "center" or "corner"
-    corner_index: int = 0         # used when use_point="corner"
+    # "center" | "corner" | "top_center" | "bottom_center"
+    use_point: str = "center"
+    corner_index: int = 0
 
     # Hover height above the selected point (default: 0.20 m)
     z_offset: float = 0.20
@@ -120,7 +221,7 @@ class GotoPointConfig:
     z_max: float = 2.00
 
     # MoveIt IK settings
-    ik_service: str = "/compute_ik"          # sometimes "/move_group/compute_ik"
+    ik_service: str = "/compute_ik"
     move_group: str = "ur_manipulator"
     ik_frame: str = "base_link"
     eef_link: str = "tool0"
@@ -140,7 +241,6 @@ class GotoPointConfig:
     time_from_start: float = 3.0
 
     # End-effector orientation target (roll, pitch, yaw)
-    # Default: pointing "down" (may need adjustment for your URDF / tool convention)
     target_rpy: List[float] = field(default_factory=lambda: [math.pi, 0.0, 0.0])
 
     # If set, runner will wait for /joint_states and use it as an IK seed
@@ -168,7 +268,6 @@ class GotoPointRunner:
         self._ik_future = None
         self._done = False
 
-        # Optional subscription for IK seed
         if self.cfg.require_joint_states_seed:
             qos = QoSProfile(
                 depth=10,
@@ -215,7 +314,8 @@ class GotoPointRunner:
         z_hover = max(float(self.cfg.z_min), min(float(self.cfg.z_max), z_hover))
 
         self.node.get_logger().info(
-            f"[goto_point] target(base_link) raw=({x:.4f},{y:.4f},{z:.4f}) -> hover_z={z_hover:.4f} (z_offset={self.cfg.z_offset:.3f})"
+            f"[goto_point] use_point={self.cfg.use_point} raw=({x:.4f},{y:.4f},{z:.4f}) -> "
+            f"hover_z={z_hover:.4f} (z_offset={self.cfg.z_offset:.3f})"
         )
 
         pose = PoseStamped()
@@ -247,7 +347,6 @@ class GotoPointRunner:
             return  # already running
 
         if self.cfg.require_joint_states_seed and self._last_joint_state is None:
-            # Do not block; caller can call start() again later (or disable require_joint_states_seed).
             self.node.get_logger().info("[goto_point] Waiting for /joint_states to use as IK seed...")
             return
 
@@ -264,7 +363,6 @@ class GotoPointRunner:
         req.ik_request.avoid_collisions = bool(self.cfg.avoid_collisions)
         req.ik_request.timeout = duration_from_sec(float(self.cfg.ik_timeout))
 
-        # Seed with current robot state if available
         if self.cfg.require_joint_states_seed and self._last_joint_state is not None:
             req.ik_request.robot_state.joint_state = self._last_joint_state
 
@@ -323,11 +421,10 @@ class GotoPointNode(Node):
     def __init__(self):
         super().__init__("goto_point_from_object_json")
 
-        # Parameters (keep compatible with your original script)
         self.declare_parameter("object_json", "")
         self.declare_parameter("use_point", "center")
         self.declare_parameter("corner_index", 0)
-        self.declare_parameter("z_offset", 0.20)   # default changed to 0.20 m
+        self.declare_parameter("z_offset", 0.20)
         self.declare_parameter("z_min", 0.05)
         self.declare_parameter("z_max", 2.00)
 
@@ -374,8 +471,6 @@ class GotoPointNode(Node):
         )
 
         self.runner = GotoPointRunner(self, cfg)
-
-        # Polling timer: call runner.start() until it fires (it will wait for joint_states/service readiness)
         self._timer = self.create_timer(0.2, self._tick)
 
     def _tick(self):
@@ -384,7 +479,6 @@ class GotoPointNode(Node):
                 self.get_logger().info("Exiting node.")
                 rclpy.shutdown()
             return
-
         self.runner.start(on_done=self._on_done)
 
     def _on_done(self, ok: bool, msg: str):

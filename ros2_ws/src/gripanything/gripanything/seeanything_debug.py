@@ -197,7 +197,7 @@ class SeeAnythingNode(Node):
 
         # Sweep angle in degrees; used to trim the full 360° loop to avoid joint limits.
         # If cfg.circle.sweep_deg is not available, the fallback default is 120.0.
-        self._sweep_deg: float = float(getattr(getattr(self.cfg, "circle", object()), "sweep_deg", 120.0))
+        self._sweep_deg: float = float(getattr(getattr(self.cfg, "circle", object()), "sweep_deg", 180.0))
 
         # Interactive prompt (unless disabled)
         if self.cfg.runtime.require_prompt:
