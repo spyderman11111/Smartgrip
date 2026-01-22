@@ -42,7 +42,7 @@ def main():
 
     #  Optional: Set SDK's log level to Trace or Debug for more verbose logs. Defaults to Info
     aria.set_log_level(aria.Level.Info)
- 
+
     # 1. Create StreamingClient instance
     streaming_client = aria.StreamingClient()
 

@@ -36,7 +36,7 @@ cd Grounded-SAM-2
 pip3 install torch torchvision torchaudio
 #check
 # echo $CUDA_HOME
-# export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
+# export CUDA_HOME=/usr/local/cuda-12.8/
 # echo $CUDA_HOME
 # echo 'export CUDA_HOME=$(dirname $(dirname $(which nvcc)))' >> ~/.bashrc
 # echo 'export PATH=$CUDA_HOME/bin:$PATH' >> ~/.bashrc

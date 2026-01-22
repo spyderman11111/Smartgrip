@@ -1,3 +1,9 @@
+source /home/MA_SmartGrip/Smartgrip/aria/bin/activate
+
+USB：python stream_rgb_eye_sam2.py --interface usb
+
+WiFi：python stream_rgb_eye_sam2.py --interface wifi --device-ip 192.168.0.102
+
 source /home/MA_SmartGrip/Smartgrip/py310/bin/activate
 source install/setup.bash 
 ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py

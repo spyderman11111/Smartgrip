@@ -33,5 +33,5 @@ def inspect_point_cloud(ply_path):
     o3d.visualization.draw_geometries([pcd, world_frame])
 
 if __name__ == "__main__":
-    ply_file = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/main_cluster_clean.ply"
+    ply_file = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/points_no_table.ply"
     inspect_point_cloud(ply_file)
