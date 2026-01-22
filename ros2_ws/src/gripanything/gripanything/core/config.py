@@ -67,7 +67,7 @@ class OfflineBias:
     enable: bool = True
     ox: float = 0.00
     oy: float = 0.01
-    oz: float = -0.03
+    oz: float = 0.00
 
 
 @dataclass

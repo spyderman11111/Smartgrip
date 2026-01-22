@@ -1,0 +1,5 @@
+1 an orange circle 1
+2 an orange square 1
+3 an orange triangle 0
+4 orange triangle  0
+5 orange square 
