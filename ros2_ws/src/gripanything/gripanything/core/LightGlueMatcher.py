@@ -5,7 +5,7 @@ import os
 import glob
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 
 import cv2
 import numpy as np
@@ -66,12 +66,6 @@ class LightGlueMatcher:
         feats["image_size"] = torch.tensor([w, h], device=self.device).unsqueeze(0)  # [1,2] (W,H)
         return feats
 
-    def extract_features(self, image_path: str) -> dict:
-        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if img is None:
-            raise FileNotFoundError(f"Failed to read image: {image_path}")
-        return self.extract_features_from_bgr(img)
-
     def match_feats(self, feats0: dict, feats1: dict) -> dict:
         data = {
             "image0": {
@@ -105,7 +99,7 @@ def _read_bgr_uint8(path: str) -> np.ndarray:
 def _object_bbox_from_black_bg(img_bgr: np.ndarray, thr: int = 8) -> Optional[Tuple[int, int, int, int]]:
     """
     Detect non-black region as object bbox in an object-only image.
-    Return (x0,y0,x1,y1) in pixel coordinates, inclusive-exclusive.
+    Return (x0,y0,x1,y1) inclusive-exclusive.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     mask = (gray > thr).astype(np.uint8)
@@ -129,7 +123,6 @@ def _crop_pad_resize(
     if bw <= 0 or bh <= 0:
         return cv2.resize(img_bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
 
-    # pad
     pad = int(round(max(bw, bh) * pad_ratio))
     cx = (x0 + x1) * 0.5
     cy = (y0 + y1) * 0.5
@@ -140,7 +133,6 @@ def _crop_pad_resize(
     nx1 = int(round(cx + half))
     ny1 = int(round(cy + half))
 
-    # clamp and pad with black
     pad_left = max(0, -nx0)
     pad_top = max(0, -ny0)
     pad_right = max(0, nx1 - w)
@@ -172,20 +164,19 @@ def preprocess_object_only(
         return img_bgr
     bbox = _object_bbox_from_black_bg(img_bgr)
     if bbox is None:
-        # object missing or too dark; return original resized to stable size
         return cv2.resize(img_bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
     return _crop_pad_resize(img_bgr, bbox=bbox, out_size=out_size, pad_ratio=pad_ratio)
 
 
 # =========================
-# Scoring and policy
+# Scoring (KEEP AS-IS)
 # =========================
 
 def compute_object_match_score(
     scores: np.ndarray,
-    score_th: float = 0.20,  # confident match threshold inside LG outputs
-    topk: int = 10,          # top-k for quality
-    k_ref: int = 20,         # saturation for coverage
+    score_th: float = 0.20,
+    topk: int = 10,
+    k_ref: int = 20,
 ) -> dict:
     if scores is None:
         return {"score": 0.0, "quality": 0.0, "coverage": 0.0, "K_conf": 0, "score_th": score_th, "topk": 0, "k_ref": k_ref}
@@ -205,6 +196,10 @@ def compute_object_match_score(
     return {"score": score, "quality": quality, "coverage": coverage, "K_conf": K_conf, "score_th": score_th, "topk": k, "k_ref": k_ref}
 
 
+# =========================
+# Results
+# =========================
+
 @dataclass
 class FrameEval:
     path: str
@@ -216,15 +211,37 @@ class FrameEval:
 
 
 @dataclass
-class VerificationResult:
+class GateResult:
+    policy: str
     accepted: bool
-    pass_index: int                 # first index where consecutive rule is satisfied, -1 if rejected
-    best_index: int                 # index of max score
+    best_index: int
     best_score: float
-    streak_required: int
-    pass_threshold: float
-    per_frame: List[FrameEval]
 
+    # topM gate fields (when policy=="topm")
+    top_m: int
+    s_top: float
+    avg_threshold: float
+    frame_threshold: float
+    min_pass_k: int
+    n_pass: int
+    selected_indices: List[int]
+    selected_paths: List[str]
+
+    # consecutive fields (when policy=="consecutive") - still filled but may be defaults
+    consecutive_n: int
+    pass_index: int
+    pass_threshold: float
+
+
+@dataclass
+class VerificationResult:
+    per_frame: List[FrameEval]
+    gate: GateResult
+
+
+# =========================
+# Debug visualization (optional)
+# =========================
 
 def _draw_matches_image(
     img0_bgr: np.ndarray,
@@ -263,6 +280,54 @@ def _draw_matches_image(
     return canvas
 
 
+# =========================
+# Gate policies
+# =========================
+
+def _gate_topm(
+    per_frame: List[FrameEval],
+    top_m: int,
+    avg_threshold: float,
+    frame_threshold: float,
+    min_pass_k: int,
+) -> Tuple[bool, float, int, List[int]]:
+    if len(per_frame) == 0:
+        return False, 0.0, 0, []
+
+    scores = np.array([f.score for f in per_frame], dtype=np.float32)
+    order = np.argsort(-scores)  # desc
+    m = int(min(max(1, top_m), len(per_frame)))
+    selected = order[:m].tolist()
+
+    s_top = float(scores[selected].mean()) if len(selected) > 0 else 0.0
+    n_pass = int((scores >= float(frame_threshold)).sum())
+    accepted = (s_top >= float(avg_threshold)) and (n_pass >= int(min_pass_k))
+    return accepted, s_top, n_pass, selected
+
+
+def _gate_consecutive(
+    per_frame: List[FrameEval],
+    pass_threshold: float,
+    consecutive_n: int,
+) -> int:
+    """Return pass_index (first index where streak satisfied), or -1 if fail."""
+    streak = 0
+    pass_index = -1
+    for i, f in enumerate(per_frame):
+        if f.score >= float(pass_threshold):
+            streak += 1
+            if streak >= int(consecutive_n):
+                pass_index = i
+                break
+        else:
+            streak = 0
+    return pass_index
+
+
+# =========================
+# Main evaluation
+# =========================
+
 def verify_one_to_many(
     matcher: LightGlueMatcher,
     aria_path: str,
@@ -276,8 +341,16 @@ def verify_one_to_many(
     topk_quality: int = 10,
     k_ref: int = 20,
     # decision policy
+    policy: str = "topm",  # "topm" (recommended) or "consecutive"
+    # topm gate
+    top_m: int = 4,
+    avg_threshold: float = 0.40,
+    frame_threshold: float = 0.30,
+    min_pass_k: int = 3,
+    # consecutive gate (legacy)
     pass_threshold: float = 0.40,
     consecutive_n: int = 2,
+    # misc
     max_frames: Optional[int] = 16,
     # optional visualization
     save_best_viz_path: Optional[str] = None,
@@ -288,12 +361,15 @@ def verify_one_to_many(
     if len(wrist_paths) == 0:
         raise ValueError("wrist_paths is empty")
 
-    # limit frames
     wrist_paths = [p for p in wrist_paths if Path(p).exists()]
     if max_frames is not None:
         wrist_paths = wrist_paths[: int(max_frames)]
     if len(wrist_paths) == 0:
         raise ValueError("No valid wrist image paths after filtering")
+
+    policy = str(policy).strip().lower()
+    if policy not in ("topm", "consecutive"):
+        raise ValueError(f"Unsupported policy: {policy}")
 
     # --- Extract Aria features once ---
     aria_bgr = _read_bgr_uint8(aria_path)
@@ -301,12 +377,10 @@ def verify_one_to_many(
     feats0 = matcher.extract_features_from_bgr(aria_bgr)
 
     per_frame: List[FrameEval] = []
-    streak = 0
-    pass_index = -1
 
     best_score = -1.0
     best_index = -1
-    best_bundle: Optional[Dict[str, Any]] = None  # store for viz
+    best_bundle: Optional[Dict[str, Any]] = None
 
     with torch.inference_mode():
         for i, wp in enumerate(wrist_paths):
@@ -319,14 +393,13 @@ def verify_one_to_many(
             matches = out["matches"][0].detach().cpu().numpy().astype(np.int64)
             scores = out["scores"][0].detach().cpu().numpy().astype(np.float32)
 
-            # sort desc by score
             if scores.size > 0:
                 order = np.argsort(-scores)
                 matches = matches[order]
                 scores = scores[order]
 
             stats = compute_object_match_score(scores, score_th=score_th, topk=topk_quality, k_ref=k_ref)
-            frame_eval = FrameEval(
+            fr = FrameEval(
                 path=wp,
                 score=stats["score"],
                 quality=stats["quality"],
@@ -334,11 +407,10 @@ def verify_one_to_many(
                 K_conf=int(stats["K_conf"]),
                 n_matches=int(matches.shape[0]),
             )
-            per_frame.append(frame_eval)
+            per_frame.append(fr)
 
-            # best
-            if frame_eval.score > best_score:
-                best_score = frame_eval.score
+            if fr.score > best_score:
+                best_score = fr.score
                 best_index = i
                 best_bundle = {
                     "aria_bgr": aria_bgr,
@@ -349,15 +421,50 @@ def verify_one_to_many(
                     "scores": scores,
                 }
 
-            # consecutive policy
-            if frame_eval.score >= float(pass_threshold):
-                streak += 1
-                if streak >= int(consecutive_n) and pass_index < 0:
-                    pass_index = i  # first frame where rule is satisfied
-            else:
-                streak = 0
+    # ---- Gate decision ----
+    selected_indices: List[int] = []
+    selected_paths: List[str] = []
+    s_top = 0.0
+    n_pass = 0
+    pass_index = -1
 
-    accepted = pass_index >= 0
+    if policy == "topm":
+        accepted, s_top, n_pass, selected_indices = _gate_topm(
+            per_frame=per_frame,
+            top_m=top_m,
+            avg_threshold=avg_threshold,
+            frame_threshold=frame_threshold,
+            min_pass_k=min_pass_k,
+        )
+        selected_paths = [per_frame[i].path for i in selected_indices]
+
+    else:
+        pass_index = _gate_consecutive(per_frame=per_frame, pass_threshold=pass_threshold, consecutive_n=consecutive_n)
+        accepted = pass_index >= 0
+        # for convenience, still output "selected" as the best one if accepted
+        if accepted and best_index >= 0:
+            selected_indices = [best_index]
+            selected_paths = [per_frame[best_index].path]
+
+    gate = GateResult(
+        policy=policy,
+        accepted=bool(accepted),
+        best_index=int(best_index),
+        best_score=float(best_score if best_score >= 0 else 0.0),
+
+        top_m=int(top_m),
+        s_top=float(s_top),
+        avg_threshold=float(avg_threshold),
+        frame_threshold=float(frame_threshold),
+        min_pass_k=int(min_pass_k),
+        n_pass=int(n_pass),
+        selected_indices=list(selected_indices),
+        selected_paths=list(selected_paths),
+
+        consecutive_n=int(consecutive_n),
+        pass_index=int(pass_index),
+        pass_threshold=float(pass_threshold),
+    )
 
     # optional: save best visualization
     if save_best_viz_path is not None and best_bundle is not None:
@@ -373,29 +480,50 @@ def verify_one_to_many(
         os.makedirs(str(Path(save_best_viz_path).parent), exist_ok=True)
         cv2.imwrite(save_best_viz_path, vis)
 
-    return VerificationResult(
-        accepted=accepted,
-        pass_index=pass_index,
-        best_index=best_index,
-        best_score=float(best_score if best_score >= 0 else 0.0),
-        streak_required=int(consecutive_n),
-        pass_threshold=float(pass_threshold),
-        per_frame=per_frame,
-    )
+    return VerificationResult(per_frame=per_frame, gate=gate)
 
 
 # =========================
-# Demo main
+# Convenience wrapper for main program
+# =========================
+
+def cross_view_gate_select(
+    matcher: LightGlueMatcher,
+    aria_path: str,
+    wrist_paths: List[str],
+    **kwargs,
+) -> Tuple[bool, List[str], VerificationResult]:
+    """
+    Main-call-friendly wrapper.
+
+    Returns:
+      accepted: bool
+      selected_paths: List[str]   # (Top-M) paths to feed VGGT if accepted
+      result: VerificationResult  # full diagnostics
+    """
+    res = verify_one_to_many(matcher=matcher, aria_path=aria_path, wrist_paths=wrist_paths, **kwargs)
+    return res.gate.accepted, res.gate.selected_paths, res
+
+
+# =========================
+# Demo main 
 # =========================
 
 def _print_summary(res: VerificationResult):
+    g = res.gate
     print("\n[CrossViewVerification] summary")
-    print(f"  accepted: {res.accepted}")
-    print(f"  pass_threshold: {res.pass_threshold:.3f} | consecutive_n: {res.streak_required}")
-    print(f"  pass_index (first satisfied): {res.pass_index}")
-    print(f"  best_index: {res.best_index} | best_score: {res.best_score:.3f}\n")
+    print(f"  policy: {g.policy}")
+    print(f"  accepted: {g.accepted}")
+    print(f"  best_index: {g.best_index} | best_score: {g.best_score:.3f}")
 
-    print(f"{'i':>3} | {'score':>6} | {'qual':>6} | {'cov':>6} | {'Kconf':>5} | {'K':>4} | path")
+    if g.policy == "topm":
+        print(f"  top_m: {g.top_m} | S_top: {g.s_top:.3f} | avg_th: {g.avg_threshold:.3f}")
+        print(f"  frame_th: {g.frame_threshold:.3f} | min_pass_k: {g.min_pass_k} | n_pass: {g.n_pass}")
+        print(f"  selected_indices: {g.selected_indices}")
+    else:
+        print(f"  pass_threshold: {g.pass_threshold:.3f} | consecutive_n: {g.consecutive_n} | pass_index: {g.pass_index}")
+
+    print(f"\n{'i':>3} | {'score':>6} | {'qual':>6} | {'cov':>6} | {'Kconf':>5} | {'K':>4} | path")
     print("-" * 120)
     for i, fr in enumerate(res.per_frame):
         print(f"{i:>3} | {fr.score:>6.3f} | {fr.quality:>6.3f} | {fr.coverage:>6.3f} | {fr.K_conf:>5d} | {fr.n_matches:>4d} | {fr.path}")
@@ -416,7 +544,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     matcher = LightGlueMatcher(feature_type="superpoint", device=device, mp=True)
 
-    # ---- Verification policy ----
+    # Recommended: topM posterior gate
     res = verify_one_to_many(
         matcher=matcher,
         aria_path=ARIA_PATH,
@@ -427,12 +555,20 @@ if __name__ == "__main__":
         score_th=0.20,
         topk_quality=10,
         k_ref=20,
-        pass_threshold=0.40,     
-        consecutive_n=2,         
-        max_frames=16,           # number of snapshots in the sweep
+
+        policy="topm",
+        top_m=4,
+        avg_threshold=0.40,
+        frame_threshold=0.30,
+        min_pass_k=3,
+
+        max_frames=16,
         save_best_viz_path="/home/MA_SmartGrip/Smartgrip/tmp/best_match_viz.png",
         viz_topk=200,
     )
 
     _print_summary(res)
+    print("[CrossViewVerification] selected_paths:")
+    for p in res.gate.selected_paths:
+        print("  ", p)
     print("[CrossViewVerification] best visualization saved to:", "/home/MA_SmartGrip/Smartgrip/tmp/best_match_viz.png")

@@ -64,7 +64,7 @@ DEFAULT_VGGT_CAMERAS_JSON = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanythi
 DEFAULT_ROBOT_SHOTS_JSON = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ur5camerajointstates.json"
 
 # Output
-DEFAULT_OUT_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/postprocess_output"
+DEFAULT_OUT_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/postprocess_output1"
 DEFAULT_VISUALIZE = True
 DEFAULT_EXPORT_OBJECT_JSON = True
 DEFAULT_OBJECT_JSON_NAME = "object_in_base_link.json"
@@ -127,13 +127,13 @@ DEFAULT_AIM_MIN_POINTS_ABS = 300
 DEFAULT_AIM_MIN_SIZE_RATIO = 0.00
 DEFAULT_AIM_PICK_MODE = "min_perp_then_depth"
 
-# visualization of aim
+# Visualization of aim
 DEFAULT_SHOW_AIM_FRAME_AND_RAY = True
 DEFAULT_AIM_FRAME_SIZE_MULT = 8.0       # axis size = mult * voxel (clamped)
 DEFAULT_AIM_FRAME_SIZE_MIN = 0.03
 DEFAULT_AIM_RAY_LENGTH_MULT = 80.0      # ray length = mult * voxel (clamped)
 DEFAULT_AIM_RAY_LENGTH_MIN = 0.30
-DEFAULT_AIM_RAY_COLOR = (0.0, 0.0, 1.0) # blue
+DEFAULT_AIM_RAY_COLOR = (0.0, 0.0, 1.0)  # blue
 
 # Visualization (center sphere size)
 DEFAULT_SHOW_CENTER = True
@@ -147,7 +147,7 @@ DEFAULT_CORNER_SPHERE_RADIUS_MULT = 0.75
 DEFAULT_CORNER_SPHERE_RADIUS_MIN = 0.003
 
 # -----------------------------------------------------------------------------
-# Geometry fit 
+# Geometry fit
 # -----------------------------------------------------------------------------
 DEFAULT_FIT_ENABLE = True
 
@@ -291,6 +291,34 @@ class Config:
     show_table_frame: bool = DEFAULT_SHOW_TABLE_FRAME
     table_frame_size_mult: float = DEFAULT_TABLE_FRAME_SIZE_MULT
     table_frame_size_min: float = DEFAULT_TABLE_FRAME_SIZE_MIN
+
+
+# =============================================================================
+# Printing helpers (concise, stage-oriented)
+# =============================================================================
+
+def _print(tag: str, msg: str) -> None:
+    print(f"[{tag}] {msg}")
+
+def _fmt_ratio(num: int, den: int) -> str:
+    if den <= 0:
+        return "n/a"
+    return f"{100.0 * num / den:.1f}%"
+
+def _fmt_vec3(v: np.ndarray, nd: int = 4) -> str:
+    v = np.asarray(v).reshape(3)
+    return f"({v[0]:.{nd}f},{v[1]:.{nd}f},{v[2]:.{nd}f})"
+
+def _fmt_extent3(e: np.ndarray, nd: int = 4) -> str:
+    e = np.asarray(e).reshape(3)
+    return f"({e[0]:.{nd}f},{e[1]:.{nd}f},{e[2]:.{nd}f})"
+
+def _fmt_mm(x_m: float) -> str:
+    return f"{x_m * 1000.0:.2f}mm"
+
+def _fmt_cm3(e_m: np.ndarray) -> str:
+    e = np.asarray(e_m).reshape(3)
+    return f"({e[0]*100:.2f},{e[1]*100:.2f},{e[2]*100:.2f})cm"
 
 
 # =============================================================================
@@ -471,7 +499,6 @@ def _rect_fit_2d(points_2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, 
     """
     pts = np.asarray(points_2d, dtype=np.float64)
     if pts.shape[0] < 5:
-        # fallback to AABB in 2D
         mn = pts.min(axis=0)
         mx = pts.max(axis=0)
         center = 0.5 * (mn + mx)
@@ -513,7 +540,6 @@ def _circle_fit_kasa(points_2d: np.ndarray) -> Tuple[np.ndarray, float, float]:
     y = P[:, 1]
     A = np.stack([x, y, np.ones_like(x)], axis=1)
     b = x*x + y*y
-    # least squares
     sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
     a, b2, c = float(sol[0]), float(sol[1]), float(sol[2])
     cx = 0.5 * a
@@ -533,7 +559,6 @@ def _circle_coverage_deg(points_2d: np.ndarray, center2: np.ndarray) -> float:
     if ang.size < 3:
         return 0.0
     dif = np.diff(ang)
-    # consider wrap-around gap
     wrap = (ang[0] + 2 * math.pi) - ang[-1]
     max_gap = float(max(np.max(dif), wrap))
     coverage = float(2 * math.pi - max_gap)
@@ -768,38 +793,39 @@ def remove_table_only(pcd: o3d.geometry.PointCloud, cfg: Config) -> Tuple[o3d.ge
       voxel
       best_plane_model (ax+by+cz+d=0) used as support-plane candidate (may be None)
     """
+    total_n = len(pcd.points)
     voxel = auto_voxel(pcd, cfg.voxel_divisor, cfg.voxel_min, cfg.voxel_max)
     detect_thr = cfg.plane_detect_dist_mult * voxel
     remove_thr = cfg.plane_remove_dist_mult * voxel
     ds_voxel = max(1e-3, cfg.ds_voxel_mult * voxel)
 
-    print(f"[Scale] voxel={voxel:.4f} m | detect_thr={detect_thr:.4f} m | remove_thr={remove_thr:.4f} m | ds_voxel={ds_voxel:.4f} m")
+    _print("Scale", f"voxel={voxel:.4f} | detect={detect_thr:.4f} | remove={remove_thr:.4f} | ds={ds_voxel:.4f}")
 
     C = rgb01(pcd)
     HSV = rgb_to_hsv_np(C)
     S, V = HSV[:, 1], HSV[:, 2]
 
     cand_mask = (S < cfg.s_gray_cand_max) & (V > cfg.v_gray_cand_min)
-    print(f"[PlaneCandidates] grayish={int(cand_mask.sum())} / total={len(pcd.points)}")
+    _print("Table", f"candidates(gray-ish)={int(cand_mask.sum())}/{total_n} ({_fmt_ratio(int(cand_mask.sum()), total_n)})")
 
     remove_color_gate = (S < cfg.s_remove_max) & (V > cfg.v_remove_min)
 
-    keep_mask = np.ones((len(pcd.points),), dtype=bool)
+    keep_mask = np.ones((total_n,), dtype=bool)
 
-    # track best plane (largest removed), for later "up axis"
     best_plane = None
     best_removed = -1
+    removed_total = 0
 
     for it in range(cfg.max_planes):
         cur_idx = np.where(keep_mask & cand_mask)[0]
         if cur_idx.size == 0:
-            print(f"[PlaneIter {it}] No candidates left, stop.")
+            _print("Table", f"iter={it} stop: no candidates left")
             break
 
         pcd_cand = pcd.select_by_index(cur_idx)
         pcd_cand_ds = pcd_cand.voxel_down_sample(voxel_size=ds_voxel) if ds_voxel > 0 else pcd_cand
         if len(pcd_cand_ds.points) < 100:
-            print(f"[PlaneIter {it}] Too few points ({len(pcd_cand_ds.points)}) for plane detection, stop.")
+            _print("Table", f"iter={it} stop: too few points for plane detection (ds={len(pcd_cand_ds.points)})")
             break
 
         plane_model, _ = pcd_cand_ds.segment_plane(
@@ -813,26 +839,26 @@ def remove_table_only(pcd: o3d.geometry.PointCloud, cfg: Config) -> Tuple[o3d.ge
 
         remove_mask = (dist_all <= remove_thr) & remove_color_gate & keep_mask
 
-        min_plane_pts = max(cfg.min_plane_points_abs, int(cfg.min_plane_points_ratio * keep_mask.sum()))
+        min_plane_pts = max(cfg.min_plane_points_abs, int(cfg.min_plane_points_ratio * int(keep_mask.sum())))
         rm_count = int(remove_mask.sum())
 
-        print(f"[PlaneIter {it}] remove_count={rm_count} (min_required={min_plane_pts})")
         if rm_count < min_plane_pts:
-            print(f"[PlaneIter {it}] Plane too small or gating too strict, stop.")
+            _print("Table", f"iter={it} stop: plane too small (remove={rm_count}, min={min_plane_pts})")
             break
 
-        # update best plane
         if rm_count > best_removed:
             best_removed = rm_count
             best_plane = tuple(float(x) for x in plane_model)
 
         keep_mask &= ~remove_mask
-        print(f"[PlaneIter {it}] removed={rm_count}, remaining={int(keep_mask.sum())}")
+        removed_total += rm_count
+        _print("Table", f"iter={it} removed={rm_count} | remaining={int(keep_mask.sum())}")
 
     pcd_no_table = pcd.select_by_index(np.where(keep_mask)[0])
+    _print("Table", f"no_table={len(pcd_no_table.points)} ({_fmt_ratio(len(pcd_no_table.points), total_n)}) | removed_total={removed_total}")
 
     if best_plane is None:
-        # fallback: run a plain plane fit on gray candidates (downsampled)
+        # Fallback: run a plain plane fit on gray candidates (downsampled)
         try:
             idx = np.where(cand_mask)[0]
             if idx.size > 200:
@@ -845,12 +871,12 @@ def remove_table_only(pcd: o3d.geometry.PointCloud, cfg: Config) -> Tuple[o3d.ge
                         num_iterations=cfg.ransac_iters,
                     )
                     best_plane = tuple(float(x) for x in plane_model)
-                    print(f"[PlaneFallback] best_plane fitted from candidates. inliers_ds={len(inliers)}")
+                    _print("Table", f"fallback plane fitted from candidates (inliers_ds={len(inliers)})")
         except Exception as e:
-            print(f"[PlaneFallback] failed: {e}")
+            _print("Table", f"fallback plane fit failed: {e}")
 
     if best_plane is None:
-        print("[Plane] WARNING: no support plane found. Geometry fit will fall back to PCA-based up axis.")
+        _print("Table", "WARNING: no support plane found (fit will fall back to PCA-up axis)")
 
     return pcd_no_table, voxel, best_plane
 
@@ -944,17 +970,18 @@ def _choose_main_cluster_label(
 
             chosen = cand_sorted[0]
             chosen_label = int(chosen["label"])
-            print(
-                f"[AimGate] enabled: perp<= {perp_r:.3f}m, depth>= {min_depth:.3f}m, min_size={min_size} "
-                f"-> chosen label={chosen_label}, size={chosen['size']}, "
-                f"perp={chosen['ray_perp']:.4f}m, depth={chosen['ray_depth']:.4f}m "
-                f"(fallback largest: label={default_label}, size={max_size})."
+            _print(
+                "AimGate",
+                f"perp<= {perp_r:.3f} depth>= {min_depth:.3f} min_size={min_size} -> "
+                f"chosen=L{chosen_label} n={chosen['size']} perp={chosen['ray_perp']:.4f} depth={chosen['ray_depth']:.4f} "
+                f"(fallback largest=L{default_label} n={max_size})"
             )
             return chosen_label, clusters
 
-        print(
-            f"[AimGate] enabled, but no cluster passed: perp<= {perp_r:.3f}m, depth>= {min_depth:.3f}m, min_size={min_size} "
-            f"-> fallback to other gates / largest(label={default_label})."
+        _print(
+            "AimGate",
+            f"enabled but no cluster passed (perp<= {perp_r:.3f}, depth>= {min_depth:.3f}, min_size={min_size}); "
+            f"fallback to other gates/largest=L{default_label}"
         )
 
     # 2) Center gate
@@ -974,17 +1001,14 @@ def _choose_main_cluster_label(
             candidates_sorted = sorted(candidates, key=lambda d: (d["dist_to_ref"], -d["size"]))
             chosen = candidates_sorted[0]
             chosen_label = int(chosen["label"])
-            print(
-                f"[CenterGate] enabled: radius={gate_r:.3f}m, min_size={min_size} "
-                f"-> chosen label={chosen_label}, size={chosen['size']}, dist={chosen['dist_to_ref']:.4f}m "
-                f"(fallback largest: label={default_label}, size={max_size})."
+            _print(
+                "CenterGate",
+                f"radius={gate_r:.3f} min_size={min_size} -> chosen=L{chosen_label} n={chosen['size']} dist={chosen['dist_to_ref']:.4f} "
+                f"(fallback largest=L{default_label} n={max_size})"
             )
             return chosen_label, clusters
 
-        print(
-            f"[CenterGate] enabled, but no cluster passed radius={gate_r:.3f}m, min_size={min_size} "
-            f"-> fallback to largest(label={default_label})."
-        )
+        _print("CenterGate", f"enabled but no cluster passed; fallback largest=L{default_label}")
 
     return default_label, clusters
 
@@ -1012,26 +1036,27 @@ def extract_main_cluster_clean(
 
     main_label, clusters = _choose_main_cluster_label(pts, labels, cfg, aim_origin_w, aim_dir_w)
 
-    if clusters:
-        by_size = sorted(clusters, key=lambda d: d["size"], reverse=True)[:5]
-        print(f"[Clusters] total={len(clusters)} | eps={eps:.4f} m | min_pts={cfg.main_dbscan_min_points}")
-        msg = []
-        for d in by_size:
-            if d.get("ray_perp", None) is not None:
-                msg.append(f"(L{d['label']}, n={d['size']}, perp={d['ray_perp']:.3f}, depth={d['ray_depth']:.3f})")
-            else:
-                msg.append(f"(L{d['label']}, n={d['size']}, dist={d['dist_to_ref']:.3f})")
-        print("[Clusters-TopSize] " + " | ".join(msg))
+    # Short, informative cluster summary (top-K by size)
+    clusters_sorted_by_size = sorted(clusters, key=lambda d: d["size"], reverse=True)
+    topk = clusters_sorted_by_size[: min(6, len(clusters_sorted_by_size))]
+    _print("Clusters", f"total={len(clusters)} | eps={eps:.4f} | min_pts={cfg.main_dbscan_min_points}")
+    msg_parts = []
+    for d in topk:
+        if d.get("ray_perp", None) is not None:
+            msg_parts.append(f"L{d['label']}:n={d['size']},perp={d['ray_perp']:.3f},depth={d['ray_depth']:.3f}")
+        else:
+            msg_parts.append(f"L{d['label']}:n={d['size']},dist={d['dist_to_ref']:.3f}")
+    _print("ClustersTop", " | ".join(msg_parts))
 
     main_size = int(np.count_nonzero(labels == main_label))
-    print(f"[MainCluster-1] chosen=(label={main_label}, size={main_size})")
+    _print("Main", f"stage1 chosen=L{main_label} n={main_size}")
 
     main_raw = pcd_no_table.select_by_index(np.where(labels == main_label)[0])
 
     gap = cfg.main_gap_mult * voxel
     dists = np.asarray(pcd_no_table.compute_point_cloud_distance(main_raw))
     near_main = pcd_no_table.select_by_index(np.where(dists <= gap)[0])
-    print(f"[NearMain] gap={gap:.4f} m | kept={len(near_main.points)} / {len(pcd_no_table.points)}")
+    _print("NearMain", f"gap={gap:.4f} | kept={len(near_main.points)}/{len(pcd_no_table.points)}")
 
     pts2 = np.asarray(near_main.points)
     labels2 = dbscan_labels_points(pts2, eps=eps, min_points=cfg.main_dbscan_min_points)
@@ -1042,13 +1067,13 @@ def extract_main_cluster_clean(
 
     sizes2 = [(li, int(np.count_nonzero(labels2 == li))) for li in range(num2)]
     main2_label, main2_size = max(sizes2, key=lambda x: x[1])
-    print(f"[MainCluster-2] clusters={num2} | main=(label={main2_label}, size={main2_size})")
+    _print("Main", f"stage2 clusters={num2} | main=L{main2_label} n={main2_size}")
 
     main2_raw = near_main.select_by_index(np.where(labels2 == main2_label)[0])
 
     r = cfg.inner_radius_mult * voxel
     main2_clean = remove_radius_outlier(main2_raw, radius=r, min_points=cfg.inner_radius_min_points)
-    print(f"[InnerOutlier] radius={r:.4f} m | min_pts={cfg.inner_radius_min_points} | raw={len(main2_raw.points)} -> clean={len(main2_clean.points)}")
+    _print("Denoise", f"radius={r:.4f} min_pts={cfg.inner_radius_min_points} | {len(main2_raw.points)} -> {len(main2_clean.points)}")
 
     if len(main2_clean.points) == 0:
         raise RuntimeError("Main cluster became empty after radius outlier removal.")
@@ -1099,14 +1124,9 @@ def fit_object_center_and_prism(
     """
     Fit object center and an approximating prism (8 corners) in VGGT world.
 
-    - Uses support plane normal as up-axis if available.
-    - Method A: fit footprint using top-band points projected to plane.
-    - Method B: fallback footprint using all points projected (convex hull) if A fails.
-
-    The prism is anchored on the support plane (bottom at z=0 along plane normal).
-    Height is estimated from robust top band.
-
-    For circle-like footprint, choose circle center and radius when it passes coverage/residual checks.
+    Important:
+    - The "extent_prism" is in VGGT world units. If you align with Sim3, convert to meters by:
+        extent_m = scale_s * extent_prism
     """
     if main_clean.is_empty():
         raise RuntimeError("Empty main cluster for geometry fitting.")
@@ -1122,11 +1142,10 @@ def fit_object_center_and_prism(
         u, p0 = _plane_unit_normal_and_point(support_plane)
         e1, e2 = _make_plane_basis(u)
 
-        # ensure object is on positive side: flip if needed
-        sdist = plane_signed_distance_unit(support_plane, P)  # signed in meters
+        # Ensure object is on positive side: flip if needed
+        sdist = plane_signed_distance_unit(support_plane, P)
         med = float(np.median(sdist))
         if med < 0.0:
-            # flip plane orientation
             a, b, c, d = support_plane
             support_plane = (-a, -b, -c, -d)
             u, p0 = _plane_unit_normal_and_point(support_plane)
@@ -1136,13 +1155,11 @@ def fit_object_center_and_prism(
         else:
             diag["support_plane_flipped"] = False
 
-        z = sdist  # distance along up-axis
+        z = sdist
         diag["support_plane_used"] = True
     else:
-        # PCA fallback
         u, e1, e2 = _estimate_up_axis_from_pca(P)
-        p0 = P.mean(axis=0)  # pseudo origin
-        # define z along u w.r.t p0 (no real plane)
+        p0 = P.mean(axis=0)
         z = (P - p0.reshape(1, 3)) @ u.reshape(3, 1)
         z = z.reshape(-1)
         diag["support_plane_used"] = False
@@ -1167,7 +1184,6 @@ def fit_object_center_and_prism(
         z_top = float(z_q)
         diag["z_top_from"] = "percentile"
 
-    # anchor bottom at plane (z=0) when support plane exists; otherwise use min z
     if support_plane is not None:
         z_bottom = 0.0
         diag["z_bottom_from"] = "support_plane"
@@ -1181,53 +1197,45 @@ def fit_object_center_and_prism(
     diag["height"] = float(height)
 
     # ---- choose points for footprint (A then B)
-    # Method A: top band points projected to plane
     P_top = P[top_mask] if (n_top > 0) else P
     use_A = bool(cfg.footprint_use_top_only) and (P_top.shape[0] >= max(20, int(cfg.top_min_points)))
     use_B = bool(cfg.footprint_fallback_use_all)
 
-    # plane origin for 2D projection:
-    # if support plane exists, keep origin as p0 on plane;
-    # but shift origin to be near object for numeric stability (project object centroid to plane)
+    # Use a plane-origin near the object for numeric stability
     if support_plane is not None:
-        # project centroid onto plane:
         centroid = P.mean(axis=0)
-        # signed distance of centroid to plane:
         a, b, c, d = support_plane
         n = np.array([a, b, c], dtype=np.float64)
         nn = float(np.linalg.norm(n))
         u_unit = n / (nn + 1e-12)
-        dist = (float(np.dot(n, centroid)) + float(d)) / (nn + 1e-12)  # signed
-        origin_plane = centroid - dist * u_unit  # on plane
+        dist = (float(np.dot(n, centroid)) + float(d)) / (nn + 1e-12)
+        origin_plane = centroid - dist * u_unit
     else:
         origin_plane = p0
 
     def _fit_footprint(points3d: np.ndarray, tag: str) -> Dict[str, Any]:
         pts2 = _project_to_plane_2d(points3d, origin_plane, e1, e2)
         if pts2.shape[0] < 5:
-            c2 = np.median(pts2, axis=0) if pts2.shape[0] > 0 else np.zeros(2)
-            center2, wh, ang, corners2 = _rect_fit_2d(pts2 if pts2.shape[0] > 0 else np.zeros((1, 2)))
+            rect_center2, rect_wh, rect_ang, rect_corners2 = _rect_fit_2d(pts2 if pts2.shape[0] > 0 else np.zeros((1, 2)))
             return {
                 "tag": tag,
                 "points2d_n": int(pts2.shape[0]),
-                "rect_center2": center2,
-                "rect_wh": wh,
-                "rect_angle_deg": float(ang),
-                "rect_corners2": corners2,
+                "rect_center2": rect_center2,
+                "rect_wh": rect_wh,
+                "rect_angle_deg": float(rect_ang),
+                "rect_corners2": rect_corners2,
                 "circle_ok": False,
                 "circle_center2": None,
                 "circle_r": None,
                 "circle_cov_deg": None,
                 "circle_norm_rmse": None,
                 "selected_model": "rect",
-                "selected_center2": center2,
+                "selected_center2": rect_center2,
             }
 
-        # rectangle on all points
         rect_center2, rect_wh, rect_ang, rect_corners2 = _rect_fit_2d(pts2)
         rect_corners2 = _order_corners_2d_ccw(rect_corners2)
 
-        # circle (optional)
         circle_ok = False
         circle_center2 = None
         circle_r = None
@@ -1256,7 +1264,6 @@ def fit_object_center_and_prism(
             except Exception:
                 circle_ok = False
 
-        # selection
         mode = str(cfg.prism_mode).lower().strip()
         if mode == "circle":
             sel = "circle" if circle_center2 is not None else "rect"
@@ -1294,15 +1301,11 @@ def fit_object_center_and_prism(
     chosen = None
     method_used = None
 
-    # A is preferred if it has enough points and yields sane dimensions
     if fitA is not None:
         wh = np.asarray(fitA["rect_wh"], dtype=np.float64).reshape(2)
-        # sanity: non-degenerate
         if float(np.min(wh)) > 1e-4 and float(np.max(wh)) > 1e-4:
             chosen = fitA
             method_used = "A_top_band"
-        else:
-            print("[Fit] Method A rect is degenerate; fallback to Method B.")
 
     if chosen is None and use_B:
         fitB = _fit_footprint(P, "B_all_points")
@@ -1334,7 +1337,6 @@ def fit_object_center_and_prism(
         len_x = 2.0 * r
         len_y = 2.0 * r
         footprint_model = "circle"
-        # corners from an axis-aligned square in plane basis centered at circle center
         cx, cy = float(center2[0]), float(center2[1])
         half = float(r)
         corners2 = np.array([
@@ -1345,7 +1347,6 @@ def fit_object_center_and_prism(
         ], dtype=np.float64)
         corners2 = _order_corners_2d_ccw(corners2)
     else:
-        # rectangle footprint
         rect_wh = np.asarray(chosen["rect_wh"], dtype=np.float64).reshape(2)
         len_x = float(rect_wh[0])
         len_y = float(rect_wh[1])
@@ -1354,22 +1355,19 @@ def fit_object_center_and_prism(
         corners2 = _order_corners_2d_ccw(corners2)
 
     # lift 2D corners to 3D on support plane (bottom) and top plane
-    corners_bottom = _lift_from_plane_2d(corners2, origin_plane, e1, e2)  # (4,3) but may not lie exactly on plane if p0 not exact
-    # if support plane exists, project bottom corners onto the plane precisely
+    corners_bottom = _lift_from_plane_2d(corners2, origin_plane, e1, e2)
+
     if support_plane is not None:
-        # project onto plane by subtracting signed distance along u
         sdist_cb = plane_signed_distance_unit(support_plane, corners_bottom)
         corners_bottom = corners_bottom - sdist_cb.reshape(-1, 1) * u.reshape(1, 3)
-    # set bottom at z_bottom when no plane: shift along u
+
     if support_plane is None and abs(z_bottom) > 1e-12:
         corners_bottom = corners_bottom + float(z_bottom) * u.reshape(1, 3)
 
     corners_top = corners_bottom + height * u.reshape(1, 3)
 
-    # center 3D: from selected center2 in plane basis
     center_on_plane = _lift_from_plane_2d(center2.reshape(1, 2), origin_plane, e1, e2).reshape(3)
     if support_plane is not None:
-        # project to plane
         sdist_c = float(plane_signed_distance_unit(support_plane, center_on_plane.reshape(1, 3))[0])
         center_on_plane = center_on_plane - sdist_c * u
     else:
@@ -1377,14 +1375,11 @@ def fit_object_center_and_prism(
 
     center_w = center_on_plane + (0.5 * height) * u
 
-    # prism 8 corners (bottom 4 + top 4)
     corners8_w = np.vstack([corners_bottom, corners_top]).astype(np.float64)
 
-    # prism rotation matrix in world: columns [e1,e2,u]
     R_prism_world = np.stack([e1, e2, u], axis=1).astype(np.float64)
     extent_prism = np.array([len_x, len_y, height], dtype=np.float64)
 
-    # diagnostics for circle selection
     diag["chosen_method"] = str(method_used)
     diag["footprint_model"] = str(footprint_model)
     diag["rect_center2"] = [float(x) for x in np.asarray(chosen["rect_center2"]).reshape(2)]
@@ -1400,11 +1395,12 @@ def fit_object_center_and_prism(
     diag["circle_cov_deg"] = float(chosen["circle_cov_deg"]) if chosen.get("circle_cov_deg", None) is not None else None
     diag["circle_norm_rmse"] = float(chosen["circle_norm_rmse"]) if chosen.get("circle_norm_rmse", None) is not None else None
 
-    # final summary print
-    print(
-        f"[Fit] method={method_used} | footprint={footprint_model} | "
-        f"extent_xy=({extent_prism[0]:.4f},{extent_prism[1]:.4f}) m | height={extent_prism[2]:.4f} m | "
-        f"center_w=({center_w[0]:.4f},{center_w[1]:.4f},{center_w[2]:.4f})"
+    # Concise fit summary (VGGT world units)
+    _print(
+        "FitW",
+        f"method={method_used} shape={footprint_model} | "
+        f"center_w={_fmt_vec3(center_w)} | extent_WU={_fmt_extent3(extent_prism)} | "
+        f"top_pts={diag.get('top_points', 0)} band={diag.get('top_band_m', 0.0):.4f}"
     )
 
     return FitResult(
@@ -1439,36 +1435,39 @@ def process_pointcloud(cfg: Config) -> Dict[str, object]:
     pcd = o3d.io.read_point_cloud(cfg.ply_path)
     if pcd.is_empty():
         raise RuntimeError(f"Empty or unreadable point cloud: {cfg.ply_path}")
-    print(f"[Load] {cfg.ply_path} | points={len(pcd.points)} | has_color={pcd.has_colors()}")
+
+    _print("Out", f"dir={cfg.out_dir}")
+    _print("Load", f"points={len(pcd.points)} | color={pcd.has_colors()}")
 
     # 1) Remove table (also returns best support plane)
     pcd_no_table, voxel, best_plane = remove_table_only(pcd, cfg)
     out_no_table = os.path.join(cfg.out_dir, "points_no_table.ply")
     o3d.io.write_point_cloud(out_no_table, pcd_no_table, write_ascii=False, compressed=True)
-    print(f"[Write] {out_no_table}")
+    _print("Write", "points_no_table.ply")
 
     # 1.5) Load VGGT camera poses once (for aim gate + later alignment)
     vggt_world_T_cam = load_vggt_world_T_cam(cfg.vggt_cameras_json, cfg.vggt_pose_is_world_T_cam)
 
-    # compute aim ray (optional)
+    # Aim ray (optional)
     aim_pid, aim_world_T_cam, aim_origin_w, aim_dir_w = None, None, None, None
     if cfg.aim_gate_enable or cfg.show_aim_frame_and_ray:
         pid, world_T_cam, C_w, d_w = compute_aim_ray_from_vggt(vggt_world_T_cam, cfg)
         aim_pid, aim_world_T_cam, aim_origin_w, aim_dir_w = pid, world_T_cam, C_w, d_w
-        print(f"[AimRay] pose_id={aim_pid} | origin={aim_origin_w.tolist()} | dir={aim_dir_w.tolist()}")
-        print("[AimRay] Note: Open3D frame color is X=red, Y=green, Z=blue. Ray uses camera (R_wc @ aim_axis_cam).")
+        _print("AimRay", f"pose_id={aim_pid} | origin={_fmt_vec3(aim_origin_w)} | dir={_fmt_vec3(aim_dir_w)}")
 
-    # 2) Extract main cluster + radius outlier removal (uses aim ray selection if enabled)
+    # 2) Extract main cluster + radius outlier removal
     main_clean = extract_main_cluster_clean(
         pcd_no_table, voxel, cfg,
         aim_origin_w=aim_origin_w if cfg.aim_gate_enable else None,
         aim_dir_w=aim_dir_w if cfg.aim_gate_enable else None,
     )
+    _print("Obj", f"main_clean={len(main_clean.points)}")
+
     out_main_clean = os.path.join(cfg.out_dir, "main_cluster_clean.ply")
     o3d.io.write_point_cloud(out_main_clean, main_clean, write_ascii=False, compressed=True)
-    print(f"[Write] {out_main_clean}")
+    _print("Write", "main_cluster_clean.ply")
 
-    # 3) Fit object center + prism in VGGT world 
+    # 3) Fit object center + prism in VGGT world (NO OBB)
     if not bool(cfg.fit_enable):
         raise RuntimeError("fit_enable=False but OBB is disabled. Enable fit_enable.")
     fit = fit_object_center_and_prism(main_clean, voxel, cfg, support_plane=best_plane)
@@ -1502,6 +1501,21 @@ def process_pointcloud(cfg: Config) -> Dict[str, object]:
 
     center_b = apply_sim3(center_w.reshape(1, 3), s, R, t).reshape(3)
     corners8_b = apply_sim3(corners8_w, s, R, t)
+
+    if with_scale:
+        _print(
+            "Align",
+            f"sim3 | pairs={len(pairs)} kept={len(keep_idx)} | scale={s:.6f} | rmse_all={_fmt_mm(err_all)} rmse_kept={_fmt_mm(err_kept)}"
+        )
+    else:
+        _print(
+            "Align",
+            f"se3 | pairs={len(pairs)} kept={len(keep_idx)} | rmse_all={_fmt_mm(err_all)} rmse_kept={_fmt_mm(err_kept)}"
+        )
+
+    # Convert fitted extent (VGGT world units) to metric size
+    extent_b_m = extent_prism * float(s) if with_scale else extent_prism
+    _print("FitB", f"center_b={_fmt_vec3(center_b)} | size={_fmt_cm3(extent_b_m)}")
 
     # 5) Export JSON
     out_json_path = os.path.join(cfg.out_dir, cfg.object_json_name)
@@ -1551,7 +1565,7 @@ def process_pointcloud(cfg: Config) -> Dict[str, object]:
                 "prism": {
                     "method_used": fit.method_used,
                     "footprint_model": fit.footprint_model,
-                    "extent_xyz_in_prism_axes": extent_prism.tolist(),          # [len_x, len_y, height]
+                    "extent_xyz_in_prism_axes": extent_prism.tolist(),          # VGGT world units
                     "R_prism_axes_in_vggt_world": R_prism_world.tolist(),       # columns [e1,e2,up]
                     "corners_8": {
                         "index_order_note": "Order: bottom 4 corners (CCW in plane) then top 4 corners (same order).",
@@ -1564,14 +1578,12 @@ def process_pointcloud(cfg: Config) -> Dict[str, object]:
         }
         with open(out_json_path, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
-        print(f"[Write] {os.path.abspath(out_json_path)}")
-        print(f"[Align] rmse_all={err_all:.6f} m | rmse_kept={err_kept:.6f} m | scale={s:.6f}")
+        _print("Write", cfg.object_json_name)
 
-    # 6) Visualization
+    # 6) Visualization (VGGT world frame)
     if cfg.visualize:
         geoms: List[o3d.geometry.Geometry] = [main_clean]
 
-        # center & corners in VGGT world
         if cfg.show_center:
             center_r = max(cfg.center_sphere_radius_min, cfg.center_sphere_radius_mult * voxel)
             geoms.append(make_sphere(center_w, center_r, cfg.center_sphere_color))
@@ -1581,22 +1593,20 @@ def process_pointcloud(cfg: Config) -> Dict[str, object]:
             for p in corners8_w:
                 geoms.append(make_sphere(p, corner_r, cfg.corner_sphere_color))
 
-        # show aim frame + ray (camera pose in VGGT world)
         if cfg.show_aim_frame_and_ray and (aim_world_T_cam is not None) and (aim_origin_w is not None) and (aim_dir_w is not None):
             frame_size = max(cfg.aim_frame_size_min, cfg.aim_frame_size_mult * voxel)
             ray_len = max(cfg.aim_ray_length_min, cfg.aim_ray_length_mult * voxel)
             geoms.append(make_coord_frame_at_T(aim_world_T_cam, frame_size))
             geoms.append(make_ray_lineset(aim_origin_w, aim_dir_w, ray_len, cfg.aim_ray_color))
 
-        # optional: show support plane frame (debug)
         if bool(cfg.show_table_frame) and (fit.support_plane is not None):
-            u, p0 = _plane_unit_normal_and_point(fit.support_plane)
-            e1, e2 = _make_plane_basis(u)
+            u_, p0_ = _plane_unit_normal_and_point(fit.support_plane)
+            e1_, e2_ = _make_plane_basis(u_)
             T = np.eye(4, dtype=np.float64)
-            T[:3, 0] = e1
-            T[:3, 1] = e2
-            T[:3, 2] = u
-            T[:3, 3] = p0
+            T[:3, 0] = e1_
+            T[:3, 1] = e2_
+            T[:3, 2] = u_
+            T[:3, 3] = p0_
             size = max(cfg.table_frame_size_min, cfg.table_frame_size_mult * voxel)
             geoms.append(make_coord_frame_at_T(T, size))
 
@@ -1606,6 +1616,8 @@ def process_pointcloud(cfg: Config) -> Dict[str, object]:
         "voxel": float(voxel),
         "center_w": center_w,
         "corners8_w": corners8_w,
+        "extent_WU": extent_prism,
+        "extent_base_m": extent_b_m,
         "alignment": {
             "scale_s": float(s),
             "R_W_to_B": R,

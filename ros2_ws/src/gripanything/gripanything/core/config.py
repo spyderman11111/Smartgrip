@@ -39,7 +39,7 @@ class Camera:
 class Dino:
     model_id: str = 'IDEA-Research/grounding-dino-tiny'
     device: str = 'cuda'
-    text_prompt: str = 'blue cylinder .'
+    text_prompt: str = 'blue object .'
     box_threshold: float = 0.25
     text_threshold: float = 0.25
     min_exec_score: float = 0.5
@@ -66,7 +66,7 @@ class OfflineBias:
     """
     enable: bool = True
     ox: float = 0.00
-    oy: float = 0.0
+    oy: float = 0.01
     oz: float = -0.03
 
 
@@ -76,9 +76,9 @@ class Control:
     ik_link_name: str = 'tool0'
     ik_timeout: float = 2.0
     controller_topic: str = '/scaled_joint_trajectory_controller/joint_trajectory'
-    move_time: float = 3.0
+    move_time: float = 1.5
     hover_above: float = 0.30
-    init_move_time: float = 5.0
+    init_move_time: float = 3.0
     init_extra_wait: float = 0.3
     joint_order: List[str] = field(default_factory=lambda: [
         'shoulder_pan_joint',
@@ -112,7 +112,7 @@ class Circle:
     orient_mode: str = 'radial_in'
     tool_z_sign: str = '-'
     dwell_time: float = 1.0
-    edge_move_time: float = 3.0
+    edge_move_time: float = 1.5
 
 
 @dataclass
