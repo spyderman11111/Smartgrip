@@ -3,24 +3,7 @@
 
 """
 Aria live RGB + EyeTrack -> gaze reprojection -> SAM2 point-prompt segmentation (local/offline weights)
-
-Key features:
-- Start Aria live streaming over USB/WiFi
-- Subscribe to RGB + EyeTrack only
-- Run EyeGaze inference on EyeTrack frames
-- Reproject gaze to RGB pixels using calibration from a VRS file
-- Print gaze pixel coordinates in the "rotated RGB display coordinate system"
-- Press 's' to run SAM2 point-prompt segmentation at current gaze pixel:
-    (1) rotated RGB (no overlay)
-    (2) binary mask
-    (3) white background cutout (object color preserved)
-- Show RGB (with gaze dot), EyeTrack, and SAM2 cutout in separate windows
-- Press 'q' or ESC to exit gracefully; Ctrl+C for fast exit
-
-Design goals:
-- Robust paths across different machines/users (avoid hard-coded /home/sz)
-- Easy to run with a short command (most paths live in USER CONFIG below)
-- Import-friendly: main logic is encapsulated in run(cfg), not executed at import time
+...
 """
 
 from __future__ import annotations
@@ -31,7 +14,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -46,79 +29,74 @@ from projectaria_tools.core.stream_id import StreamId
 
 
 # ============================================================
-# USER CONFIG (edit these once; then run with one simple command)
-# You can also override any of them via environment variables.
+# USER CONFIG
 # ============================================================
 
-# Calibration VRS file (used to load device + camera calibration for gaze reprojection)
 DEFAULT_CALIB_VRS = os.environ.get(
     "SMARTGRIP_ARIA_CALIB_VRS",
     "/home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs",
 )
 
-# Aria streaming profile name
 DEFAULT_PROFILE_NAME = os.environ.get("SMARTGRIP_ARIA_PROFILE", "profile18")
-
-# Inference device ("cuda" or "cpu")
 DEFAULT_DEVICE = os.environ.get("SMARTGRIP_DEVICE", "cuda")
-
-# Assumed gaze depth in meters for reprojection
 DEFAULT_GAZE_DEPTH_M = float(os.environ.get("SMARTGRIP_GAZE_DEPTH_M", "1.0"))
-
-# Aria RGB channel interpretation ("auto" recommended; try "bgr" if colors look wrong)
 DEFAULT_ARIA_RGB_FORMAT = os.environ.get("SMARTGRIP_ARIA_RGB_FORMAT", "auto")  # auto|rgb|bgr|gray
 
-# Local SAM2 repository root (Grounded-SAM-2)
 DEFAULT_SAM2_ROOT = os.environ.get("SMARTGRIP_SAM2_ROOT", "/home/MA_SmartGrip/Smartgrip/Grounded-SAM-2")
-
-# Local SAM2 checkpoint path
 DEFAULT_SAM2_CKPT = os.environ.get(
     "SMARTGRIP_SAM2_CKPT",
     "/home/MA_SmartGrip/Smartgrip/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt",
 )
-
-# SAM2 config YAML (absolute path is OK; we will convert it to a Hydra-friendly name)
-# User-provided path:
 DEFAULT_SAM2_CONFIG_FILE = os.environ.get(
     "SMARTGRIP_SAM2_CONFIG",
     "/home/MA_SmartGrip/Smartgrip/Grounded-SAM-2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml",
 )
 
-# SAM2 predictor post-processing knobs
 DEFAULT_SAM2_MASK_THRESHOLD = float(os.environ.get("SMARTGRIP_SAM2_MASK_THRESHOLD", "0.3"))
 DEFAULT_SAM2_MAX_HOLE_AREA = float(os.environ.get("SMARTGRIP_SAM2_MAX_HOLE_AREA", "100.0"))
 DEFAULT_SAM2_MAX_SPRINKLE_AREA = float(os.environ.get("SMARTGRIP_SAM2_MAX_SPRINKLE_AREA", "50.0"))
 
-# Save outputs to this directory (default: same directory as this script)
-DEFAULT_OUTPUT_DIR = os.environ.get("SMARTGRIP_OUTPUT_DIR", "")
+# ======= IMPORTANT CHANGE: default output dir fixed to your path =======
+DEFAULT_OUTPUT_DIR = os.environ.get(
+    "SMARTGRIP_OUTPUT_DIR",
+    "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage",
+)
+# =====================================================================
 
-from pathlib import Path
-import os
-
-# Local repo default (dynamic, no hard-coded username)
-DEFAULT_EYE_REPO_ROOT = Path(os.environ.get(
-    "SMARTGRIP_EYE_REPO_ROOT",
-    str(Path.home() / "Smartgrip" / "projectaria_eyetracking")
-)).expanduser()
+DEFAULT_EYE_REPO_ROOT = Path(
+    os.environ.get(
+        "SMARTGRIP_EYE_REPO_ROOT",
+        str(Path.home() / "Smartgrip" / "projectaria_eyetracking"),
+    )
+).expanduser()
 
 DEFAULT_EYE_WEIGHTS = os.environ.get(
     "SMARTGRIP_EYE_WEIGHTS",
-    str(DEFAULT_EYE_REPO_ROOT / "projectaria_eyetracking" / "inference" / "model" /
-        "pretrained_weights" / "social_eyes_uncertainty_v1" / "weights.pth")
+    str(
+        DEFAULT_EYE_REPO_ROOT
+        / "projectaria_eyetracking"
+        / "inference"
+        / "model"
+        / "pretrained_weights"
+        / "social_eyes_uncertainty_v1"
+        / "weights.pth"
+    ),
 )
 
 DEFAULT_EYE_CONFIG = os.environ.get(
     "SMARTGRIP_EYE_CONFIG",
-    str(DEFAULT_EYE_REPO_ROOT / "projectaria_eyetracking" / "inference" / "model" /
-        "pretrained_weights" / "social_eyes_uncertainty_v1" / "config.yaml")
+    str(
+        DEFAULT_EYE_REPO_ROOT
+        / "projectaria_eyetracking"
+        / "inference"
+        / "model"
+        / "pretrained_weights"
+        / "social_eyes_uncertainty_v1"
+        / "config.yaml"
+    ),
 )
 
 
-
-# ============================================================
-# Optional dependency from Project Aria samples:
-# - If not present, we just skip iptables update.
-# ============================================================
 try:
     from common import update_iptables  # type: ignore
 except Exception:  # pragma: no cover
@@ -126,9 +104,6 @@ except Exception:  # pragma: no cover
         return
 
 
-# ============================================================
-# EyeGazeInference import (robust across different package layouts)
-# ============================================================
 try:
     from projectaria_eyetracking.inference.infer import EyeGazeInference  # type: ignore
 except Exception:  # pragma: no cover
@@ -138,25 +113,20 @@ except Exception:  # pragma: no cover
 
 @dataclass
 class AppConfig:
-    # Streaming
     streaming_interface: str = "usb"   # usb|wifi
     device_ip: Optional[str] = None
     profile_name: str = DEFAULT_PROFILE_NAME
     update_iptables: bool = False
 
-    # Calibration + gaze
     calib_vrs: str = DEFAULT_CALIB_VRS
     gaze_depth_m: float = DEFAULT_GAZE_DEPTH_M
     aria_rgb_format: str = DEFAULT_ARIA_RGB_FORMAT  # auto|rgb|bgr|gray
 
-    # Compute device
     device: str = DEFAULT_DEVICE  # cuda|cpu
 
-    # EyeGaze model paths (can be auto-discovered)
-    eye_weights: Optional[str] = None
-    eye_config: Optional[str] = None
+    eye_weights: Optional[str] = DEFAULT_EYE_WEIGHTS
+    eye_config: Optional[str] = DEFAULT_EYE_CONFIG
 
-    # SAM2 local
     sam2_root: str = DEFAULT_SAM2_ROOT
     sam2_ckpt: str = DEFAULT_SAM2_CKPT
     sam2_config_file: str = DEFAULT_SAM2_CONFIG_FILE
@@ -164,13 +134,11 @@ class AppConfig:
     sam2_max_hole_area: float = DEFAULT_SAM2_MAX_HOLE_AREA
     sam2_max_sprinkle_area: float = DEFAULT_SAM2_MAX_SPRINKLE_AREA
 
-    # Output
-    output_dir: str = DEFAULT_OUTPUT_DIR  # empty => script directory
+    # ======= IMPORTANT CHANGE: now default is your output dir, not script dir =======
+    output_dir: str = DEFAULT_OUTPUT_DIR
+    # ============================================================================
 
 
-# ----------------------------
-# Path helpers
-# ----------------------------
 def _script_dir() -> Path:
     return Path(__file__).resolve().parent
 
@@ -189,46 +157,81 @@ def _ensure_dir(path: str, what: str) -> Path:
     return p
 
 
+def _candidate_pkg_roots_for(name: str) -> List[Path]:
+    import importlib.util
+    roots: List[Path] = []
+
+    spec = importlib.util.find_spec(name)
+    if spec and spec.submodule_search_locations:
+        for p in spec.submodule_search_locations:
+            try:
+                roots.append(Path(p).resolve())
+            except Exception:
+                pass
+
+    try:
+        pkg = __import__(name, fromlist=["__path__", "__file__"])
+        pkg_path = getattr(pkg, "__path__", None)
+        if pkg_path:
+            for p in pkg_path:
+                try:
+                    roots.append(Path(p).resolve())
+                except Exception:
+                    pass
+        pkg_file = getattr(pkg, "__file__", None)
+        if pkg_file:
+            try:
+                roots.append(Path(pkg_file).resolve().parent)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    uniq: List[Path] = []
+    seen = set()
+    for r in roots:
+        s = str(r)
+        if s not in seen:
+            uniq.append(r)
+            seen.add(s)
+    return uniq
+
+
 def find_default_eyegaze_assets() -> Tuple[Path, Path]:
-    """
-    Try to locate EyeGaze pretrained weights/config inside the installed package.
+    roots = _candidate_pkg_roots_for("projectaria_eyetracking")
 
-    This avoids hard-coded /home/<user>/... paths.
-    """
-    import projectaria_eyetracking  # type: ignore
+    def try_root(r: Path) -> Optional[Tuple[Path, Path]]:
+        base = r / "inference" / "model" / "pretrained_weights" / "social_eyes_uncertainty_v1"
+        w = base / "weights.pth"
+        c = base / "config.yaml"
+        if w.is_file() and c.is_file():
+            return w, c
 
-    pkg_root = Path(projectaria_eyetracking.__file__).resolve().parent
-    # Common layout used by the eyetracking repo
-    base = pkg_root / "inference" / "model" / "pretrained_weights" / "social_eyes_uncertainty_v1"
-    weights = base / "weights.pth"
-    config = base / "config.yaml"
+        base2 = r / "projectaria_eyetracking" / "inference" / "model" / "pretrained_weights" / "social_eyes_uncertainty_v1"
+        w2 = base2 / "weights.pth"
+        c2 = base2 / "config.yaml"
+        if w2.is_file() and c2.is_file():
+            return w2, c2
+        return None
 
-    if weights.is_file() and config.is_file():
-        return weights, config
-
-    # Fallback: search a bit (bounded, to keep it fast)
-    candidates = list(pkg_root.rglob("social_eyes_uncertainty_v1"))
-    for c in candidates[:10]:
-        w = c / "weights.pth"
-        y = c / "config.yaml"
-        if w.is_file() and y.is_file():
-            return w, y
+    for r in roots:
+        hit = try_root(r)
+        if hit:
+            return hit
 
     raise FileNotFoundError(
-        "Cannot auto-locate EyeGaze pretrained weights/config inside projectaria_eyetracking.\n"
-        f"Package root: {pkg_root}\n"
-        "Please pass --eye-weights and --eye-config explicitly, or ensure the package contains the pretrained assets."
+        "Cannot auto-locate EyeGaze pretrained weights/config inside pip package.\n"
+        "Tried package roots:\n  - " + "\n  - ".join(str(r) for r in roots) + "\n\n"
+        "Fix options:\n"
+        "1) Pass them explicitly:\n"
+        "   --eye-weights /path/to/weights.pth --eye-config /path/to/config.yaml\n"
+        "2) Or set env:\n"
+        "   SMARTGRIP_EYE_WEIGHTS=/path/to/weights.pth\n"
+        "   SMARTGRIP_EYE_CONFIG=/path/to/config.yaml\n"
     )
 
 
-# ----------------------------
-# SAM2 import + config resolution
-# ----------------------------
 def import_sam2_local(sam2_root: str):
-    """
-    Import SAM2 from a local Grounded-SAM-2 checkout.
-    We add sam2_root to sys.path so that `import sam2...` works.
-    """
     sam2_root = str(Path(sam2_root).expanduser().resolve())
     if sam2_root not in sys.path:
         sys.path.append(sam2_root)
@@ -247,27 +250,12 @@ def import_sam2_local(sam2_root: str):
 
 
 def sam2_hydra_config_name(sam2_root: str, sam2_config_file: str) -> Tuple[str, Path]:
-    """
-    Convert an absolute YAML path into a Hydra-friendly relative config name.
-
-    Example:
-        /.../Grounded-SAM-2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml
-    ->  configs/sam2.1/sam2.1_hiera_l.yaml
-
-    Returns:
-        (config_name_for_hydra, config_file_path_resolved)
-    """
     sam2_root_p = Path(sam2_root).expanduser().resolve()
     sam2_pkg_root = sam2_root_p / "sam2"
 
     cfg_path = Path(sam2_config_file).expanduser()
     if not cfg_path.is_absolute():
-        # Try a few likely locations
-        candidates = [
-            sam2_root_p / cfg_path,              # relative to repo root
-            sam2_pkg_root / cfg_path,            # relative to sam2 package root
-            Path.cwd() / cfg_path,               # relative to current working dir
-        ]
+        candidates = [sam2_root_p / cfg_path, sam2_pkg_root / cfg_path, Path.cwd() / cfg_path]
         cfg_resolved = None
         for c in candidates:
             if c.is_file():
@@ -286,17 +274,14 @@ def sam2_hydra_config_name(sam2_root: str, sam2_config_file: str) -> Tuple[str, 
     if not cfg_path.is_file():
         raise FileNotFoundError(f"SAM2 config file not found: {cfg_path}")
 
-    # Convert absolute path to "configs/..." relative to sam2 package root
     try:
         rel = cfg_path.relative_to(sam2_pkg_root)
         config_name = rel.as_posix()
     except Exception:
-        # If it is not under sam2_pkg_root, we can still attempt:
-        # - If it contains "/sam2/" segment, strip up to that.
         norm = cfg_path.as_posix()
         idx = norm.find("/sam2/")
         if idx >= 0:
-            config_name = norm[idx + len("/sam2/") :]
+            config_name = norm[idx + len("/sam2/"):]
         else:
             raise FileNotFoundError(
                 "SAM2 config file is not under <sam2_root>/sam2, Hydra may fail.\n"
@@ -304,7 +289,6 @@ def sam2_hydra_config_name(sam2_root: str, sam2_config_file: str) -> Tuple[str, 
                 f"sam2_config_file={cfg_path}\n"
                 "Please set sam2_config_file to a path under <sam2_root>/sam2/."
             )
-
     return config_name, cfg_path
 
 
@@ -318,20 +302,9 @@ def build_sam2_predictor(
     max_hole_area: float,
     max_sprinkle_area: float,
 ):
-    """
-    Build SAM2 image predictor.
-
-    Note:
-    - Some forks use build_sam2(config_file=..., ckpt_path=..., device=...)
-      others use positional args. We support both.
-    """
     ckpt_p = _ensure_file(ckpt_path, "SAM2 checkpoint")
     try:
-        sam_model = build_sam2_fn(
-            config_file=config_name_for_hydra,
-            ckpt_path=str(ckpt_p),
-            device=device,
-        )
+        sam_model = build_sam2_fn(config_file=config_name_for_hydra, ckpt_path=str(ckpt_p), device=device)
     except TypeError:
         sam_model = build_sam2_fn(config_name_for_hydra, str(ckpt_p), device)
 
@@ -344,9 +317,6 @@ def build_sam2_predictor(
     return predictor
 
 
-# ----------------------------
-# Calibration loading
-# ----------------------------
 def load_calibration_from_vrs(vrs_path: str):
     provider = data_provider.create_vrs_data_provider(vrs_path)
     rgb_stream_id = StreamId("214-1")
@@ -356,15 +326,11 @@ def load_calibration_from_vrs(vrs_path: str):
     return device_calibration, rgb_camera_calibration, rgb_stream_label
 
 
-# ----------------------------
-# Image color interpretation helpers
-# ----------------------------
 def _to_bgr_for_imshow(rotated: np.ndarray, fmt: str) -> np.ndarray:
     if rotated.ndim == 2 or fmt == "gray":
         return cv2.cvtColor(rotated, cv2.COLOR_GRAY2BGR)
     if fmt == "bgr":
         return rotated.copy()
-    # "rgb" or "auto": assume rotated is RGB
     return cv2.cvtColor(rotated, cv2.COLOR_RGB2BGR)
 
 
@@ -373,44 +339,24 @@ def _to_rgb_for_sam(rotated: np.ndarray, fmt: str) -> np.ndarray:
         return cv2.cvtColor(rotated, cv2.COLOR_GRAY2RGB)
     if fmt == "bgr":
         return cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB)
-    return rotated.copy()  # "rgb" or "auto"
+    return rotated.copy()
 
 
 def preprocess_image_for_display(image_raw: np.ndarray, aria_rgb_format: str) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Rotate raw image into the display orientation (clockwise 90 deg),
-    then return BGR image for OpenCV display.
-    """
     rotated = np.rot90(image_raw, -1)
-
-    fmt = aria_rgb_format
-    if fmt == "auto":
-        fmt = "rgb"
-
+    fmt = aria_rgb_format if aria_rgb_format != "auto" else "rgb"
     vis_bgr = _to_bgr_for_imshow(rotated, fmt)
     return vis_bgr, image_raw
 
 
 def get_rotated_rgb_for_sam(image_raw: np.ndarray, aria_rgb_format: str) -> np.ndarray:
-    """
-    Rotate raw RGB to display orientation, return HWC RGB for SAM2.
-    """
     rotated = np.rot90(image_raw, -1)
-
-    fmt = aria_rgb_format
-    if fmt == "auto":
-        fmt = "rgb"
-
+    fmt = aria_rgb_format if aria_rgb_format != "auto" else "rgb"
     rgb = _to_rgb_for_sam(rotated, fmt)
     return rgb
 
 
 def rotate_point_cw90(x: float, y: float, h_raw: int, w_raw: int) -> Tuple[float, float]:
-    """
-    Map a point (x, y) in the raw image into the rotated (clockwise 90 deg) coordinate system.
-    Raw image size: (H, W)
-    Rotated size: (W, H)
-    """
     x_rot = h_raw - 1 - y
     y_rot = x
     return x_rot, y_rot
@@ -424,33 +370,14 @@ def clamp_point(x: float, y: float, w: int, h: int) -> Tuple[int, int]:
     return xi, yi
 
 
-# ----------------------------
-# Output utilities
-# ----------------------------
 def make_cutout_whitebg_rgb(rgb_rot_rgb: np.ndarray, mask_bool: np.ndarray) -> np.ndarray:
-    """
-    White background cutout:
-    - background: white (255)
-    - foreground (mask): original RGB colors
-    """
     h, w = rgb_rot_rgb.shape[:2]
     out = np.full((h, w, 3), 255, dtype=np.uint8)
     out[mask_bool] = rgb_rot_rgb[mask_bool]
     return out
 
 
-def save_three_outputs(
-    rgb_rot_rgb: np.ndarray,
-    mask_bool: np.ndarray,
-    out_dir: Path,
-    prefix: str = "gaze_sam2",
-):
-    """
-    Save:
-    1) rotated RGB (no overlay)
-    2) binary mask
-    3) white background cutout
-    """
+def save_three_outputs(rgb_rot_rgb: np.ndarray, mask_bool: np.ndarray, out_dir: Path, prefix: str = "gaze_sam2"):
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
 
@@ -468,19 +395,10 @@ def save_three_outputs(
     print(f"[Saved] rgb_rot        : {rgb_path}")
     print(f"[Saved] mask_bin       : {mask_path}")
     print(f"[Saved] cutout_whitebg : {cutout_path}")
-
     return rgb_path, mask_path, cutout_path, cutout_rgb
 
 
-# ----------------------------
-# Streaming observer
-# ----------------------------
 class EyeRgbStreamingClientObserver:
-    """
-    - EyeTrack frames: run EyeGazeInference, update yaw/pitch
-    - RGB frames: reproject current gaze to RGB pixels using calibration, update pixel coords
-    """
-
     def __init__(
         self,
         inference_model: EyeGazeInference,
@@ -493,27 +411,18 @@ class EyeRgbStreamingClientObserver:
         print_interval_s: float = 0.05,
     ) -> None:
         self.images = {}
-
         self.inference_model = inference_model
         self.device_calibration = device_calibration
         self.rgb_camera_calibration = rgb_camera_calibration
         self.rgb_stream_label = rgb_stream_label
-
         self.depth_m = depth_m
         self.torch_device = torch_device
         self.aria_rgb_format = aria_rgb_format
 
-        self.latest_gaze = {
-            "yaw": None,
-            "pitch": None,
-            "timestamp_ns": None,
-            "pixel_raw": None,
-            "pixel_rot": None,
-        }
-
+        self.latest_gaze = {"yaw": None, "pitch": None, "timestamp_ns": None, "pixel_raw": None, "pixel_rot": None}
         self.latest_rgb_raw = None
         self.latest_rgb_rot = None
-        self.latest_rgb_rot_shape = None  # (H, W) of rotated image
+        self.latest_rgb_rot_shape = None
 
         self._last_print_t = 0.0
         self._print_interval = print_interval_s
@@ -521,7 +430,6 @@ class EyeRgbStreamingClientObserver:
     def on_image_received(self, image: np.ndarray, record: ImageDataRecord) -> None:
         camera_id = record.camera_id
         self.images[camera_id] = image
-
         if camera_id == aria.CameraId.EyeTrack:
             self._handle_eye_frame(image, record)
         elif camera_id == aria.CameraId.Rgb:
@@ -531,18 +439,13 @@ class EyeRgbStreamingClientObserver:
         img_tensor = torch.tensor(image, device=self.torch_device)
         with torch.no_grad():
             preds, _, _ = self.inference_model.predict(img_tensor)
-
         preds = preds.detach().cpu().numpy()
-        yaw = float(preds[0][0])
-        pitch = float(preds[0][1])
-
-        self.latest_gaze["yaw"] = yaw
-        self.latest_gaze["pitch"] = pitch
+        self.latest_gaze["yaw"] = float(preds[0][0])
+        self.latest_gaze["pitch"] = float(preds[0][1])
         self.latest_gaze["timestamp_ns"] = int(record.capture_timestamp_ns)
 
     def _handle_rgb_frame(self, image: np.ndarray, record: ImageDataRecord) -> None:
         self.latest_rgb_raw = image
-
         rgb_rot = get_rotated_rgb_for_sam(image, self.aria_rgb_format)
         self.latest_rgb_rot = rgb_rot
         self.latest_rgb_rot_shape = rgb_rot.shape[:2]
@@ -552,7 +455,6 @@ class EyeRgbStreamingClientObserver:
         if yaw is None or pitch is None:
             return
 
-        # IMPORTANT: create an instance (not the class object)
         eg = EyeGaze()
         eg.yaw = yaw
         eg.pitch = pitch
@@ -565,7 +467,6 @@ class EyeRgbStreamingClientObserver:
             self.rgb_camera_calibration,
             self.depth_m,
         )
-
         if gaze_projection is None:
             self.latest_gaze["pixel_raw"] = None
             self.latest_gaze["pixel_rot"] = None
@@ -574,7 +475,6 @@ class EyeRgbStreamingClientObserver:
         x_raw, y_raw = float(gaze_projection[0]), float(gaze_projection[1])
         h_raw, w_raw = image.shape[:2]
         x_rot, y_rot = rotate_point_cw90(x_raw, y_raw, h_raw, w_raw)
-
         self.latest_gaze["pixel_raw"] = (x_raw, y_raw)
         self.latest_gaze["pixel_rot"] = (x_rot, y_rot)
 
@@ -586,9 +486,6 @@ class EyeRgbStreamingClientObserver:
             print(f"[GazePixel] ({gx}, {gy})  size=({w_rot}x{h_rot})")
 
 
-# ----------------------------
-# Streaming setup
-# ----------------------------
 def start_device_streaming(streaming_interface: str, profile_name: str, device_ip: Optional[str]):
     device_client = aria.DeviceClient()
     client_config = aria.DeviceClientConfig()
@@ -605,7 +502,6 @@ def start_device_streaming(streaming_interface: str, profile_name: str, device_i
 
     streaming_config = aria.StreamingConfig()
     streaming_config.profile_name = profile_name
-
     if streaming_interface == "usb":
         streaming_config.streaming_interface = aria.StreamingInterface.Usb
     elif streaming_interface == "wifi":
@@ -613,11 +509,10 @@ def start_device_streaming(streaming_interface: str, profile_name: str, device_i
 
     streaming_config.security_options.use_ephemeral_certs = True
     streaming_manager.streaming_config = streaming_config
-
     streaming_manager.start_streaming()
+
     print(f"[StreamingManager] Started: profile={profile_name}, interface={streaming_interface}")
     print(f"[StreamingManager] State: {streaming_manager.streaming_state}")
-
     return device_client, device, streaming_manager, streaming_client
 
 
@@ -630,27 +525,10 @@ def configure_streaming_client_rgb_eye(streaming_client: aria.StreamingClient) -
     options = aria.StreamingSecurityOptions()
     options.use_ephemeral_certs = True
     config.security_options = options
-
     streaming_client.subscription_config = config
 
 
-# ----------------------------
-# SAM2 inference with gaze point
-# ----------------------------
-def run_sam2_with_gaze_point(
-    sam2_predictor,
-    rgb_rot_rgb: np.ndarray,
-    gaze_xy: Tuple[int, int],
-    multimask_output: bool = True,
-):
-    """
-    SAM2 point-prompt segmentation at the gaze pixel.
-
-    Selection rule when multimask_output=True:
-    - Prefer masks that contain the gaze pixel
-    - Among them pick the max IoU
-    - If none contains gaze pixel, fall back to global max IoU
-    """
+def run_sam2_with_gaze_point(sam2_predictor, rgb_rot_rgb: np.ndarray, gaze_xy: Tuple[int, int], multimask_output: bool = True):
     sam2_predictor.set_image(rgb_rot_rgb)
 
     gx, gy = gaze_xy
@@ -677,12 +555,10 @@ def run_sam2_with_gaze_point(
             m = masks[i]
             if 0 <= gy < m.shape[0] and 0 <= gx < m.shape[1] and bool(m[gy, gx]):
                 contain.append(i)
-
         if contain:
             best_idx = contain[int(np.argmax(ious[contain]))]
         else:
             best_idx = int(np.argmax(ious)) if len(ious) else 0
-
         mask = masks[best_idx].astype(bool)
         score = float(ious[best_idx]) if len(ious) else 0.0
     else:
@@ -692,22 +568,12 @@ def run_sam2_with_gaze_point(
     return mask, score
 
 
-# ============================================================
-# CLI
-# ============================================================
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Aria live RGB+EyeTrack with gaze->SAM2 point prompt (offline/local)."
-    )
-
+    p = argparse.ArgumentParser(description="Aria live RGB+EyeTrack with gaze->SAM2 point prompt (offline/local).")
     p.add_argument("--interface", type=str, required=True, choices=["usb", "wifi"], help="Streaming interface.")
     p.add_argument("--device-ip", type=str, default=None, help="Aria IP when interface=wifi.")
     p.add_argument("--update_iptables", action="store_true", help="Update iptables to allow UDP (Linux).")
-
-    # Keep CLI minimal: VRS can be omitted if you set DEFAULT_CALIB_VRS at top
-    p.add_argument("--calib-vrs", type=str, default="", help="Calibration VRS path (optional if set in USER CONFIG).")
-
-    # Optional overrides (usually you don't need them)
+    p.add_argument("--calib-vrs", type=str, default="", help="Calibration VRS path.")
     p.add_argument("--profile", type=str, default="", help="Streaming profile name override.")
     p.add_argument("--device", type=str, default="", help="cuda or cpu override.")
     p.add_argument("--aria-rgb-format", type=str, default="", choices=["", "auto", "rgb", "bgr", "gray"], help="Override RGB format.")
@@ -732,31 +598,24 @@ def build_config_from_args(args: argparse.Namespace) -> AppConfig:
 
     if args.calib_vrs.strip():
         cfg.calib_vrs = args.calib_vrs.strip()
-
     if args.profile.strip():
         cfg.profile_name = args.profile.strip()
-
     if args.device.strip():
         cfg.device = args.device.strip()
-
     if args.aria_rgb_format.strip():
         cfg.aria_rgb_format = args.aria_rgb_format.strip()
-
     if args.gaze_depth > 0:
         cfg.gaze_depth_m = float(args.gaze_depth)
 
     if args.eye_weights.strip():
         cfg.eye_weights = args.eye_weights.strip()
-
     if args.eye_config.strip():
         cfg.eye_config = args.eye_config.strip()
 
     if args.sam2_root.strip():
         cfg.sam2_root = args.sam2_root.strip()
-
     if args.sam2_ckpt.strip():
         cfg.sam2_ckpt = args.sam2_ckpt.strip()
-
     if args.sam2_config.strip():
         cfg.sam2_config_file = args.sam2_config.strip()
 
@@ -766,11 +625,7 @@ def build_config_from_args(args: argparse.Namespace) -> AppConfig:
     return cfg
 
 
-# ============================================================
-# Main run loop (import-friendly)
-# ============================================================
 def run(cfg: AppConfig) -> None:
-    # Optional: helps debug Hydra issues with full trace
     os.environ.setdefault("HYDRA_FULL_ERROR", "1")
 
     if cfg.update_iptables and sys.platform.startswith("linux"):
@@ -778,17 +633,19 @@ def run(cfg: AppConfig) -> None:
 
     aria.set_log_level(aria.Level.Info)
 
-    # Resolve output dir
+    # ======= IMPORTANT CHANGE: output dir always resolves to your path (or CLI/env override) =======
     out_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else _script_dir()
+    # ===========================================================================================
 
-    # 1) Load calibration
     calib_vrs_p = _ensure_file(cfg.calib_vrs, "Calibration VRS")
     print(f"[Calib] Loading from VRS: {calib_vrs_p}")
     device_calibration, rgb_camera_calibration, rgb_stream_label = load_calibration_from_vrs(str(calib_vrs_p))
     print(f"[Calib] RGB stream label: {rgb_stream_label}")
 
-    # 2) EyeGazeInference assets (auto-discover if not specified)
-    if cfg.eye_weights is None or cfg.eye_config is None:
+    eye_w_path = Path(cfg.eye_weights).expanduser() if cfg.eye_weights else None
+    eye_y_path = Path(cfg.eye_config).expanduser() if cfg.eye_config else None
+    if not (eye_w_path and eye_w_path.is_file() and eye_y_path and eye_y_path.is_file()):
+        print("[Model] Eye assets not found at cfg paths, trying auto-discovery from pip package...")
         w, y = find_default_eyegaze_assets()
         cfg.eye_weights = str(w)
         cfg.eye_config = str(y)
@@ -800,13 +657,10 @@ def run(cfg: AppConfig) -> None:
     print(f"        device : {cfg.device}")
     print(f"        weights: {eye_w}")
     print(f"        config : {eye_y}")
-
     inference_model = EyeGazeInference(str(eye_w), str(eye_y), cfg.device)
 
-    # 3) SAM2 local predictor
     sam2_root_p = _ensure_dir(cfg.sam2_root, "SAM2 repo root")
     build_sam2_fn, predictor_cls = import_sam2_local(str(sam2_root_p))
-
     cfg_name, cfg_file_resolved = sam2_hydra_config_name(str(sam2_root_p), cfg.sam2_config_file)
     _ensure_file(cfg.sam2_ckpt, "SAM2 checkpoint")
 
@@ -827,14 +681,12 @@ def run(cfg: AppConfig) -> None:
         max_sprinkle_area=cfg.sam2_max_sprinkle_area,
     )
 
-    # 4) Start streaming
     device_client, device, streaming_manager, streaming_client = start_device_streaming(
         streaming_interface=cfg.streaming_interface,
         profile_name=cfg.profile_name,
         device_ip=cfg.device_ip,
     )
 
-    # 5) Subscribe RGB+EyeTrack
     configure_streaming_client_rgb_eye(streaming_client)
 
     observer = EyeRgbStreamingClientObserver(
@@ -849,7 +701,6 @@ def run(cfg: AppConfig) -> None:
     streaming_client.set_streaming_client_observer(observer)
     streaming_client.subscribe()
 
-    # 6) Windows
     rgb_window = "Aria RGB (Gaze)"
     eye_window = "Aria EyeTrack"
     sam_window = "SAM2 Cutout Preview"
@@ -880,7 +731,6 @@ def run(cfg: AppConfig) -> None:
 
     try:
         while True:
-            # RGB display
             if aria.CameraId.Rgb in observer.images:
                 rgb_raw = observer.images.pop(aria.CameraId.Rgb)
                 rgb_vis_bgr, _ = preprocess_image_for_display(rgb_raw, cfg.aria_rgb_format)
@@ -893,24 +743,18 @@ def run(cfg: AppConfig) -> None:
 
                 cv2.imshow(rgb_window, rgb_vis_bgr)
 
-            # EyeTrack display
             if aria.CameraId.EyeTrack in observer.images:
                 eye_raw = observer.images.pop(aria.CameraId.EyeTrack)
                 eye_vis_bgr, _ = preprocess_image_for_display(eye_raw, "gray")
                 cv2.imshow(eye_window, eye_vis_bgr)
 
-            # SAM2 preview display
             if latest_cutout_bgr is not None:
                 cv2.imshow(sam_window, latest_cutout_bgr)
 
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("s"):
-                if (
-                    observer.latest_rgb_rot is None
-                    or observer.latest_rgb_rot_shape is None
-                    or observer.latest_gaze.get("pixel_rot") is None
-                ):
+                if observer.latest_rgb_rot is None or observer.latest_rgb_rot_shape is None or observer.latest_gaze.get("pixel_rot") is None:
                     print("[SAM2] No valid RGB/gaze yet.")
                     continue
 
@@ -981,4 +825,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

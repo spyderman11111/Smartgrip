@@ -1,8 +1,23 @@
 source /home/MA_SmartGrip/Smartgrip/aria/bin/activate
 
-USB：python stream_rgb_eye_sam2.py --interface usb
+需要修改源码/home/MA_SmartGrip/Smartgrip/projectaria_eyetracking/projectaria_eyetracking/inference/model/model_utils.py
+line 203 model_buffer = torch.load(chkpt_path, map_location=map_location, weights_only=False)
 
-WiFi：python stream_rgb_eye_sam2.py --interface wifi --device-ip 192.168.0.102
+python /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/stream_rgb_eye_sam2.py \
+  --interface usb \
+  --calib-vrs /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs \
+  --output-dir /home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage
+
+
+python /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/stream_rgb_eye_sam2.py \
+  --interface wifi \
+  --device-ip 192.168.0.102 \
+  --calib-vrs /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs \
+  --update_iptables \
+  --output-dir /home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage
+
+
+
 
 source /home/MA_SmartGrip/Smartgrip/py310/bin/activate
 source install/setup.bash 

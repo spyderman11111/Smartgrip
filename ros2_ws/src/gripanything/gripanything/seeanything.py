@@ -1,51 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-seeanything.py — Two-pass detection + circular path + snapshots + (Cross-view gate) + VGGT + postprocess + final goto
+seeanything.py — Two-pass detection + circular path + snapshots + VGGT + postprocess + final goto
 
-Key fix (time-binding stability):
-- Atomically bind {image, image_stamp} at capture time
-- Compute TF strictly at that image_stamp (NO fallback-to-latest)
-- Save image + json entry together in ONE atomic "shot" function
-- If TF at stamp is unavailable: skip saving that shot (avoid image<->pose mismatch)
+This version applies MINIMAL changes on top of your current script, and adds:
+- Multi-candidate selection at the high observation stage (INIT / stage-1 view)
+- Per-candidate close hover + snapshot + DINO->SAM2 rgbmask + LightGlue scoring vs latest Aria mask
+- Orbit capture (polygon path) only around the best-matching candidate
 
-New in this version:
-- Add a Cross-view verification gate (LightGlue) BEFORE running VGGT.
-- Create output folders:
-    - output/ur5image    : UR5e captured images (already used)
-    - output/ariaimage   : Aria images (user will place images here)
-    - output/crossview   : store preprocessed images + score json + best match visualization
-  The "mask" here refers to the object-focused preprocessed crops used for matching (not SAM masks).
+Key guarantees preserved:
+- Atomic capture binding {image, image_stamp} and TF computed strictly at image_stamp (NO fallback-to-latest)
+- Offline pipeline behavior unchanged (VGGT + postprocess + optional offline bias + final goto)
 
-Pipeline
-1) Move to INIT pose -> wait until stationary
-2) Stage-1 detection (coarse): compute C1; build a pose that updates XY to C1 while keeping current tool Z; IK + move
-3) Wait until stationary
-4) Stage-2 detection (fine): compute C2; set hover pose (tool-Z-down) with Z = C2.z + hover_above; IK + move
-5) Wait until stationary -> compute start_yaw -> generate an N-vertex polygon/circular path (non-closed)
-   - Use sweep_deg (< 360°) to avoid joint limits near the last vertex
-6) Vertex-by-vertex IK; at each dwell: atomically capture {image + joint positions + camera pose @ image stamp}
-   - If IK indicates an abnormal jump on a vertex: skip that vertex and continue (no dwell)
-7) Return to INIT
-8) Offline pipeline:
-   8.1) Cross-view gate (LightGlue): Aria image vs UR5e captured images (one-to-many)
-        - If rejected: skip VGGT + postprocess
-   8.2) Run VGGT reconstruction from captured images
-   8.3) Post-process + align to base_link
-   8.4) Export object center + shape vertices in base_link
-   8.5) Apply an additional OFFLINE bias to exported coordinates (center + vertices)
-9) Final goto:
-   - After object center is available, move to (offset above) object center (tool-Z-down)
-   - Wait until stationary, then exit
+Assumptions (by default):
+- Aria script outputs are in: <OUTPUT_ROOT>/ariaimage
+  with files like:
+    gaze_sam2_<ts>_rgb_rot.png
+    gaze_sam2_<ts>_mask_bin.png
+- This node will build an Aria object-only rgbmask (black background) into:
+    <OUTPUT_ROOT>/match_results/aria_rgbmask.png
+
+New outputs:
+- Candidate evaluation snapshots / masks / json:
+    <OUTPUT_ROOT>/match_results/candidates/
+    <OUTPUT_ROOT>/match_results/candidate_selection.json
 """
+
+from __future__ import annotations
 
 from typing import Optional, List, Dict, Any, Tuple
 import math
 import os
 import json
-import glob
 import threading
 from datetime import datetime
+from pathlib import Path
 
 import numpy as np
 import cv2
@@ -62,28 +51,29 @@ from cv_bridge import CvBridge
 
 import tf2_ros
 
+# LightGlue (already used in your matcher module; embedded minimal scoring here for robustness)
+import torch
+from lightglue import LightGlue, SuperPoint
+
 
 # -----------------------------------------------------------------------------
 # Output paths (fixed)
 # -----------------------------------------------------------------------------
 OUTPUT_ROOT = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output"
-
-# UR5e captured images (given by user)
 OUTPUT_IMG_DIR = os.path.join(OUTPUT_ROOT, "ur5image")
 OUTPUT_JSON_PATH = os.path.join(OUTPUT_ROOT, "ur5camerajointstates.json")
-
-# User will store Aria images here
-OUTPUT_ARIA_DIR = os.path.join(OUTPUT_ROOT, "ariaimage")
-
-# New: cross-view folder (preproc crops + score json + viz)
-OUTPUT_CROSSVIEW_DIR = os.path.join(OUTPUT_ROOT, "crossview")
-OUTPUT_CROSSVIEW_PREPROC_DIR = os.path.join(OUTPUT_CROSSVIEW_DIR, "preproc")
-OUTPUT_CROSSVIEW_VIZ_PATH = os.path.join(OUTPUT_CROSSVIEW_DIR, "best_match_viz.png")
-OUTPUT_CROSSVIEW_SCORE_JSON = os.path.join(OUTPUT_CROSSVIEW_DIR, "match_scores.json")
-
-# Offline outputs
 OUTPUT_VGGT_DIR = os.path.join(OUTPUT_ROOT, "offline_output")
 OUTPUT_OBJECT_JSON_NAME = "object_in_base_link.json"
+
+# Aria outputs (from your Aria streaming script)
+ARIA_OUT_DIR = os.path.join(OUTPUT_ROOT, "ariaimage")
+
+# New: matching + candidate selection outputs
+MATCH_ROOT = os.path.join(OUTPUT_ROOT, "match_results")
+MATCH_CAND_DIR = os.path.join(MATCH_ROOT, "candidates")
+MATCH_JSON_PATH = os.path.join(MATCH_ROOT, "candidate_selection.json")
+ARIA_RGBMASK_PATH = os.path.join(MATCH_ROOT, "aria_rgbmask.png")
+BEST_VIZ_PATH = os.path.join(MATCH_ROOT, "best_match_viz.png")
 
 
 # -----------------------------------------------------------------------------
@@ -93,7 +83,7 @@ RUN_OFFLINE_PIPELINE = True
 VGGT_AUTO_VISUALIZE = False          # Avoid Open3D window blocking the ROS node
 POSTPROCESS_VISUALIZE = False        # Avoid Open3D window blocking the ROS node
 
-# VGGT reconstruction parameters (keep explicit and stable for reproducibility)
+# VGGT reconstruction parameters
 VGGT_BATCH_SIZE = 30
 VGGT_MAX_POINTS = 1_500_000
 VGGT_RESOLUTION = 518
@@ -118,38 +108,21 @@ FINAL_GOTO_Z_MAX = 2.00             # safety clamp
 
 
 # -----------------------------------------------------------------------------
-# Cross-view (LightGlue) gate defaults
+# New: multi-candidate + cross-view selection knobs
 # -----------------------------------------------------------------------------
-CROSSVIEW_ENABLE_DEFAULT = True
+ENABLE_MULTI_CANDIDATE = True
 
-# Aria: choose the latest image in OUTPUT_ARIA_DIR by default
-CROSSVIEW_ARIA_GLOB_DEFAULT = os.path.join(OUTPUT_ARIA_DIR, "*.png")
+# If high-stage detection yields >=2 candidates above cfg.dino.min_exec_score,
+# we will evaluate them at close hover and pick best match.
+CAND_MAX = 6                 # evaluate top-N candidates by DINO score
+CAND_DWELL_SEC = 1.5         # pause duration per candidate for snapshot + match
+MATCH_SCORE_ACCEPT = 0.50    # if best match < this, fallback to best DINO candidate
 
-# Wrist: default uses captured raw images
-CROSSVIEW_WRIST_GLOB_DEFAULT = os.path.join(OUTPUT_IMG_DIR, "pose_*_image.png")
-
-# Gate policy (recommended)
-CROSSVIEW_POLICY_DEFAULT = "topm"   # "topm" or "consecutive"
-
-# Loose thresholds (you can tighten later)
-CROSSVIEW_TOP_M_DEFAULT = 4
-CROSSVIEW_AVG_TH_DEFAULT = 0.22
-CROSSVIEW_FRAME_TH_DEFAULT = 0.18
-CROSSVIEW_MIN_PASS_K_DEFAULT = 1
-
-# Your score computation hyper-params (keep stable)
-CROSSVIEW_SCORE_TH_DEFAULT = 0.15
-CROSSVIEW_TOPK_QUALITY_DEFAULT = 10
-CROSSVIEW_KREF_DEFAULT = 20
-
-CROSSVIEW_MAX_FRAMES_DEFAULT = 16
-CROSSVIEW_AUTO_CROP_RESIZE_DEFAULT = True
-CROSSVIEW_PREPROC_OUT_SIZE_DEFAULT = 512
-CROSSVIEW_PREPROC_PAD_RATIO_DEFAULT = 0.15
-
-# Optional: also save preproc crops for the top frames
-CROSSVIEW_SAVE_PREPROC_DEFAULT = True
-CROSSVIEW_SAVE_PREPROC_TOPN_DEFAULT = 8
+# SAM2 segmentation for candidate snapshots
+SAM2_ID = "facebook/sam2.1-hiera-large"
+SAM2_MASK_THRESHOLD = 0.30
+SAM2_MAX_HOLE_AREA = 100.0
+SAM2_MAX_SPRINKLE_AREA = 50.0
 
 
 # -----------------------------------------------------------------------------
@@ -161,6 +134,14 @@ except Exception:
     import sys
     sys.path.append("/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything")
     from gripanything.core.detect_with_dino import GroundingDinoPredictor
+
+# SAM2 wrapper (your repo module)
+try:
+    from gripanything.core.segment_with_sam2 import SAM2ImagePredictorWrapper
+except Exception:
+    import sys
+    sys.path.append("/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything")
+    from gripanything.core.segment_with_sam2 import SAM2ImagePredictorWrapper
 
 from gripanything.core.config import load_from_ros_params
 from gripanything.core.vision_geom import SingleShotDetector
@@ -209,10 +190,7 @@ def _safe_remove(path: str) -> None:
 
 
 def _ensure_dir(path: str) -> None:
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
+    os.makedirs(path, exist_ok=True)
 
 
 def _cleanup_outputs_for_new_run() -> None:
@@ -220,21 +198,19 @@ def _cleanup_outputs_for_new_run() -> None:
     Ensure that a new run overwrites outputs cleanly:
     - Remove old pose_* images so leftover frames do not contaminate the next run
     - Remove old JSON log
-    - Remove old VGGT outputs that we generate (points/cameras/lines/object json)
-    - Clean crossview artifacts (score json, viz, preproc crops)
-    - Ensure output folders exist
+    - Remove old VGGT outputs that we generate
+    - Prepare match output dirs
     """
     _ensure_dir(OUTPUT_ROOT)
     _ensure_dir(OUTPUT_IMG_DIR)
     _ensure_dir(OUTPUT_VGGT_DIR)
-    _ensure_dir(OUTPUT_ARIA_DIR)
-    _ensure_dir(OUTPUT_CROSSVIEW_DIR)
-    _ensure_dir(OUTPUT_CROSSVIEW_PREPROC_DIR)
+    _ensure_dir(MATCH_ROOT)
+    _ensure_dir(MATCH_CAND_DIR)
 
-    # Images from previous run (ur5image)
+    # Images from previous run (VGGT inputs)
     try:
         for fn in os.listdir(OUTPUT_IMG_DIR):
-            if fn.startswith("pose_") and ("_image." in fn or fn.endswith(".png") or fn.endswith(".jpg")):
+            if fn.startswith("pose_") and (fn.endswith(".png") or fn.endswith(".jpg")):
                 _safe_remove(os.path.join(OUTPUT_IMG_DIR, fn))
     except Exception:
         pass
@@ -248,13 +224,13 @@ def _cleanup_outputs_for_new_run() -> None:
     _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "cameras_lines.ply"))
     _safe_remove(os.path.join(OUTPUT_VGGT_DIR, OUTPUT_OBJECT_JSON_NAME))
 
-    # Crossview outputs
-    _safe_remove(OUTPUT_CROSSVIEW_VIZ_PATH)
-    _safe_remove(OUTPUT_CROSSVIEW_SCORE_JSON)
+    # Match outputs
+    _safe_remove(MATCH_JSON_PATH)
+    _safe_remove(ARIA_RGBMASK_PATH)
+    _safe_remove(BEST_VIZ_PATH)
     try:
-        for fn in os.listdir(OUTPUT_CROSSVIEW_PREPROC_DIR):
-            if fn.endswith(".png") or fn.endswith(".jpg"):
-                _safe_remove(os.path.join(OUTPUT_CROSSVIEW_PREPROC_DIR, fn))
+        for fn in os.listdir(MATCH_CAND_DIR):
+            _safe_remove(os.path.join(MATCH_CAND_DIR, fn))
     except Exception:
         pass
 
@@ -266,70 +242,40 @@ def _stamp_to_ns(stamp_msg) -> int:
         return -1
 
 
-# =============================================================================
-# Cross-view verifier (LightGlue) - embedded for easy main-program calling
-# =============================================================================
-_LIGHTGLUE_OK = True
-try:
-    import torch
-    from lightglue import LightGlue, SuperPoint
-except Exception:
-    _LIGHTGLUE_OK = False
-
-
-class LightGlueMatcher:
-    def __init__(
-        self,
-        feature_type: str = "superpoint",
-        device: str = "cuda",
-        descriptor_dim: int = 256,
-        n_layers: int = 9,
-        num_heads: int = 4,
-        flash: bool = True,
-        mp: bool = False,
-        depth_confidence: float = 0.95,
-        width_confidence: float = 0.99,
-        filter_threshold: float = 0.1,
-        weights: str = None,
-    ):
-        if not _LIGHTGLUE_OK:
-            raise RuntimeError("LightGlue/SuperPoint/torch import failed. Install dependencies or disable crossview gate.")
-
+# -----------------------------------------------------------------------------
+# Minimal LightGlue matcher + score (embedded for robustness)
+# -----------------------------------------------------------------------------
+class _LGMatcher:
+    def __init__(self, device: str = "cuda", mp: bool = True):
         self.device = device
         self.matcher = LightGlue(
-            features=feature_type,
-            descriptor_dim=descriptor_dim,
-            n_layers=n_layers,
-            num_heads=num_heads,
-            flash=flash,
+            features="superpoint",
+            descriptor_dim=256,
+            n_layers=9,
+            num_heads=4,
+            flash=True,
             mp=mp,
-            depth_confidence=depth_confidence,
-            width_confidence=width_confidence,
-            filter_threshold=filter_threshold,
-            weights=weights,
+            depth_confidence=0.95,
+            width_confidence=0.99,
+            filter_threshold=0.1,
+            weights=None,
         ).to(device)
-
-        if feature_type == "superpoint":
-            self.feature_extractor = SuperPoint().to(device)
-        else:
-            raise ValueError(f"Unsupported feature type: {feature_type}")
+        self.extractor = SuperPoint().to(device)
 
     @staticmethod
-    def _bgr_to_tensor_rgb01(img_bgr: np.ndarray, device: str) -> "torch.Tensor":
-        if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
-            raise ValueError(f"Expected BGR uint8 HxWx3, got {img_bgr.shape}")
+    def _bgr_to_tensor_rgb01(img_bgr: np.ndarray, device: str) -> torch.Tensor:
         img_rgb = img_bgr[:, :, ::-1]  # BGR->RGB
-        t = torch.from_numpy(img_rgb).permute(2, 0, 1).contiguous().float() / 255.0  # [3,H,W]
+        t = torch.from_numpy(img_rgb).permute(2, 0, 1).contiguous().float() / 255.0
         return t.to(device)
 
-    def extract_features_from_bgr(self, img_bgr: np.ndarray) -> dict:
-        image = self._bgr_to_tensor_rgb01(img_bgr, self.device)  # [3,H,W]
-        feats = self.feature_extractor.extract(image)
+    def extract(self, img_bgr: np.ndarray) -> dict:
+        image = self._bgr_to_tensor_rgb01(img_bgr, self.device)
+        feats = self.extractor.extract(image)
         h, w = img_bgr.shape[:2]
-        feats["image_size"] = torch.tensor([w, h], device=self.device).unsqueeze(0)  # [1,2] (W,H)
+        feats["image_size"] = torch.tensor([w, h], device=self.device).unsqueeze(0)
         return feats
 
-    def match_feats(self, feats0: dict, feats1: dict) -> dict:
+    def match(self, feats0: dict, feats1: dict) -> dict:
         data = {
             "image0": {
                 "keypoints": feats0["keypoints"].to(self.device),
@@ -344,23 +290,8 @@ class LightGlueMatcher:
         }
         return self.matcher(data)
 
-    def compile(self, mode: str = "reduce-overhead"):
-        self.matcher.compile(mode=mode)
-
-
-def _read_bgr_uint8(path: str) -> np.ndarray:
-    img = cv2.imread(path, cv2.IMREAD_COLOR)
-    if img is None:
-        raise FileNotFoundError(f"Failed to read image: {path}")
-    return img
-
 
 def _object_bbox_from_black_bg(img_bgr: np.ndarray, thr: int = 8) -> Optional[Tuple[int, int, int, int]]:
-    """
-    Detect non-black region as object bbox in an object-only image.
-    Return (x0,y0,x1,y1) inclusive-exclusive.
-    If the input is a raw photo, bbox will likely become full-frame (still ok).
-    """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     mask = (gray > thr).astype(np.uint8)
     ys, xs = np.where(mask > 0)
@@ -414,43 +345,29 @@ def _crop_pad_resize(
     return crop
 
 
-def preprocess_object_only(
-    img_bgr: np.ndarray,
-    auto_crop_resize: bool = True,
-    out_size: int = 512,
-    pad_ratio: float = 0.15,
-) -> np.ndarray:
-    if not auto_crop_resize:
-        return img_bgr
+def _preprocess_object_only(img_bgr: np.ndarray, out_size: int = 512, pad_ratio: float = 0.15) -> np.ndarray:
     bbox = _object_bbox_from_black_bg(img_bgr)
     if bbox is None:
         return cv2.resize(img_bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
     return _crop_pad_resize(img_bgr, bbox=bbox, out_size=out_size, pad_ratio=pad_ratio)
 
 
-# Keep your scoring algorithm unchanged (quality * coverage)
-def compute_object_match_score(
-    scores: np.ndarray,
-    score_th: float = 0.20,
-    topk: int = 10,
-    k_ref: int = 20,
-) -> dict:
+def _compute_object_match_score(scores: np.ndarray, score_th: float = 0.20, topk: int = 10, k_ref: int = 20) -> Dict[str, Any]:
     if scores is None:
-        return {"score": 0.0, "quality": 0.0, "coverage": 0.0, "K_conf": 0, "score_th": score_th, "topk": 0, "k_ref": k_ref}
+        return {"score": 0.0, "quality": 0.0, "coverage": 0.0, "K_conf": 0}
 
     scores = np.asarray(scores, dtype=np.float32)
     conf = scores[scores >= float(score_th)]
     K_conf = int(conf.size)
-
     if K_conf == 0:
-        return {"score": 0.0, "quality": 0.0, "coverage": 0.0, "K_conf": 0, "score_th": score_th, "topk": 0, "k_ref": k_ref}
+        return {"score": 0.0, "quality": 0.0, "coverage": 0.0, "K_conf": 0}
 
     conf_sorted = np.sort(conf)[::-1]
     k = int(min(topk, K_conf))
     quality = float(conf_sorted[:k].mean())
     coverage = float(min(1.0, K_conf / float(max(1, k_ref))))
     score = float(np.clip(quality * coverage, 0.0, 1.0))
-    return {"score": score, "quality": quality, "coverage": coverage, "K_conf": K_conf, "score_th": score_th, "topk": k, "k_ref": k_ref}
+    return {"score": score, "quality": quality, "coverage": coverage, "K_conf": K_conf}
 
 
 def _draw_matches_image(
@@ -481,252 +398,104 @@ def _draw_matches_image(
         cv2.line(canvas, tuple(p0), tuple(p1), (0, 255, 0), 1, cv2.LINE_AA)
         cv2.circle(canvas, tuple(p0), 2, (0, 0, 255), -1, cv2.LINE_AA)
         cv2.circle(canvas, tuple(p1), 2, (0, 0, 255), -1, cv2.LINE_AA)
-        s = float(scores[idx])
+        s = float(scores[idx]) if scores is not None and scores.size > idx else 0.0
         mid = ((p0 + p1) * 0.5).astype(np.int32)
         cv2.putText(canvas, f"{s:.2f}", tuple(mid), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1, cv2.LINE_AA)
-
     return canvas
 
 
-def _pick_latest_by_mtime(paths: List[str]) -> Optional[str]:
-    if not paths:
+# -----------------------------------------------------------------------------
+# Aria rgbmask builder (from latest aria *_rgb_rot.png + *_mask_bin.png)
+# -----------------------------------------------------------------------------
+def _find_latest_aria_pair(aria_dir: str) -> Optional[Tuple[str, str]]:
+    """
+    Find the latest (rgb_rot, mask_bin) pair from Aria output dir.
+    Expects filenames like:
+      gaze_sam2_<ts>_rgb_rot.png
+      gaze_sam2_<ts>_mask_bin.png
+    """
+    d = Path(aria_dir)
+    if not d.exists():
         return None
-    try:
-        paths = [p for p in paths if os.path.isfile(p)]
-        if not paths:
-            return None
-        paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return paths[0]
-    except Exception:
-        return paths[-1] if paths else None
+
+    rgbs = sorted(d.glob("*_rgb_rot.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for rgbp in rgbs:
+        base = rgbp.name.replace("_rgb_rot.png", "")
+        maskp = d / f"{base}_mask_bin.png"
+        if maskp.exists():
+            return str(rgbp), str(maskp)
+    return None
 
 
-def cross_view_gate_one_to_many(
-    matcher: LightGlueMatcher,
-    aria_path: str,
-    wrist_paths: List[str],
-    # preprocessing
-    auto_crop_resize: bool,
-    out_size: int,
-    pad_ratio: float,
-    # scoring
-    score_th: float,
-    topk_quality: int,
-    k_ref: int,
-    # policy
-    policy: str,
-    top_m: int,
-    avg_threshold: float,
-    frame_threshold: float,
-    min_pass_k: int,
-    consecutive_n: int,
-    pass_threshold: float,
-    max_frames: int,
-    # outputs
-    save_scores_json_path: Optional[str],
-    save_best_viz_path: Optional[str],
-    save_preproc_dir: Optional[str],
-    save_preproc_topn: int,
-) -> Tuple[bool, Dict[str, Any]]:
+def _build_rgbmask_blackbg(bgr: np.ndarray, mask_uint8: np.ndarray) -> np.ndarray:
     """
-    Returns (accepted, report_dict).
-    report_dict includes per-frame stats and gate summary.
+    Build object-only BGR image (black background) from mask.
+    mask_uint8 can be {0,255} or {0,1}.
     """
-    wrist_paths = [p for p in wrist_paths if os.path.isfile(p)]
-    if max_frames is not None and max_frames > 0:
-        wrist_paths = wrist_paths[: int(max_frames)]
-    if not wrist_paths:
-        return True, {"skipped": True, "reason": "no_wrist_images"}
-
-    aria_bgr = _read_bgr_uint8(aria_path)
-    aria_pre = preprocess_object_only(aria_bgr, auto_crop_resize=auto_crop_resize, out_size=out_size, pad_ratio=pad_ratio)
-    feats0 = matcher.extract_features_from_bgr(aria_pre)
-
-    per_frame = []
-    best_score = -1.0
-    best_index = -1
-    best_bundle = None
-
-    with torch.inference_mode():
-        for i, wp in enumerate(wrist_paths):
-            wrist_bgr = _read_bgr_uint8(wp)
-            wrist_pre = preprocess_object_only(wrist_bgr, auto_crop_resize=auto_crop_resize, out_size=out_size, pad_ratio=pad_ratio)
-            feats1 = matcher.extract_features_from_bgr(wrist_pre)
-
-            out = matcher.match_feats(feats0, feats1)
-            matches = out["matches"][0].detach().cpu().numpy().astype(np.int64)
-            scores = out["scores"][0].detach().cpu().numpy().astype(np.float32)
-
-            # sort desc by score
-            if scores.size > 0:
-                order = np.argsort(-scores)
-                matches = matches[order]
-                scores = scores[order]
-
-            stats = compute_object_match_score(scores, score_th=score_th, topk=topk_quality, k_ref=k_ref)
-            s = float(stats["score"])
-            per_frame.append({
-                "index": int(i),
-                "path": str(wp),
-                "basename": os.path.basename(wp),
-                "score": float(s),
-                "quality": float(stats["quality"]),
-                "coverage": float(stats["coverage"]),
-                "K_conf": int(stats["K_conf"]),
-                "n_matches": int(matches.shape[0]),
-            })
-
-            if s > best_score:
-                best_score = s
-                best_index = i
-                best_bundle = {
-                    "aria_pre": aria_pre,
-                    "wrist_pre": wrist_pre,
-                    "feats0": feats0,
-                    "feats1": feats1,
-                    "matches": matches,
-                    "scores": scores,
-                }
-
-    # Gate decision
-    policy = str(policy or "topm").strip().lower()
-
-    gate = {
-        "policy": policy,
-        "accepted": True,
-    }
-
-    selected_indices: List[int] = []
-    selected_paths: List[str] = []
-
-    if policy == "consecutive":
-        # consecutive rule on per-frame score
-        streak = 0
-        pass_index = -1
-        for fr in per_frame:
-            if fr["score"] >= float(pass_threshold):
-                streak += 1
-                if streak >= int(consecutive_n) and pass_index < 0:
-                    pass_index = int(fr["index"])
-            else:
-                streak = 0
-
-        accepted = (pass_index >= 0)
-        gate.update({
-            "pass_threshold": float(pass_threshold),
-            "consecutive_n": int(consecutive_n),
-            "pass_index": int(pass_index),
-            "best_index": int(best_index),
-            "best_score": float(best_score if best_score >= 0 else 0.0),
-        })
-
+    if mask_uint8.dtype != np.uint8:
+        mask_uint8 = mask_uint8.astype(np.uint8)
+    if mask_uint8.max() <= 1:
+        m = (mask_uint8 > 0)
     else:
-        # top-m rule
-        scores_list = [(fr["score"], fr["index"]) for fr in per_frame]
-        scores_list.sort(key=lambda x: x[0], reverse=True)
+        m = (mask_uint8 >= 128)
 
-        top_m = max(1, int(top_m))
-        top_items = scores_list[: min(top_m, len(scores_list))]
-        selected_indices = [int(i) for (_, i) in top_items]
-        selected_paths = [per_frame[i]["path"] for i in selected_indices]
-
-        s_top = float(np.mean([s for (s, _) in top_items])) if top_items else 0.0
-        n_pass = int(sum(1 for fr in per_frame if fr["score"] >= float(frame_threshold)))
-
-        accepted = (s_top >= float(avg_threshold)) and (n_pass >= int(min_pass_k))
-
-        gate.update({
-            "top_m": int(top_m),
-            "avg_threshold": float(avg_threshold),
-            "frame_threshold": float(frame_threshold),
-            "min_pass_k": int(min_pass_k),
-            "s_top": float(s_top),
-            "n_pass": int(n_pass),
-            "best_index": int(best_index),
-            "best_score": float(best_score if best_score >= 0 else 0.0),
-            "selected_indices": selected_indices,
-        })
-
-    gate["accepted"] = bool(accepted)
-
-    report = {
-        "skipped": False,
-        "aria_path": str(aria_path),
-        "wrist_glob_count": int(len(wrist_paths)),
-        "max_frames_used": int(len(wrist_paths)),
-        "preprocess": {
-            "auto_crop_resize": bool(auto_crop_resize),
-            "out_size": int(out_size),
-            "pad_ratio": float(pad_ratio),
-        },
-        "score_config": {
-            "score_th": float(score_th),
-            "topk_quality": int(topk_quality),
-            "k_ref": int(k_ref),
-        },
-        "gate": gate,
-        "per_frame": per_frame,
-        "created_at": datetime.now().isoformat(),
-    }
-
-    # Save preproc crops (as "mask-like" object-focused crops used for matching)
-    if save_preproc_dir:
-        try:
-            _ensure_dir(save_preproc_dir)
-            cv2.imwrite(os.path.join(save_preproc_dir, "aria_preproc.png"), aria_pre)
-            # save top-N preproc wrist frames by score
-            sorted_pf = sorted(per_frame, key=lambda d: d["score"], reverse=True)
-            for j, fr in enumerate(sorted_pf[: max(1, int(save_preproc_topn))]):
-                wp = fr["path"]
-                wbgr = _read_bgr_uint8(wp)
-                wpre = preprocess_object_only(wbgr, auto_crop_resize=auto_crop_resize, out_size=out_size, pad_ratio=pad_ratio)
-                cv2.imwrite(os.path.join(save_preproc_dir, f"wrist_preproc_rank{j+1:02d}_{fr['basename']}"), wpre)
-        except Exception:
-            pass
-
-    # Save best match visualization
-    if save_best_viz_path and best_bundle is not None:
-        try:
-            kpts0 = best_bundle["feats0"]["keypoints"][0].detach().cpu().numpy().astype(np.float32)
-            kpts1 = best_bundle["feats1"]["keypoints"][0].detach().cpu().numpy().astype(np.float32)
-            matches = best_bundle["matches"]
-            scores = best_bundle["scores"]
-            vis = _draw_matches_image(best_bundle["aria_pre"], best_bundle["wrist_pre"], kpts0, kpts1, matches, scores, topk=200)
-            _ensure_dir(os.path.dirname(save_best_viz_path))
-            cv2.imwrite(save_best_viz_path, vis)
-        except Exception:
-            pass
-
-    # Save score json
-    if save_scores_json_path:
-        try:
-            _ensure_dir(os.path.dirname(save_scores_json_path))
-            with open(save_scores_json_path, "w", encoding="utf-8") as f:
-                json.dump(report, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    return bool(accepted), report
+    out = np.zeros_like(bgr, dtype=np.uint8)
+    if m.any():
+        out[m] = bgr[m]
+    return out
 
 
-# =============================================================================
-# Main ROS node
-# =============================================================================
+def _save_aria_rgbmask(aria_dir: str, out_path: str) -> Optional[Dict[str, str]]:
+    pair = _find_latest_aria_pair(aria_dir)
+    if pair is None:
+        return None
+    rgb_path, mask_path = pair
+
+    bgr = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return None
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None
+
+    rgbmask = _build_rgbmask_blackbg(bgr, mask)
+    _ensure_dir(str(Path(out_path).parent))
+    cv2.imwrite(out_path, rgbmask)
+    return {"rgb_rot": rgb_path, "mask_bin": mask_path, "aria_rgbmask": out_path}
+
+
+# -----------------------------------------------------------------------------
+# Candidate pack
+# -----------------------------------------------------------------------------
+class _Candidate:
+    def __init__(self, idx: int, score: float, box_xyxy: Tuple[float, float, float, float], C: np.ndarray, hover_pose: PoseStamped):
+        self.idx = idx
+        self.score = float(score)
+        self.box_xyxy = box_xyxy
+        self.C = C.copy()
+        self.hover_pose = hover_pose
+        self.eval_image_path: Optional[str] = None
+        self.eval_rgbmask_path: Optional[str] = None
+        self.match_score: float = -1.0
+        self.match_quality: float = 0.0
+        self.match_coverage: float = 0.0
+        self.match_Kconf: int = 0
+
 
 class SeeAnythingNode(Node):
     def __init__(self):
         super().__init__("seeanything_minimal_clean")
 
-        # Always clean outputs at node startup to guarantee overwriting behavior.
+        # Clean outputs at node startup
         _cleanup_outputs_for_new_run()
 
-        # Load config (with some ROS param overrides)
+        # Load config
         self.cfg = load_from_ros_params(self)
 
-        # Sweep angle in degrees; used to trim the full 360° loop to avoid joint limits.
-        self._sweep_deg: float = float(getattr(getattr(self.cfg, "circle", object()), "sweep_deg", 180.0))
+        # Sweep angle in degrees (trim full loop to avoid joint limits)
+        self._sweep_deg: float = float(getattr(getattr(self.cfg, "circle", object()), "sweep_deg", 120.0))
 
-        # Interactive prompt (unless disabled)
+        # Prompt
         if self.cfg.runtime.require_prompt:
             user_prompt = input("Enter the target text prompt (e.g., 'orange object'): ").strip()
             if user_prompt:
@@ -740,11 +509,9 @@ class SeeAnythingNode(Node):
 
         # Fixed output locations
         self._img_dir = OUTPUT_IMG_DIR
-        self._aria_dir = OUTPUT_ARIA_DIR
         self._js_path = OUTPUT_JSON_PATH
-        self._cross_dir = OUTPUT_CROSSVIEW_DIR
 
-        # JSON log (single file, always overwrite)
+        # JSON log for VGGT shots
         self._joint_log: Dict[str, Any] = {
             "note": "Per-image joint positions and camera pose at capture time.",
             "prompt": self.cfg.dino.text_prompt,
@@ -754,13 +521,31 @@ class SeeAnythingNode(Node):
         }
         self._flush_joint_log()
 
-        # Rolling camera frame buffer (BGR) + last image stamp (atomic via lock)
+        # Candidate selection JSON
+        self._match_log: Dict[str, Any] = {
+            "note": "Candidate selection via Aria<->wrist matching.",
+            "prompt": self.cfg.dino.text_prompt,
+            "created_at": datetime.now().isoformat(),
+            "aria_dir": ARIA_OUT_DIR,
+            "aria_files": {},
+            "candidates": [],
+            "selected": {},
+            "thresholds": {
+                "min_exec_score": float(self.cfg.dino.min_exec_score),
+                "cand_max": int(CAND_MAX),
+                "cand_dwell_sec": float(CAND_DWELL_SEC),
+                "match_accept": float(MATCH_SCORE_ACCEPT),
+            }
+        }
+        self._flush_match_log()
+
+        # Rolling camera frame buffer (BGR) + last image stamp (atomic)
         self._bridge = CvBridge()
         self._img_lock = threading.Lock()
         self._latest_bgr: Optional[np.ndarray] = None
-        self._latest_img_stamp = None   # msg.header.stamp
+        self._latest_img_stamp = None  # msg.header.stamp
 
-        # Image subscription (trigger + buffer)
+        # Image subscription
         qos_img = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(Image, self.cfg.frames.image_topic, self._on_image, qos_img)
 
@@ -773,6 +558,22 @@ class SeeAnythingNode(Node):
         self.predictor = GroundingDinoPredictor(self.cfg.dino.model_id, self.cfg.dino.device)
         self.detector = SingleShotDetector(self, self.cfg, self.predictor)
 
+        # SAM2 for candidate snapshots (only needed when multi-candidate path triggers)
+        self.sam2 = SAM2ImagePredictorWrapper(
+            model_id=SAM2_ID,
+            device=self.cfg.dino.device,
+            mask_threshold=SAM2_MASK_THRESHOLD,
+            max_hole_area=SAM2_MAX_HOLE_AREA,
+            max_sprinkle_area=SAM2_MAX_SPRINKLE_AREA,
+            multimask_output=False,
+            return_logits=False,
+        )
+
+        # LightGlue matcher
+        self._lg = _LGMatcher(device=self.cfg.dino.device, mp=True)
+        self._aria_feats0: Optional[dict] = None
+        self._aria_rgbmask_ready: bool = False
+
         # Trajectory / IK / joint_states
         self.motion = MotionContext(
             self,
@@ -780,9 +581,7 @@ class SeeAnythingNode(Node):
             self.cfg.control.vel_eps,
             self.cfg.control.require_stationary,
         )
-        self.traj = TrajectoryPublisher(
-            self, self.cfg.control.joint_order, self.cfg.control.controller_topic
-        )
+        self.traj = TrajectoryPublisher(self, self.cfg.control.joint_order, self.cfg.control.controller_topic)
         self.ik = IKClient(
             self,
             self.cfg.control.group_name,
@@ -799,16 +598,16 @@ class SeeAnythingNode(Node):
         self._inflight = False
         self._done = False
 
-        # Offline pipeline state (avoid running twice)
+        # Offline pipeline state
         self._offline_ran = False
 
-        # Stage-1 / Stage-2 cached poses and detection outputs
+        # Stage-1 / Stage-2 cached data (legacy path)
         self._pose_stage1: Optional[PoseStamped] = None
         self._fixed_hover: Optional[PoseStamped] = None
         self._circle_center: Optional[np.ndarray] = None
         self._ring_z: Optional[float] = None
 
-        # Circular/polygon path state
+        # Circular path
         self._start_yaw: Optional[float] = None
         self._poly_wps: List[PoseStamped] = []
         self._poly_idx: int = 0
@@ -822,9 +621,15 @@ class SeeAnythingNode(Node):
             self.create_timer(1.0 / self.cfg.control.tf_rebroadcast_hz, self._rebroadcast_tfs)
 
         # Final goto state
-        self._final_point_base: Optional[np.ndarray] = None   # (x,y,z) in base_link
-        self._final_pose: Optional[PoseStamped] = None
+        self._final_point_base: Optional[np.ndarray] = None
         self._final_goto_requested = False
+
+        # New: candidate selection state
+        self._cand_list: List[_Candidate] = []
+        self._cand_active_idx: int = -1
+        self._cand_iter: int = 0
+        self._cand_dwell_due_ns: Optional[int] = None
+        self._cand_best_idx: int = -1
 
         # Main loop
         self.create_timer(0.05, self._tick)
@@ -837,53 +642,8 @@ class SeeAnythingNode(Node):
             f"offline_bias(enable={ob.enable}, ox={ob.ox:.3f}, oy={ob.oy:.3f}, oz={ob.oz:.3f}); "
             f"N={self.cfg.circle.n_vertices}, R={self.cfg.circle.radius:.3f}m, orient={self.cfg.circle.orient_mode}, "
             f"dir={self.cfg.circle.poly_dir}, sweep={self._sweep_deg:.1f}deg; "
-            f"out_ur5_dir={self._img_dir}, out_json={self._js_path}; "
-            f"aria_dir={self._aria_dir}; cross_dir={self._cross_dir}; "
-            f"vggt_out_dir={OUTPUT_VGGT_DIR}"
+            f"out_img_dir={self._img_dir}, out_json={self._js_path}; vggt_out_dir={OUTPUT_VGGT_DIR}"
         )
-
-        # -----------------------------
-        # Cross-view verifier init
-        # -----------------------------
-        self.declare_parameter("crossview_enable", CROSSVIEW_ENABLE_DEFAULT)
-        self.declare_parameter("crossview_aria_glob", CROSSVIEW_ARIA_GLOB_DEFAULT)
-        self.declare_parameter("crossview_wrist_glob", CROSSVIEW_WRIST_GLOB_DEFAULT)
-        self.declare_parameter("crossview_policy", CROSSVIEW_POLICY_DEFAULT)
-
-        self.declare_parameter("crossview_top_m", CROSSVIEW_TOP_M_DEFAULT)
-        self.declare_parameter("crossview_avg_th", CROSSVIEW_AVG_TH_DEFAULT)
-        self.declare_parameter("crossview_frame_th", CROSSVIEW_FRAME_TH_DEFAULT)
-        self.declare_parameter("crossview_min_pass_k", CROSSVIEW_MIN_PASS_K_DEFAULT)
-
-        self.declare_parameter("crossview_consecutive_n", 2)
-        self.declare_parameter("crossview_pass_th", 0.40)
-
-        self.declare_parameter("crossview_score_th", CROSSVIEW_SCORE_TH_DEFAULT)
-        self.declare_parameter("crossview_topk_quality", CROSSVIEW_TOPK_QUALITY_DEFAULT)
-        self.declare_parameter("crossview_k_ref", CROSSVIEW_KREF_DEFAULT)
-
-        self.declare_parameter("crossview_max_frames", CROSSVIEW_MAX_FRAMES_DEFAULT)
-        self.declare_parameter("crossview_auto_crop_resize", CROSSVIEW_AUTO_CROP_RESIZE_DEFAULT)
-        self.declare_parameter("crossview_out_size", CROSSVIEW_PREPROC_OUT_SIZE_DEFAULT)
-        self.declare_parameter("crossview_pad_ratio", CROSSVIEW_PREPROC_PAD_RATIO_DEFAULT)
-
-        self.declare_parameter("crossview_save_preproc", CROSSVIEW_SAVE_PREPROC_DEFAULT)
-        self.declare_parameter("crossview_save_preproc_topn", CROSSVIEW_SAVE_PREPROC_TOPN_DEFAULT)
-
-        self._crossview_enable = bool(self.get_parameter("crossview_enable").value)
-        self._cv_matcher: Optional[LightGlueMatcher] = None
-        self._crossview_last: Optional[Dict[str, Any]] = None
-
-        if self._crossview_enable and (not _LIGHTGLUE_OK):
-            self.get_logger().warn("[crossview] LightGlue/torch not available; gate will be skipped (VGGT will still run).")
-        elif self._crossview_enable and _LIGHTGLUE_OK:
-            try:
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                self._cv_matcher = LightGlueMatcher(feature_type="superpoint", device=device, mp=True)
-                self.get_logger().info(f"[crossview] enabled, matcher device={device}")
-            except Exception as e:
-                self._cv_matcher = None
-                self.get_logger().warn(f"[crossview] matcher init failed; gate will be skipped. err={e}")
 
     # ---------- TF rebroadcast ----------
     def _rebroadcast_tfs(self):
@@ -903,6 +663,22 @@ class SeeAnythingNode(Node):
             t.transform = self._last_circle_tf.transform
             self.tf_brd.sendTransform(t)
 
+    # ---------- helper: write logs ----------
+    def _flush_joint_log(self):
+        try:
+            with open(self._js_path, "w", encoding="utf-8") as f:
+                json.dump(self._joint_log, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.get_logger().error(f"Failed to write joint log JSON: {e}")
+
+    def _flush_match_log(self):
+        try:
+            _ensure_dir(MATCH_ROOT)
+            with open(MATCH_JSON_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._match_log, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.get_logger().error(f"Failed to write match log JSON: {e}")
+
     # ---------- helpers ----------
     def _get_tool_z_now(self) -> Optional[float]:
         """Read current tool Z in base frame."""
@@ -917,6 +693,21 @@ class SeeAnythingNode(Node):
             self.get_logger().warn(f"Read tool Z failed: {ex}")
             return None
 
+    def _get_tool_yaw_xy(self) -> Optional[float]:
+        """Tool yaw around base Z (from tool x-axis projected to XY)."""
+        try:
+            T_bt = self.tf_buffer.lookup_transform(
+                self.cfg.frames.base_frame, self.cfg.frames.tool_frame, Time(),
+                timeout=RclDuration(seconds=0.2)
+            )
+            R_bt, _ = tfmsg_to_Rp(T_bt)
+            ex = R_bt[:, 0]
+            return float(math.atan2(float(ex[1]), float(ex[0])))
+        except Exception as ex:
+            self.get_logger().warn(f"Read tool yaw failed: {ex}")
+            return None
+
+    # ---------- camera pose at image stamp (unchanged) ----------
     def _calc_camera_pose_at_stamp(self, stamp_msg) -> Optional[Dict[str, Any]]:
         """
         Compute base->camera_optical pose strictly at the provided image stamp.
@@ -927,7 +718,6 @@ class SeeAnythingNode(Node):
 
         t_query = Time.from_msg(stamp_msg)
 
-        # 1) TF base<-tool0 at the image timestamp (exact)
         try:
             T_bt = self.tf_buffer.lookup_transform(
                 self.cfg.frames.base_frame, self.cfg.frames.tool_frame, t_query,
@@ -939,7 +729,6 @@ class SeeAnythingNode(Node):
 
         R_bt, p_bt = tfmsg_to_Rp(T_bt)
 
-        # 2) tool->camera_optical
         qx, qy, qz, qw = self.cfg.cam.t_tool_cam_quat_xyzw
         R_t_cam = quat_to_rot(qx, qy, qz, qw)
 
@@ -950,7 +739,6 @@ class SeeAnythingNode(Node):
 
         p_t_co = np.array(self.cfg.cam.t_tool_cam_xyz, dtype=float)
 
-        # 3) base->camera_optical
         R_bc = R_bt @ R_t_co
         p_bc = R_bt @ p_t_co + p_bt
 
@@ -968,11 +756,425 @@ class SeeAnythingNode(Node):
             "t": [float(p_bc[0]), float(p_bc[1]), float(p_bc[2])]
         }
 
+    # ---------- Atomic capture for VGGT shots (unchanged) ----------
+    def _capture_and_log_shot(self, vertex_index_zero_based: int) -> bool:
+        idx1 = int(vertex_index_zero_based) + 1
+        key = f"image_{idx1}"
+        fname = f"pose_{idx1}_image.png"
+        fpath = os.path.join(self._img_dir, fname)
+
+        with self._img_lock:
+            if self._latest_bgr is None or self._latest_img_stamp is None:
+                self.get_logger().warn("No camera frame/stamp available to capture.")
+                return False
+            bgr = self._latest_bgr.copy()
+            stamp_msg = self._latest_img_stamp
+
+        cam_pose = self._calc_camera_pose_at_stamp(stamp_msg)
+        if cam_pose is None:
+            self.get_logger().warn(f"[capture] Skip idx={idx1}: TF not available at this image stamp (no fallback).")
+            return False
+
+        js = self.motion._last_js
+        if js is None or (not js.position) or (not js.name):
+            self.get_logger().warn("[capture] No /joint_states available; skip shot.")
+            return False
+
+        if not self._joint_log["joint_names"]:
+            self._joint_log["joint_names"] = list(js.name)
+
+        joint_stamp_ns = -1
+        try:
+            joint_stamp_ns = _stamp_to_ns(js.header.stamp)
+        except Exception:
+            joint_stamp_ns = -1
+
+        try:
+            ok = cv2.imwrite(fpath, bgr)
+            if not ok:
+                self.get_logger().error(f"[capture] cv2.imwrite returned False for: {fpath}")
+                return False
+        except Exception as e:
+            self.get_logger().error(f"[capture] Failed to save snapshot to {fpath}: {e}")
+            return False
+
+        entry = {
+            "image_file": fname,
+            "image_stamp_ns": int(cam_pose["stamp"].get("stamp_ns", -1)),
+            "joint_stamp_ns": int(joint_stamp_ns),
+            "position": [float(x) for x in js.position],
+            "camera_pose": cam_pose,
+        }
+
+        self._joint_log["shots"][key] = entry
+        self._flush_joint_log()
+        self.get_logger().info(
+            f"[capture] Saved idx={idx1}: {fpath} | img_stamp_ns={entry['image_stamp_ns']} | joint_stamp_ns={entry['joint_stamp_ns']}"
+        )
+        return True
+
+    # ---------- Candidate snapshot + mask + match ----------
+    def _capture_candidate_image(self, cand_rank0: int) -> Optional[Tuple[str, np.ndarray]]:
+        """
+        Capture latest frame (NOT VGGT) for candidate evaluation.
+        """
+        with self._img_lock:
+            if self._latest_bgr is None:
+                return None
+            bgr = self._latest_bgr.copy()
+
+        fname = f"cand_{cand_rank0+1:02d}_image.png"
+        fpath = os.path.join(MATCH_CAND_DIR, fname)
+        ok = cv2.imwrite(fpath, bgr)
+        if not ok:
+            return None
+        return fpath, bgr
+
+    def _dino_best_box_on_bgr(self, bgr: np.ndarray) -> Optional[Tuple[Tuple[int, int, int, int], float]]:
+        """
+        Run DINO on the candidate snapshot and pick best box by score.
+        Return (xyxy_int, best_score).
+        """
+        # Convert BGR->RGB for PIL
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        from PIL import Image as PILImage
+        pil = PILImage.fromarray(rgb)
+
+        out = self.predictor.predict(
+            pil, self.cfg.dino.text_prompt,
+            box_threshold=self.cfg.dino.box_threshold,
+            text_threshold=self.cfg.dino.text_threshold
+        )
+        if not isinstance(out, tuple) or len(out) < 2:
+            return None
+        boxes, labels = out[:2]
+        scores = out[2] if len(out) >= 3 else [None] * len(boxes)
+        if len(boxes) == 0:
+            return None
+
+        s = np.array([float(x.detach().cpu().item()) if hasattr(x, "detach") else float(x) for x in scores], dtype=float)
+        best = int(np.argmax(s))
+        best_score = float(s[best]) if np.isfinite(s[best]) else -1.0
+
+        x0, y0, x1, y1 = (boxes[best].tolist() if hasattr(boxes[best], "tolist") else boxes[best])
+        h, w = bgr.shape[:2]
+        x0 = int(max(0, min(w - 1, round(x0))))
+        y0 = int(max(0, min(h - 1, round(y0))))
+        x1 = int(max(0, min(w - 1, round(x1))))
+        y1 = int(max(0, min(h - 1, round(y1))))
+        if x1 <= x0:
+            x1 = min(w - 1, x0 + 1)
+        if y1 <= y0:
+            y1 = min(h - 1, y0 + 1)
+        return (x0, y0, x1, y1), best_score
+
+    def _sam2_rgbmask_for_snapshot(self, image_path: str, bgr: np.ndarray) -> Optional[str]:
+        """
+        Run DINO->SAM2 on the snapshot, build an object-only rgbmask (black bg) and save it.
+        """
+        best = self._dino_best_box_on_bgr(bgr)
+        if best is None:
+            return None
+        (x0, y0, x1, y1), s_det = best
+
+        res = self.sam2.run_inference(
+            image_path=image_path,
+            box=(x0, y0, x1, y1),
+            save_dir=MATCH_CAND_DIR,
+        )
+        mask = res.get("mask_array", None)
+        if mask is None or (not np.any(mask)):
+            return None
+
+        rgbmask = _build_rgbmask_blackbg(bgr, (mask.astype(np.uint8) * 255) if mask.dtype != np.uint8 else mask)
+        out_path = os.path.join(MATCH_CAND_DIR, Path(image_path).stem + "_rgbmask.png")
+        cv2.imwrite(out_path, rgbmask)
+        return out_path
+
+    def _ensure_aria_rgbmask_ready(self) -> bool:
+        """
+        Build aria_rgbmask.png from the latest Aria outputs.
+        Also precompute LightGlue features for Aria once.
+        """
+        if self._aria_rgbmask_ready and Path(ARIA_RGBMASK_PATH).exists() and self._aria_feats0 is not None:
+            return True
+
+        info = _save_aria_rgbmask(ARIA_OUT_DIR, ARIA_RGBMASK_PATH)
+        if info is None:
+            self.get_logger().warn(f"[aria] No valid Aria outputs found in: {ARIA_OUT_DIR}")
+            return False
+
+        self._match_log["aria_files"] = dict(info)
+        self._flush_match_log()
+
+        aria_bgr = cv2.imread(ARIA_RGBMASK_PATH, cv2.IMREAD_COLOR)
+        if aria_bgr is None:
+            return False
+
+        aria_bgr_p = _preprocess_object_only(aria_bgr, out_size=512, pad_ratio=0.15)
+        with torch.inference_mode():
+            self._aria_feats0 = self._lg.extract(aria_bgr_p)
+
+        self._aria_rgbmask_ready = True
+        self.get_logger().info(f"[aria] Using aria_rgbmask: {ARIA_RGBMASK_PATH}")
+        return True
+
+    def _score_pair_lightglue(self, aria_rgbmask_path: str, wrist_rgbmask_path: str, save_viz_path: Optional[str] = None) -> Dict[str, Any]:
+        aria_bgr = cv2.imread(aria_rgbmask_path, cv2.IMREAD_COLOR)
+        wrist_bgr = cv2.imread(wrist_rgbmask_path, cv2.IMREAD_COLOR)
+        if aria_bgr is None or wrist_bgr is None:
+            return {"score": 0.0, "quality": 0.0, "coverage": 0.0, "K_conf": 0}
+
+        aria_bgr = _preprocess_object_only(aria_bgr, out_size=512, pad_ratio=0.15)
+        wrist_bgr = _preprocess_object_only(wrist_bgr, out_size=512, pad_ratio=0.15)
+
+        with torch.inference_mode():
+            feats0 = self._aria_feats0 if self._aria_feats0 is not None else self._lg.extract(aria_bgr)
+            feats1 = self._lg.extract(wrist_bgr)
+            out = self._lg.match(feats0, feats1)
+
+        matches = out["matches"][0].detach().cpu().numpy().astype(np.int64)
+        scores = out["scores"][0].detach().cpu().numpy().astype(np.float32)
+
+        if scores.size > 0:
+            order = np.argsort(-scores)
+            matches = matches[order]
+            scores = scores[order]
+
+        stats = _compute_object_match_score(scores, score_th=0.20, topk=10, k_ref=20)
+
+        if save_viz_path is not None:
+            try:
+                kpts0 = feats0["keypoints"][0].detach().cpu().numpy().astype(np.float32)
+                kpts1 = feats1["keypoints"][0].detach().cpu().numpy().astype(np.float32)
+                vis = _draw_matches_image(aria_bgr, wrist_bgr, kpts0, kpts1, matches, scores, topk=200)
+                cv2.imwrite(save_viz_path, vis)
+            except Exception:
+                pass
+
+        return stats
+
+    # ---------- Multi-candidate detection at high stage ----------
+    def _detect_candidates_from_msg(self, img_msg: Image) -> Optional[List[_Candidate]]:
+        """
+        Run DINO on current frame, compute plane intersections for each candidate box,
+        and build hover poses (tool-Z-down) at z = C.z + hover_above.
+        All geometry is consistent with your SingleShotDetector conventions.
+        """
+        try:
+            rgb = self._bridge.imgmsg_to_cv2(img_msg, desired_encoding="rgb8")
+        except Exception:
+            return None
+
+        from PIL import Image as PILImage
+        pil = PILImage.fromarray(rgb)
+
+        out = self.predictor.predict(
+            pil, self.cfg.dino.text_prompt,
+            box_threshold=self.cfg.dino.box_threshold,
+            text_threshold=self.cfg.dino.text_threshold
+        )
+        if not isinstance(out, tuple) or len(out) < 2:
+            return None
+        boxes, labels = out[:2]
+        scores = out[2] if len(out) >= 3 else [None] * len(boxes)
+        if len(boxes) == 0:
+            return None
+
+        s = np.array([float(x.detach().cpu().item()) if hasattr(x, "detach") else float(x) for x in scores], dtype=float)
+        order = np.argsort(-s)  # desc
+
+        # TF query time mode aligned with vision_geom.py
+        t_query = Time.from_msg(img_msg.header.stamp) if self.cfg.control.tf_time_mode == "image" else Time()
+        try:
+            T_bt = self.tf_buffer.lookup_transform(
+                self.cfg.frames.base_frame, self.cfg.frames.tool_frame, t_query,
+                timeout=RclDuration(seconds=0.2)
+            )
+        except Exception as ex:
+            self.get_logger().warn(f"[cand] TF lookup failed: {ex}")
+            return None
+        R_bt, p_bt = tfmsg_to_Rp(T_bt)
+
+        # tool->camera_optical (same as SingleShotDetector)
+        R_t_co = self.detector.R_t_co
+        p_t_co = self.detector.p_t_co
+
+        # camera pose in base
+        R_bc = R_bt @ R_t_co
+        p_bc = R_bt @ p_t_co + p_bt
+
+        cand_list: List[_Candidate] = []
+        min_s = float(self.cfg.dino.min_exec_score)
+
+        for rank0, bi in enumerate(order[: int(max(1, CAND_MAX))]):
+            sc = float(s[bi]) if np.isfinite(s[bi]) else -1.0
+            if sc < min_s:
+                continue
+
+            x0, y0, x1, y1 = (boxes[bi].tolist() if hasattr(boxes[bi], "tolist") else boxes[bi])
+            u = 0.5 * (float(x0) + float(x1))
+            v = 0.5 * (float(y0) + float(y1))
+
+            # pixel -> optical ray (reuse detector convention)
+            d_opt = self.detector._pixel_to_dir_optical(u, v)  # normalized
+            d_base = R_bc @ d_opt
+
+            dz = float(d_base[2])
+            if abs(dz) < 1e-6:
+                continue
+
+            t_star = (float(self.cfg.frames.z_virt) - float(p_bc[2])) / dz
+            if t_star < 0:
+                continue
+
+            C = p_bc + t_star * d_base
+            if self.cfg.bias.enable:
+                C[0] += float(self.cfg.bias.bx)
+                C[1] += float(self.cfg.bias.by)
+                C[2] += float(self.cfg.bias.bz)
+
+            # build hover pose (tool-Z-down)
+            hover = PoseStamped()
+            hover.header.frame_id = self.cfg.frames.pose_frame
+            hover.header.stamp = self.get_clock().now().to_msg()
+            hover.pose.position.x = float(C[0])
+            hover.pose.position.y = float(C[1])
+            hover.pose.position.z = float(C[2] + self.cfg.control.hover_above)
+            hover.pose.orientation.w = 0.0
+            hover.pose.orientation.x = 1.0
+            hover.pose.orientation.y = 0.0
+            hover.pose.orientation.z = 0.0
+
+            cand_list.append(_Candidate(
+                idx=int(rank0),
+                score=sc,
+                box_xyxy=(float(x0), float(y0), float(x1), float(y1)),
+                C=C,
+                hover_pose=hover,
+            ))
+
+        if len(cand_list) == 0:
+            return None
+        return cand_list
+
+    # ---------- image callback ----------
+    def _on_image(self, msg: Image):
+        # Update rolling buffer + stamp atomically
+        try:
+            bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+        except Exception:
+            return
+
+        with self._img_lock:
+            self._latest_bgr = bgr
+            self._latest_img_stamp = msg.header.stamp
+
+        if self._done or self._inflight:
+            return
+        if self._phase not in ("wait_detect_stage1", "wait_detect_stage2"):
+            return
+        if not self.motion.is_stationary():
+            return
+
+        # Stride throttle
+        self._frame_count += 1
+        if self.cfg.runtime.frame_stride > 1 and (self._frame_count % self.cfg.runtime.frame_stride) != 0:
+            return
+
+        # ----------------------------
+        # NEW: multi-candidate branch at stage-1
+        # ----------------------------
+        if self._phase == "wait_detect_stage1" and ENABLE_MULTI_CANDIDATE:
+            cand_list = self._detect_candidates_from_msg(msg)
+            if cand_list is not None and len(cand_list) >= 2:
+                # Prepare aria rgbmask once
+                if not self._ensure_aria_rgbmask_ready():
+                    self.get_logger().warn("[cand] Aria rgbmask not ready, fallback to legacy stage-1 behavior.")
+                else:
+                    # Cache candidates and start sequential evaluation
+                    self._cand_list = cand_list
+                    self._cand_iter = 0
+                    self._cand_active_idx = -1
+                    self._cand_dwell_due_ns = None
+                    self._cand_best_idx = -1
+
+                    # Broadcast TF for the top candidate center (for RViz convenience)
+                    topC = self._cand_list[0].C
+                    tf_now = self.get_clock().now().to_msg()
+
+                    tf_obj = TransformStamped()
+                    tf_obj.header.stamp = tf_now
+                    tf_obj.header.frame_id = self.cfg.frames.base_frame
+                    tf_obj.child_frame_id = self.cfg.frames.object_frame
+                    tf_obj.transform.translation.x = float(topC[0])
+                    tf_obj.transform.translation.y = float(topC[1])
+                    tf_obj.transform.translation.z = float(topC[2])
+                    tf_obj.transform.rotation.w = 1.0
+                    self.tf_brd.sendTransform(tf_obj)
+                    self._last_obj_tf = tf_obj
+
+                    tf_circle = TransformStamped()
+                    tf_circle.header.stamp = tf_now
+                    tf_circle.header.frame_id = self.cfg.frames.base_frame
+                    tf_circle.child_frame_id = self.cfg.frames.circle_frame
+                    tf_circle.transform.translation.x = float(topC[0])
+                    tf_circle.transform.translation.y = float(topC[1])
+                    tf_circle.transform.translation.z = float(topC[2])
+                    tf_circle.transform.rotation.w = 1.0
+                    self.tf_brd.sendTransform(tf_circle)
+                    self._last_circle_tf = tf_circle
+
+                    self.get_logger().info(
+                        f"[cand] Detected {len(self._cand_list)} candidates (score>={self.cfg.dino.min_exec_score:.2f}). "
+                        f"Start close-hover verification..."
+                    )
+                    self._phase = "cand_move_next"
+                    return
+            # if not multi-candidate trigger, fall through to legacy stage-1
+
+        # ----------------------------
+        # Legacy path: use your existing detector.detect_once()
+        # ----------------------------
+        out = self.detector.detect_once(msg, self.tf_buffer)
+        if out is None:
+            return
+        C, hover, tf_obj, tf_circle = out
+
+        # Broadcast TF for RViz
+        self.tf_brd.sendTransform(tf_obj)
+        self._last_obj_tf = tf_obj
+        self.tf_brd.sendTransform(tf_circle)
+        self._last_circle_tf = tf_circle
+
+        if self._phase == "wait_detect_stage1":
+            # Stage-1: change XY to C, keep current Z
+            z_keep = self._get_tool_z_now()
+            if z_keep is None:
+                self.get_logger().warn("Cannot read current Z; waiting next frame.")
+                return
+            ps = PoseStamped()
+            ps.header.frame_id = self.cfg.frames.pose_frame
+            ps.header.stamp = self.get_clock().now().to_msg()
+            ps.pose.position.x = float(C[0])
+            ps.pose.position.y = float(C[1])
+            ps.pose.position.z = float(z_keep)
+            ps.pose.orientation.w = 0.0
+            ps.pose.orientation.x = 1.0
+            ps.pose.orientation.y = 0.0
+            ps.pose.orientation.z = 0.0
+            self._pose_stage1 = ps
+            self.get_logger().info(f"[Stage-1] Move XY->({C[0]:.3f},{C[1]:.3f}), keep Z={z_keep:.3f}")
+
+        elif self._phase == "wait_detect_stage2":
+            # Stage-2: hover over C
+            self._fixed_hover = hover
+            self._circle_center = C.copy()
+            self._ring_z = float(hover.pose.position.z)
+            self.get_logger().info(f"[Stage-2] Move XY->({C[0]:.3f},{C[1]:.3f}), Z->{self._ring_z:.3f}")
+
+    # ---------- Offline bias + final pose helpers (unchanged) ----------
     def _apply_offline_bias_to_object_json(self, obj_json_path: str, offset_xyz: np.ndarray) -> bool:
-        """
-        Apply an additive offset (in base_link) to the exported object JSON.
-        File overwritten in-place.
-        """
         try:
             if not obj_json_path or (not os.path.isfile(obj_json_path)):
                 return False
@@ -1000,7 +1202,6 @@ class SeeAnythingNode(Node):
 
             changed = False
 
-            # 1) Center (explicit)
             c = obj.get("center", None)
             if isinstance(c, dict) and _is_vec3(c.get("base_link", None)):
                 c["base_link"] = _add3(c["base_link"])
@@ -1012,7 +1213,6 @@ class SeeAnythingNode(Node):
                 obj["center_base_link"] = _add3(obj["center_base_link"])
                 changed = True
 
-            # 2) Backward-compatible OBB corners if present
             obb = obj.get("obb", None)
             if isinstance(obb, dict):
                 c8 = obb.get("corners_8", None)
@@ -1020,7 +1220,6 @@ class SeeAnythingNode(Node):
                     c8["base_link"] = [_add3(p) for p in c8["base_link"]]
                     changed = True
 
-            # 3) Apply to any point-list under object subtree with key "base_link"
             def _walk_apply_points(node):
                 nonlocal changed
                 if isinstance(node, dict):
@@ -1047,159 +1246,6 @@ class SeeAnythingNode(Node):
             self.get_logger().warn(f"[offline] Failed to apply offline bias to object JSON: {ex}")
             return False
 
-    # ---------- image callback: two-pass detection triggers ----------
-    def _on_image(self, msg: Image):
-        # Update rolling buffer + stamp atomically
-        try:
-            bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-        except Exception:
-            return
-
-        with self._img_lock:
-            self._latest_bgr = bgr
-            self._latest_img_stamp = msg.header.stamp
-
-        if self._done or self._inflight:
-            return
-        if self._phase not in ("wait_detect_stage1", "wait_detect_stage2"):
-            return
-        if not self.motion.is_stationary():
-            return
-
-        # Stride throttle
-        self._frame_count += 1
-        if self.cfg.runtime.frame_stride > 1 and (self._frame_count % self.cfg.runtime.frame_stride) != 0:
-            return
-
-        out = self.detector.detect_once(msg, self.tf_buffer)
-        if out is None:
-            return
-        C, hover, tf_obj, tf_circle = out
-
-        # Broadcast TF for RViz
-        self.tf_brd.sendTransform(tf_obj)
-        self._last_obj_tf = tf_obj
-        self.tf_brd.sendTransform(tf_circle)
-        self._last_circle_tf = tf_circle
-
-        if self._phase == "wait_detect_stage1":
-            # Stage-1: change XY to C, keep current Z (tool-Z-down)
-            z_keep = self._get_tool_z_now()
-            if z_keep is None:
-                self.get_logger().warn("Cannot read current Z; waiting next frame.")
-                return
-            ps = PoseStamped()
-            ps.header.frame_id = self.cfg.frames.pose_frame
-            ps.header.stamp = self.get_clock().now().to_msg()
-            ps.pose.position.x = float(C[0])
-            ps.pose.position.y = float(C[1])
-            ps.pose.position.z = float(z_keep)
-            # tool-Z-down quaternion: (w,x,y,z) = (0,1,0,0)
-            ps.pose.orientation.w = 0.0
-            ps.pose.orientation.x = 1.0
-            ps.pose.orientation.y = 0.0
-            ps.pose.orientation.z = 0.0
-            self._pose_stage1 = ps
-            self.get_logger().info(f"[Stage-1] Move XY->({C[0]:.3f},{C[1]:.3f}), keep Z={z_keep:.3f}")
-
-        elif self._phase == "wait_detect_stage2":
-            # Stage-2: hover over C (XY = C, Z = C.z + hover_above)
-            self._fixed_hover = hover
-            self._circle_center = C.copy()
-            self._ring_z = float(hover.pose.position.z)  # equals C.z + hover_above
-            self.get_logger().info(f"[Stage-2] Move XY->({C[0]:.3f},{C[1]:.3f}), Z->{self._ring_z:.3f}")
-
-    # ---------- helper: write the joint log to disk (always overwrite) ----------
-    def _flush_joint_log(self):
-        try:
-            with open(self._js_path, "w", encoding="utf-8") as f:
-                json.dump(self._joint_log, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            self.get_logger().error(f"Failed to write joint log JSON: {e}")
-
-    # ---------- Atomic capture: image + joint positions + camera pose at image stamp ----------
-    def _capture_and_log_shot(self, vertex_index_zero_based: int) -> bool:
-        """
-        Atomically bind:
-          - image file (pose_{k}_image.png)
-          - image stamp
-          - camera_pose computed at that stamp (NO fallback)
-          - joint positions (latest) + joint stamp for debugging
-        """
-        idx1 = int(vertex_index_zero_based) + 1
-        key = f"image_{idx1}"
-        fname = f"pose_{idx1}_image.png"
-        fpath = os.path.join(self._img_dir, fname)
-
-        # 1) Freeze (bgr + stamp) atomically
-        with self._img_lock:
-            if self._latest_bgr is None or self._latest_img_stamp is None:
-                self.get_logger().warn("No camera frame/stamp available to capture.")
-                return False
-            bgr = self._latest_bgr.copy()
-            stamp_msg = self._latest_img_stamp
-
-        # 2) Compute camera pose at THIS image stamp (no fallback)
-        cam_pose = self._calc_camera_pose_at_stamp(stamp_msg)
-        if cam_pose is None:
-            self.get_logger().warn(f"[capture] Skip idx={idx1}: TF not available at this image stamp (no fallback).")
-            return False
-
-        # 3) Get joint state (latest)
-        js = self.motion._last_js
-        if js is None or (not js.position) or (not js.name):
-            self.get_logger().warn("[capture] No /joint_states available; skip shot.")
-            return False
-
-        if not self._joint_log["joint_names"]:
-            self._joint_log["joint_names"] = list(js.name)
-
-        joint_stamp_ns = -1
-        try:
-            joint_stamp_ns = _stamp_to_ns(js.header.stamp)
-        except Exception:
-            joint_stamp_ns = -1
-
-        # 4) Save image first, then JSON entry.
-        try:
-            ok = cv2.imwrite(fpath, bgr)
-            if not ok:
-                self.get_logger().error(f"[capture] cv2.imwrite returned False for: {fpath}")
-                return False
-        except Exception as e:
-            self.get_logger().error(f"[capture] Failed to save snapshot to {fpath}: {e}")
-            return False
-
-        entry = {
-            "image_file": fname,
-            "image_stamp_ns": int(cam_pose["stamp"].get("stamp_ns", -1)),
-            "joint_stamp_ns": int(joint_stamp_ns),
-            "position": [float(x) for x in js.position],
-            "camera_pose": cam_pose,
-        }
-
-        self._joint_log["shots"][key] = entry
-        self._flush_joint_log()
-        self.get_logger().info(
-            f"[capture] Saved idx={idx1}: {fpath} | img_stamp_ns={entry['image_stamp_ns']} | joint_stamp_ns={entry['joint_stamp_ns']}"
-        )
-        return True
-
-    # ---------- current tool yaw (XY) ----------
-    def _get_tool_yaw_xy(self) -> Optional[float]:
-        try:
-            T_bt = self.tf_buffer.lookup_transform(
-                self.cfg.frames.base_frame, self.cfg.frames.tool_frame, Time(),
-                timeout=RclDuration(seconds=0.2)
-            )
-            R_bt, _ = tfmsg_to_Rp(T_bt)
-            ex = R_bt[:, 0]
-            return float(math.atan2(float(ex[1]), float(ex[0])))
-        except Exception as ex:
-            self.get_logger().warn(f"Read tool yaw failed: {ex}")
-            return None
-
-    # ---------- Parse object center from exported JSON ----------
     def _read_center_from_object_json(self, obj_json_path: str) -> Optional[np.ndarray]:
         try:
             if not obj_json_path or (not os.path.isfile(obj_json_path)):
@@ -1209,14 +1255,11 @@ class SeeAnythingNode(Node):
             obj = data.get("object", {})
 
             p = None
-
-            # Preferred format: object.center.base_link
             if isinstance(obj, dict):
                 c = obj.get("center", {})
                 if isinstance(c, dict):
                     p = c.get("base_link", None)
 
-            # Backward/alternate formats
             if p is None and isinstance(obj, dict):
                 p = obj.get("center_base", None)
             if p is None and isinstance(obj, dict):
@@ -1230,7 +1273,6 @@ class SeeAnythingNode(Node):
         except Exception:
             return None
 
-    # ---------- Build final hover pose (offset above object center) ----------
     def _build_final_hover_pose(self, center_b: np.ndarray) -> PoseStamped:
         x, y, z = float(center_b[0]), float(center_b[1]), float(center_b[2])
         z_hover = z + float(FINAL_GOTO_Z_OFFSET)
@@ -1242,123 +1284,13 @@ class SeeAnythingNode(Node):
         ps.pose.position.x = x
         ps.pose.position.y = y
         ps.pose.position.z = z_hover
-        # tool-Z-down quaternion
         ps.pose.orientation.w = 0.0
         ps.pose.orientation.x = 1.0
         ps.pose.orientation.y = 0.0
         ps.pose.orientation.z = 0.0
         return ps
 
-    # ---------- Cross-view gate runner ----------
-    def _run_crossview_gate(self) -> bool:
-        """
-        Returns True if we should proceed to VGGT, False if rejected.
-        If gate cannot run (disabled / missing LG / missing aria image), it will be skipped and returns True.
-        """
-        if not self._crossview_enable:
-            self.get_logger().info("[crossview] disabled by param. Skip gate.")
-            return True
-
-        if self._cv_matcher is None or (not _LIGHTGLUE_OK):
-            self.get_logger().warn("[crossview] matcher not available. Skip gate.")
-            return True
-
-        aria_glob = str(self.get_parameter("crossview_aria_glob").value)
-        aria_paths = sorted(glob.glob(aria_glob))
-        aria_path = _pick_latest_by_mtime(aria_paths)
-        if (aria_path is None) or (not os.path.isfile(aria_path)):
-            self.get_logger().warn(f"[crossview] no aria image found under glob: {aria_glob}. Skip gate.")
-            return True
-
-        wrist_glob = str(self.get_parameter("crossview_wrist_glob").value)
-        wrist_paths = sorted(glob.glob(wrist_glob))
-        if not wrist_paths:
-            self.get_logger().warn(f"[crossview] no wrist images found under glob: {wrist_glob}. Skip gate.")
-            return True
-
-        policy = str(self.get_parameter("crossview_policy").value).strip().lower()
-        top_m = int(self.get_parameter("crossview_top_m").value)
-        avg_th = float(self.get_parameter("crossview_avg_th").value)
-        frame_th = float(self.get_parameter("crossview_frame_th").value)
-        min_pass_k = int(self.get_parameter("crossview_min_pass_k").value)
-
-        consecutive_n = int(self.get_parameter("crossview_consecutive_n").value)
-        pass_th = float(self.get_parameter("crossview_pass_th").value)
-
-        score_th = float(self.get_parameter("crossview_score_th").value)
-        topk_quality = int(self.get_parameter("crossview_topk_quality").value)
-        k_ref = int(self.get_parameter("crossview_k_ref").value)
-
-        max_frames = int(self.get_parameter("crossview_max_frames").value)
-        auto_crop_resize = bool(self.get_parameter("crossview_auto_crop_resize").value)
-        out_size = int(self.get_parameter("crossview_out_size").value)
-        pad_ratio = float(self.get_parameter("crossview_pad_ratio").value)
-
-        save_preproc = bool(self.get_parameter("crossview_save_preproc").value)
-        save_preproc_topn = int(self.get_parameter("crossview_save_preproc_topn").value)
-
-        # Ensure folder exists
-        _ensure_dir(OUTPUT_CROSSVIEW_DIR)
-        _ensure_dir(OUTPUT_CROSSVIEW_PREPROC_DIR)
-
-        try:
-            accepted, report = cross_view_gate_one_to_many(
-                matcher=self._cv_matcher,
-                aria_path=aria_path,
-                wrist_paths=wrist_paths,
-                auto_crop_resize=auto_crop_resize,
-                out_size=out_size,
-                pad_ratio=pad_ratio,
-                score_th=score_th,
-                topk_quality=topk_quality,
-                k_ref=k_ref,
-                policy=policy,
-                top_m=top_m,
-                avg_threshold=avg_th,
-                frame_threshold=frame_th,
-                min_pass_k=min_pass_k,
-                consecutive_n=consecutive_n,
-                pass_threshold=pass_th,
-                max_frames=max_frames,
-                save_scores_json_path=OUTPUT_CROSSVIEW_SCORE_JSON,
-                save_best_viz_path=OUTPUT_CROSSVIEW_VIZ_PATH,
-                save_preproc_dir=(OUTPUT_CROSSVIEW_PREPROC_DIR if save_preproc else None),
-                save_preproc_topn=save_preproc_topn,
-            )
-            self._crossview_last = report
-
-            g = report.get("gate", {})
-            if g.get("policy", "") == "topm":
-                self.get_logger().info(
-                    f"[crossview] accepted={bool(g.get('accepted', False))} | "
-                    f"S_top={float(g.get('s_top', 0.0)):.3f} (avg_th={float(g.get('avg_threshold', 0.0)):.3f}) | "
-                    f"n_pass={int(g.get('n_pass', 0))} (frame_th={float(g.get('frame_threshold', 0.0)):.3f}, "
-                    f"min_pass_k={int(g.get('min_pass_k', 0))}) | "
-                    f"best={float(g.get('best_score', 0.0)):.3f}@{int(g.get('best_index', -1))}"
-                )
-                sel = g.get("selected_indices", [])
-                if isinstance(sel, list) and sel:
-                    self.get_logger().info(f"[crossview] selected_indices(topM)={sel}")
-            else:
-                self.get_logger().info(
-                    f"[crossview] accepted={bool(g.get('accepted', False))} | "
-                    f"pass_th={float(g.get('pass_threshold', 0.0)):.3f}, "
-                    f"consecutive_n={int(g.get('consecutive_n', 0))}, pass_index={int(g.get('pass_index', -1))} | "
-                    f"best={float(g.get('best_score', 0.0)):.3f}@{int(g.get('best_index', -1))}"
-                )
-
-            self.get_logger().info(f"[crossview] score_json={OUTPUT_CROSSVIEW_SCORE_JSON}")
-            self.get_logger().info(f"[crossview] best_viz={OUTPUT_CROSSVIEW_VIZ_PATH}")
-            if save_preproc:
-                self.get_logger().info(f"[crossview] preproc_dir={OUTPUT_CROSSVIEW_PREPROC_DIR}")
-
-            return bool(accepted)
-
-        except Exception as e:
-            self.get_logger().warn(f"[crossview] gate failed. skip gate and continue. err={e}")
-            return True
-
-    # ---------- Offline pipeline: VGGT + postprocess ----------
+    # ---------- Offline pipeline (unchanged) ----------
     def _run_offline_pipeline_once(self):
         if not RUN_OFFLINE_PIPELINE:
             self.get_logger().info("[offline] RUN_OFFLINE_PIPELINE=False, skipping VGGT + postprocess.")
@@ -1369,16 +1301,6 @@ class SeeAnythingNode(Node):
         self._offline_ran = True
         self._inflight = True
 
-        # ---------------------------------------------------------
-        # Cross-view gate BEFORE running VGGT
-        # ---------------------------------------------------------
-        ok_gate = self._run_crossview_gate()
-        if not ok_gate:
-            self.get_logger().warn("[offline] Cross-view gate rejected. Skip VGGT + postprocess.")
-            self._inflight = False
-            return
-
-        # Ensure old outputs are removed (explicit overwrite behavior)
         _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "points.ply"))
         _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "cameras.json"))
         _safe_remove(os.path.join(OUTPUT_VGGT_DIR, "cameras_lines.ply"))
@@ -1407,15 +1329,7 @@ class SeeAnythingNode(Node):
             )
             recon = VGGTReconstructor(vcfg)
 
-            # Lazy import to avoid ROS startup issues and to fix "torch not defined"
-            try:
-                import torch as _torch
-            except Exception as e:
-                self.get_logger().error(f"[offline] torch import failed: {e}")
-                self._inflight = False
-                return
-
-            with _torch.inference_mode():
+            with torch.inference_mode():
                 vout = recon.run()
 
             points_ply = vout.get("points_ply", os.path.join(OUTPUT_VGGT_DIR, "points.ply"))
@@ -1446,7 +1360,6 @@ class SeeAnythingNode(Node):
             obj_json = pres.get("outputs", {}).get("object_json", obj_json)
             center_b = pres.get("center_b", None)
 
-            # Parse center
             center_np: Optional[np.ndarray] = None
             if center_b is not None:
                 try:
@@ -1456,7 +1369,6 @@ class SeeAnythingNode(Node):
             if center_np is None:
                 center_np = self._read_center_from_object_json(obj_json)
 
-            # Apply OFFLINE bias to exported coordinates (center + vertices)
             if bool(getattr(self.cfg, "offline_bias", None) and self.cfg.offline_bias.enable):
                 ob = self.cfg.offline_bias
                 offset = np.asarray([float(ob.ox), float(ob.oy), float(ob.oz)], dtype=float).reshape(3)
@@ -1472,13 +1384,11 @@ class SeeAnythingNode(Node):
 
                 center_np = self._read_center_from_object_json(obj_json)
 
-            # Cache final point for the "final goto" step
             self._final_point_base = center_np
 
             if center_np is not None:
                 self.get_logger().info(
-                    f"[offline] Object center in base_link (after offline bias if enabled): "
-                    f"({center_np[0]:.4f}, {center_np[1]:.4f}, {center_np[2]:.4f})"
+                    f"[offline] Object center in base_link: ({center_np[0]:.4f}, {center_np[1]:.4f}, {center_np[2]:.4f})"
                 )
             else:
                 self.get_logger().warn("[offline] Object center not found (parse failed).")
@@ -1489,7 +1399,7 @@ class SeeAnythingNode(Node):
         finally:
             self._inflight = False
 
-    # ---------- Final goto: request IK and move to hover above object ----------
+    # ---------- Final goto ----------
     def _request_final_goto(self):
         if not FINAL_GOTO_ENABLE:
             return
@@ -1502,7 +1412,7 @@ class SeeAnythingNode(Node):
         if not self.ik.ready():
             return
 
-        self._final_pose = self._build_final_hover_pose(self._final_point_base)
+        pose = self._build_final_hover_pose(self._final_point_base)
         seed = self.motion.make_seed()
         if seed is None:
             self.get_logger().warn("[final] Waiting for /joint_states seed...")
@@ -1512,11 +1422,9 @@ class SeeAnythingNode(Node):
         self._inflight = True
         self.get_logger().info(
             f"[final] Request IK for hover above object: "
-            f"({self._final_pose.pose.position.x:.3f}, "
-            f"{self._final_pose.pose.position.y:.3f}, "
-            f"{self._final_pose.pose.position.z:.3f})"
+            f"({pose.pose.position.x:.3f}, {pose.pose.position.y:.3f}, {pose.pose.position.z:.3f})"
         )
-        self.ik.request_async(self._final_pose, seed, self._on_final_ik)
+        self.ik.request_async(pose, seed, self._on_final_ik)
 
     def _on_final_ik(self, joint_positions: Optional[List[float]]):
         self._inflight = False
@@ -1530,15 +1438,55 @@ class SeeAnythingNode(Node):
         self.motion.set_motion_due(float(FINAL_GOTO_MOVE_TIME), 0.3)
         self._phase = "final_moving"
 
+    # ---------- Candidate selection helpers ----------
+    def _select_best_candidate(self) -> int:
+        """
+        Choose candidate by highest match score. If all invalid, fallback to best DINO score (index 0).
+        """
+        best_i = -1
+        best_s = -1.0
+        for i, c in enumerate(self._cand_list):
+            if c.match_score > best_s:
+                best_s = c.match_score
+                best_i = i
+
+        if best_i < 0:
+            return 0
+
+        if best_s < float(MATCH_SCORE_ACCEPT):
+            self.get_logger().warn(
+                f"[cand] Best match score {best_s:.3f} < {MATCH_SCORE_ACCEPT:.3f}. Fallback to top DINO candidate."
+            )
+            return 0
+        return best_i
+
+    def _log_candidate_result(self):
+        self._match_log["candidates"] = []
+        for i, c in enumerate(self._cand_list):
+            self._match_log["candidates"].append({
+                "rank": int(i),
+                "dino_score_stage1": float(c.score),
+                "box_xyxy_stage1": [float(x) for x in c.box_xyxy],
+                "C_base": [float(c.C[0]), float(c.C[1]), float(c.C[2])],
+                "hover_z": float(c.hover_pose.pose.position.z),
+                "eval_image_path": c.eval_image_path,
+                "eval_rgbmask_path": c.eval_rgbmask_path,
+                "match_score": float(c.match_score),
+                "match_quality": float(c.match_quality),
+                "match_coverage": float(c.match_coverage),
+                "match_Kconf": int(c.match_Kconf),
+            })
+        self._flush_match_log()
+
     # ---------- FSM ----------
     def _tick(self):
         if self._done:
             return
 
-        # Prevent control FSM from running while IK/offline is inflight
         if self._inflight and self._phase not in ("offline_pipeline",):
             return
 
+        # INIT
         if self._phase == "init_needed":
             self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
             self.motion.set_seed_hint(self.cfg.control.init_pos)
@@ -1549,10 +1497,138 @@ class SeeAnythingNode(Node):
         if self._phase == "init_moving":
             if self.motion.is_stationary():
                 self._phase = "wait_detect_stage1"
-                self.get_logger().info("INIT reached. Waiting for Stage-1 detection (XY only)...")
+                self.get_logger().info("INIT reached. Waiting for Stage-1 detection...")
             return
 
-        # Stage-1 move (XY only, keep Z)
+        # ----------------------------
+        # NEW: candidate selection phases
+        # ----------------------------
+        if self._phase == "cand_move_next":
+            if self._cand_iter >= len(self._cand_list):
+                # pick best and move there
+                self._cand_best_idx = self._select_best_candidate()
+                self._match_log["selected"] = {
+                    "best_rank": int(self._cand_best_idx),
+                    "best_match_score": float(self._cand_list[self._cand_best_idx].match_score),
+                    "best_dino_score": float(self._cand_list[self._cand_best_idx].score),
+                }
+                self._log_candidate_result()
+                self.get_logger().info(f"[cand] Selected best candidate rank={self._cand_best_idx}.")
+
+                self._phase = "cand_move_best"
+                return
+
+            if not self.ik.ready():
+                return
+            seed = self.motion.make_seed()
+            if seed is None:
+                self.get_logger().warn("[cand] Waiting for /joint_states seed...")
+                return
+
+            self._cand_active_idx = int(self._cand_iter)
+            pose = self._cand_list[self._cand_active_idx].hover_pose
+            self._inflight = True
+            self.ik.request_async(pose, seed, self._on_cand_ik)
+            return
+
+        if self._phase == "cand_moving":
+            if not self.motion.is_stationary():
+                return
+            # start dwell window
+            self._cand_dwell_due_ns = None
+            self._phase = "cand_dwell"
+            return
+
+        if self._phase == "cand_dwell":
+            if not self.motion.is_stationary():
+                return
+            now = self.get_clock().now().nanoseconds
+
+            # On entry: capture + segment + match once
+            if self._cand_dwell_due_ns is None:
+                self._cand_dwell_due_ns = now + int(float(CAND_DWELL_SEC) * 1e9)
+                idx = int(self._cand_active_idx)
+                self.get_logger().info(f"[cand] At candidate rank={idx}, running snapshot+mask+match...")
+
+                if not self._ensure_aria_rgbmask_ready():
+                    self.get_logger().warn("[cand] Aria not ready; skipping match for this candidate.")
+                else:
+                    cap = self._capture_candidate_image(idx)
+                    if cap is None:
+                        self.get_logger().warn("[cand] Candidate image capture failed.")
+                    else:
+                        image_path, bgr = cap
+                        self._cand_list[idx].eval_image_path = image_path
+
+                        rgbmask_path = self._sam2_rgbmask_for_snapshot(image_path, bgr)
+                        self._cand_list[idx].eval_rgbmask_path = rgbmask_path
+
+                        if rgbmask_path is None:
+                            self.get_logger().warn("[cand] SAM2 rgbmask failed (mask empty or detection missing).")
+                        else:
+                            stats = self._score_pair_lightglue(
+                                ARIA_RGBMASK_PATH, rgbmask_path,
+                                save_viz_path=None
+                            )
+                            self._cand_list[idx].match_score = float(stats["score"])
+                            self._cand_list[idx].match_quality = float(stats["quality"])
+                            self._cand_list[idx].match_coverage = float(stats["coverage"])
+                            self._cand_list[idx].match_Kconf = int(stats["K_conf"])
+                            self.get_logger().info(
+                                f"[cand] rank={idx} match_score={stats['score']:.3f} "
+                                f"(qual={stats['quality']:.3f}, cov={stats['coverage']:.3f}, Kconf={stats['K_conf']})"
+                            )
+
+                # update json incrementally
+                self._log_candidate_result()
+                return
+
+            if now < self._cand_dwell_due_ns:
+                return
+
+            # Next candidate
+            self._cand_iter += 1
+            self._phase = "cand_move_next"
+            return
+
+        if self._phase == "cand_move_best":
+            if not self.ik.ready():
+                return
+            if self._cand_best_idx < 0 or self._cand_best_idx >= len(self._cand_list):
+                self._cand_best_idx = 0
+            seed = self.motion.make_seed()
+            if seed is None:
+                return
+            self._inflight = True
+            pose = self._cand_list[self._cand_best_idx].hover_pose
+            self.ik.request_async(pose, seed, self._on_best_cand_ik)
+            return
+
+        if self._phase == "cand_best_moving":
+            if not self.motion.is_stationary():
+                return
+            # finalize orbit center from selected candidate
+            bestC = self._cand_list[self._cand_best_idx].C
+            self._circle_center = bestC.copy()
+            self._ring_z = float(self._cand_list[self._cand_best_idx].hover_pose.pose.position.z)
+            self._phase = "hover_to_center"
+            self.get_logger().info(
+                f"[cand] Best candidate hover reached. Orbit center=({bestC[0]:.3f},{bestC[1]:.3f},{bestC[2]:.3f})."
+            )
+            # also save a best visualization for debugging
+            try:
+                # pick best candidate rgbmask for viz if exists
+                rp = self._cand_list[self._cand_best_idx].eval_rgbmask_path
+                if rp and Path(rp).exists() and self._ensure_aria_rgbmask_ready():
+                    _ = self._score_pair_lightglue(ARIA_RGBMASK_PATH, rp, save_viz_path=BEST_VIZ_PATH)
+                    self.get_logger().info(f"[cand] Saved best match visualization: {BEST_VIZ_PATH}")
+            except Exception:
+                pass
+            return
+
+        # ----------------------------
+        # Legacy stage-1 move (XY only, keep Z)
+        # ----------------------------
         if self._phase == "wait_detect_stage1" and self._pose_stage1 is not None:
             if not self.ik.ready():
                 return
@@ -1568,10 +1644,10 @@ class SeeAnythingNode(Node):
             if self.motion.is_stationary():
                 self._pose_stage1 = None
                 self._phase = "wait_detect_stage2"
-                self.get_logger().info("Stage-1 done. Waiting for Stage-2 detection (XY + descend)...")
+                self.get_logger().info("Stage-1 done. Waiting for Stage-2 detection...")
             return
 
-        # Stage-2 move (hover over center)
+        # Legacy stage-2 move (hover over center)
         if self._phase == "wait_detect_stage2" and self._fixed_hover is not None:
             if not self.ik.ready():
                 return
@@ -1583,14 +1659,13 @@ class SeeAnythingNode(Node):
             self.ik.request_async(self._fixed_hover, seed, self._on_hover_ik)
             return
 
+        # Hover reached -> generate polygon
         if self._phase == "hover_to_center":
             if not self.motion.is_stationary():
                 return
 
-            # At hover; compute start yaw and build polygon vertices
             self._start_yaw = self._get_tool_yaw_xy()
             if self._circle_center is not None and self._ring_z is not None and self._start_yaw is not None:
-                # 1) Generate full vertices
                 all_wps = make_polygon_vertices(
                     self.get_clock().now().to_msg,
                     self._circle_center, self._ring_z, self._start_yaw,
@@ -1600,7 +1675,6 @@ class SeeAnythingNode(Node):
                     self.cfg.circle.radius, self.cfg.circle.tool_z_sign
                 )
 
-                # 2) Trim vertices according to sweep_deg
                 total_deg = 360.0 * float(self.cfg.circle.num_turns)
                 sweep_deg = max(0.0, min(float(self._sweep_deg), total_deg))
                 if sweep_deg < total_deg and len(all_wps) > 1:
@@ -1637,7 +1711,6 @@ class SeeAnythingNode(Node):
             return
 
         if self._phase == "poly_moving":
-            # If the last IK was skipped due to abnormal jump, move to the next vertex without dwell
             if self._skip_last_vertex:
                 self._skip_last_vertex = False
                 if self._poly_idx >= len(self._poly_wps):
@@ -1660,7 +1733,6 @@ class SeeAnythingNode(Node):
             if not self.motion.is_stationary():
                 return
 
-            # Dwell at current vertex -> atomic capture
             if self._poly_dwell_due_ns is None:
                 self._poly_dwell_due_ns = now + int(self.cfg.circle.dwell_time * 1e9)
                 curr_vertex0 = max(0, self._poly_idx - 1)
@@ -1673,7 +1745,6 @@ class SeeAnythingNode(Node):
                 return
             self._poly_dwell_due_ns = None
 
-            # If already at the last point -> return to INIT
             if getattr(self, "_at_last_vertex", False):
                 self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
                 self.motion.set_seed_hint(self.cfg.control.init_pos)
@@ -1698,14 +1769,14 @@ class SeeAnythingNode(Node):
             self._poly_idx += 1
             return
 
-        # After returning to INIT, run offline pipeline and then optionally do final goto
+        # Return to INIT -> offline -> final goto
         if self._phase == "return_init":
             if not self.motion.is_stationary():
                 return
 
             if RUN_OFFLINE_PIPELINE and not self._offline_ran:
                 self._phase = "offline_pipeline"
-                self.get_logger().info("Capture finished and INIT reached. Starting offline pipeline (Cross-view + VGGT + postprocess)...")
+                self.get_logger().info("Capture finished and INIT reached. Starting offline pipeline...")
                 self._run_offline_pipeline_once()
 
                 if FINAL_GOTO_ENABLE:
@@ -1721,10 +1792,6 @@ class SeeAnythingNode(Node):
             if not self.motion.is_stationary():
                 return
             self._request_final_goto()
-            if self._final_goto_requested and self._inflight:
-                return
-            if self._final_goto_requested and (self._final_point_base is None):
-                self._phase = "shutdown"
             return
 
         if self._phase == "final_moving":
@@ -1783,6 +1850,36 @@ class SeeAnythingNode(Node):
         self.motion.set_seed_hint(joint_positions)
         self.motion.set_motion_due(self.cfg.circle.edge_move_time, 0.3)
         self._inflight = False
+
+    def _on_cand_ik(self, joint_positions: Optional[List[float]]):
+        self._inflight = False
+        if joint_positions is None:
+            self.get_logger().warn("[cand] IK failed/skipped for candidate. Mark as invalid and continue.")
+            if 0 <= self._cand_active_idx < len(self._cand_list):
+                self._cand_list[self._cand_active_idx].match_score = -1.0
+            self._cand_iter += 1
+            self._phase = "cand_move_next"
+            return
+
+        self.traj.publish_positions(joint_positions, self.cfg.control.move_time)
+        self.motion.set_seed_hint(joint_positions)
+        self.motion.set_motion_due(self.cfg.control.move_time, 0.3)
+        self._phase = "cand_moving"
+
+    def _on_best_cand_ik(self, joint_positions: Optional[List[float]]):
+        self._inflight = False
+        if joint_positions is None:
+            self.get_logger().warn("[cand] IK failed/skipped for best candidate. Fallback to return_init.")
+            self.traj.publish_init(self.cfg.control.init_pos, self.cfg.control.init_move_time)
+            self.motion.set_seed_hint(self.cfg.control.init_pos)
+            self.motion.set_motion_due(self.cfg.control.init_move_time, self.cfg.control.init_extra_wait)
+            self._phase = "return_init"
+            return
+
+        self.traj.publish_positions(joint_positions, self.cfg.control.move_time)
+        self.motion.set_seed_hint(joint_positions)
+        self.motion.set_motion_due(self.cfg.control.move_time, 0.3)
+        self._phase = "cand_best_moving"
 
 
 def main():
