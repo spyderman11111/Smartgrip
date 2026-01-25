@@ -5,12 +5,22 @@
 Aria live RGB + EyeTrack -> gaze projection on RGB -> SAM2 single-frame ROI box segmentation (local weights).
 
 Keys:
-- Press 's' to run SAM2 on a gaze-centered ROI box and save:
-  1) rotated RGB (no overlay)
-  2) binary mask (full image, ROI outside forced 0)
-  3) white-background cutout (full image)
-  4) debug RGB with gaze dot + ROI box
-- Press 'q' or ESC to exit.
+- Press 's' to run SAM2 on a gaze-centered ROI box and save 4 outputs (NO timestamp, fixed names).
+
+Outputs (fixed names, PNG):
+  1) gaze_sam2_mask_bin.png
+     - binary mask (0/255), full image, ROI outside forced 0
+  2) gaze_sam2_roi_mask_rgb.png
+     - color masked image within ROI (black background; only mask pixels kept)
+  3) gaze_sam2_rgb_rot.png
+     - rotated RGB (no overlay)
+  4) gaze_sam2_debug_gaze_roi.png
+     - debug RGB with gaze dot + ROI box
+
+Main-script (seeanything.py) compatibility:
+- Your seeanything.py looks for latest "*_rgb_rot.png" and then the paired "*_mask_bin.png".
+- We keep names ending with "_rgb_rot.png" and "_mask_bin.png" AND write mask first, rgb_rot last
+  to avoid race conditions.
 
 Mask semantics:
 - By default, we INVERT the SAM2 mask inside ROI (because your current output tends to be background).
@@ -21,7 +31,6 @@ Mask semantics:
 import argparse
 import os
 import sys
-import time
 from typing import Optional, Tuple
 
 import aria.sdk as aria
@@ -55,6 +64,9 @@ DEFAULT_SAM2_ROOT = "/home/MA_SmartGrip/Smartgrip/Grounded-SAM-2"
 DEFAULT_SAM2_CKPT = "/home/MA_SmartGrip/Smartgrip/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt"
 DEFAULT_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
+# Default out dir to match seeanything.py expectation:
+DEFAULT_ARIA_OUT_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage"
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -80,6 +92,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sam2-max-hole-area", type=float, default=100.0)
     p.add_argument("--sam2-max-sprinkle-area", type=float, default=50.0)
 
+    # output directory (must match seeanything.py ARIA_OUT_DIR)
+    p.add_argument("--out-dir", type=str, default=DEFAULT_ARIA_OUT_DIR)
+
+    # fixed output basenames (NO timestamp)
+    p.add_argument("--fn-mask-bin", type=str, default="gaze_sam2_mask_bin.png")
+    p.add_argument("--fn-roi-mask-rgb", type=str, default="gaze_sam2_roi_mask_rgb.png")
+    p.add_argument("--fn-rgb-rot", type=str, default="gaze_sam2_rgb_rot.png")
+    p.add_argument("--fn-debug", type=str, default="gaze_sam2_debug_gaze_roi.png")
+
     # default: ON
     p.add_argument(
         "--no-invert-roi-mask",
@@ -90,6 +111,39 @@ def parse_args() -> argparse.Namespace:
     p.set_defaults(invert_roi_mask=True)
 
     return p.parse_args()
+
+
+def _ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _atomic_imwrite_png(path: str, img: np.ndarray) -> None:
+    """
+    Atomic PNG write that does NOT depend on filename extension.
+    Uses cv2.imencode('.png', ...) then writes bytes to a temp file and os.replace().
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    _ensure_dir(d)
+
+    # Make sure image is contiguous and a supported dtype
+    if img is None:
+        raise RuntimeError("atomic_imwrite_png: img is None")
+
+    if img.dtype != np.uint8:
+        # Most of your outputs are uint8 already; keep it safe here
+        img = img.astype(np.uint8, copy=False)
+
+    img = np.ascontiguousarray(img)
+
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError(f"cv2.imencode('.png', ...) failed for: {path}")
+
+    tmp = path + ".tmp"  # extension doesn't matter now
+    with open(tmp, "wb") as f:
+        f.write(buf.tobytes())
+
+    os.replace(tmp, path)
 
 
 def import_sam2_local(sam2_root: str):
@@ -110,7 +164,6 @@ def resolve_sam2_config(sam2_root: str, cfg_arg: str) -> Tuple[str, str]:
     if os.path.isabs(arg):
         if not os.path.isfile(arg):
             raise FileNotFoundError(f"SAM2 config not found: {arg}")
-        # best-effort hydra name
         sam2_pkg_root = os.path.join(sam2_root, "sam2")
         try:
             rel = os.path.relpath(arg, sam2_pkg_root)
@@ -199,32 +252,62 @@ def to_sam_rgb(rotated: np.ndarray, fmt: str) -> np.ndarray:
     return rotated.copy()
 
 
-def save_outputs(rgb_rot_rgb: np.ndarray, mask: np.ndarray, dbg_bgr: np.ndarray, prefix: str = "gaze_sam2"):
-    here = os.path.dirname(os.path.abspath(__file__))
-    ts = time.strftime("%Y%m%d_%H%M%S")
+def _build_rgbmask_blackbg(rgb_rot_rgb: np.ndarray, mask_bool: np.ndarray) -> np.ndarray:
+    """
+    Build object-only RGB image (black background) from boolean mask.
+    rgb_rot_rgb is RGB; output is RGB.
+    """
+    out = np.zeros_like(rgb_rot_rgb, dtype=np.uint8)
+    if mask_bool is not None and mask_bool.any():
+        out[mask_bool] = rgb_rot_rgb[mask_bool]
+    return out
 
-    rgb_path = os.path.join(here, f"{prefix}_{ts}_rgb_rot.png")
-    mask_path = os.path.join(here, f"{prefix}_{ts}_mask_bin.png")
-    cut_path = os.path.join(here, f"{prefix}_{ts}_cutout_whitebg.png")
-    dbg_path = os.path.join(here, f"{prefix}_{ts}_rgb_gaze_box.png")
 
-    cv2.imwrite(rgb_path, cv2.cvtColor(rgb_rot_rgb, cv2.COLOR_RGB2BGR))
+def save_outputs_fixed(
+    rgb_rot_rgb: np.ndarray,
+    mask_bool: np.ndarray,
+    dbg_bgr: np.ndarray,
+    out_dir: str,
+    fn_mask_bin: str,
+    fn_roi_mask_rgb: str,
+    fn_rgb_rot: str,
+    fn_debug: str,
+):
+    """
+    Save 4 outputs with fixed names (no timestamp) to out_dir.
 
-    mask_u8 = (mask.astype(np.uint8) * 255)
-    cv2.imwrite(mask_path, mask_u8)
+    IMPORTANT for seeanything.py pairing logic:
+    - write mask_bin first, rgb_rot last
+    - use atomic write for all files
+    """
+    _ensure_dir(out_dir)
 
-    cutout = np.full_like(rgb_rot_rgb, 255)
-    cutout[mask] = rgb_rot_rgb[mask]
-    cv2.imwrite(cut_path, cv2.cvtColor(cutout, cv2.COLOR_RGB2BGR))
+    p_mask = os.path.join(out_dir, fn_mask_bin)
+    p_roi_rgb = os.path.join(out_dir, fn_roi_mask_rgb)
+    p_dbg = os.path.join(out_dir, fn_debug)
+    p_rgb = os.path.join(out_dir, fn_rgb_rot)
 
-    cv2.imwrite(dbg_path, dbg_bgr)
+    # 1) binary mask: 0/255 uint8
+    mask_u8 = (mask_bool.astype(np.uint8) * 255)
+    _atomic_imwrite_png(p_mask, mask_u8)
 
-    print(f"[Saved] {rgb_path}")
-    print(f"[Saved] {mask_path}")
-    print(f"[Saved] {cut_path}")
-    print(f"[Saved] {dbg_path}")
+    # 2) ROI masked color image (black background)
+    roi_rgb = _build_rgbmask_blackbg(rgb_rot_rgb, mask_bool)
+    _atomic_imwrite_png(p_roi_rgb, cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR))
 
-    return cutout
+    # 3) debug
+    _atomic_imwrite_png(p_dbg, dbg_bgr)
+
+    # 4) rotated rgb (no overlay) - write LAST to avoid race
+    _atomic_imwrite_png(p_rgb, cv2.cvtColor(rgb_rot_rgb, cv2.COLOR_RGB2BGR))
+
+    print("[Saved-fixed]")
+    print(f"  mask_bin      : {p_mask}")
+    print(f"  roi_mask_rgb  : {p_roi_rgb}")
+    print(f"  debug         : {p_dbg}")
+    print(f"  rgb_rot       : {p_rgb}")
+
+    return roi_rgb
 
 
 class Observer:
@@ -322,6 +405,8 @@ def start_streaming(streaming_interface: str, profile_name: str, device_ip: Opti
     scfg.profile_name = profile_name
     if streaming_interface == "usb":
         scfg.streaming_interface = aria.StreamingInterface.Usb
+    else:
+        scfg.streaming_interface = aria.StreamingInterface.Wifi
     scfg.security_options.use_ephemeral_certs = True
     mgr.streaming_config = scfg
 
@@ -377,6 +462,14 @@ def main():
 
     aria.set_log_level(aria.Level.Info)
 
+    _ensure_dir(args.out_dir)
+    print(f"[OutDir] {args.out_dir}")
+    print("[OutFiles]")
+    print(f"  mask_bin     : {args.fn_mask_bin}")
+    print(f"  roi_mask_rgb : {args.fn_roi_mask_rgb}")
+    print(f"  rgb_rot      : {args.fn_rgb_rot}")
+    print(f"  debug        : {args.fn_debug}")
+
     dev_calib, rgb_calib, rgb_label = load_calibration_from_vrs(args.calib_vrs)
     print(f"[Calib] RGB label: {rgb_label}")
 
@@ -417,7 +510,7 @@ def main():
 
     rgb_win = "Aria RGB (Gaze)"
     eye_win = "Aria EyeTrack"
-    sam_win = "SAM2 Cutout"
+    sam_win = "SAM2 ROI Mask RGB"
 
     cv2.namedWindow(rgb_win, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(rgb_win, 960, 960)
@@ -434,7 +527,7 @@ def main():
     print("[Main] Press 's' to segment & save. Press 'q' or ESC to exit.")
     print(f"[Main] invert_roi_mask = {args.invert_roi_mask} (disable with --no-invert-roi-mask)")
 
-    latest_cutout_bgr = None
+    latest_roi_rgb_bgr = None
     graceful_exit = True
 
     try:
@@ -458,8 +551,8 @@ def main():
                 eye_bgr = to_display_bgr(rotated_eye, "gray")
                 cv2.imshow(eye_win, eye_bgr)
 
-            if latest_cutout_bgr is not None:
-                cv2.imshow(sam_win, latest_cutout_bgr)
+            if latest_roi_rgb_bgr is not None:
+                cv2.imshow(sam_win, latest_roi_rgb_bgr)
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -487,14 +580,23 @@ def main():
                 else:
                     mask = roi_gate & full_mask
 
-                print(f"[SAM2] score={score:.4f}  ROI=({x1},{y1})-({x2},{y2})")
+                print(f"[SAM2] score={score:.4f}  ROI=({x1},{y1})-({x2},{y2})  mask_pixels={int(mask.sum())}")
 
                 dbg = cv2.cvtColor(obs.rgb_rot_rgb, cv2.COLOR_RGB2BGR)
                 cv2.circle(dbg, (gx, gy), 12, (0, 255, 0), thickness=-1)
                 cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), thickness=2)
 
-                cutout_rgb = save_outputs(obs.rgb_rot_rgb, mask, dbg, prefix="gaze_sam2")
-                latest_cutout_bgr = cv2.cvtColor(cutout_rgb, cv2.COLOR_RGB2BGR)
+                roi_rgb = save_outputs_fixed(
+                    obs.rgb_rot_rgb,
+                    mask,
+                    dbg,
+                    out_dir=args.out_dir,
+                    fn_mask_bin=args.fn_mask_bin,
+                    fn_roi_mask_rgb=args.fn_roi_mask_rgb,
+                    fn_rgb_rot=args.fn_rgb_rot,
+                    fn_debug=args.fn_debug,
+                )
+                latest_roi_rgb_bgr = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR)
 
             if key == ord("q") or key == 27:
                 print("[Main] Exit.")
@@ -540,21 +642,9 @@ python stream_rgb_eye_sam2.py \
   --profile profile18 \
   --calib_vrs /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs \
   --device cuda \
-  --gaze-box-size 150 \
+  --gaze-box-size 200 \
   --sam2-root /home/MA_SmartGrip/Smartgrip/Grounded-SAM-2 \
   --sam2-ckpt /home/MA_SmartGrip/Smartgrip/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt \
-  --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml
-  
-python stream_rgb_eye_sam2.py \
-  --interface wifi \
-  --device-ip 192.168.0.102 \
-  --profile profile18 \
-  --calib_vrs /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs \
-  --update_iptables \
-  --device cuda \
-  --gaze-box-size 320 \
-  --sam2-root /home/MA_SmartGrip/Smartgrip/Grounded-SAM-2 \
-  --sam2-ckpt /home/MA_SmartGrip/Smartgrip/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt \
-  --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml
-  
-  """
+  --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \
+  --out-dir /home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage
+"""

@@ -12,18 +12,29 @@ Key guarantees preserved:
 - Atomic capture binding {image, image_stamp} and TF computed strictly at image_stamp (NO fallback-to-latest)
 - Offline pipeline behavior unchanged (VGGT + postprocess + optional offline bias + final goto)
 
-Assumptions (by default):
-- Aria script outputs are in: <OUTPUT_ROOT>/ariaimage
-  with files like:
-    gaze_sam2_<ts>_rgb_rot.png
-    gaze_sam2_<ts>_mask_bin.png
-- This node will build an Aria object-only rgbmask (black background) into:
+Aria outputs (UPDATED - naming-robust):
+- This node reads the latest {RGB, MASK} pair from:
+    <OUTPUT_ROOT>/ariaimage
+  It no longer assumes a single hard-coded filename pattern.
+  It will:
+    - search RGB candidates: filenames containing 'rgb' (not containing 'mask')
+    - search MASK candidates: filenames containing 'mask'
+    - pair them by (a) common stem after stripping known rgb/mask suffixes, or (b) shared timestamp digits
+- Then it builds an Aria object-only rgbmask (black background) into:
     <OUTPUT_ROOT>/match_results/aria_rgbmask.png
 
 New outputs:
 - Candidate evaluation snapshots / masks / json:
     <OUTPUT_ROOT>/match_results/candidates/
     <OUTPUT_ROOT>/match_results/candidate_selection.json
+
+[NEW in this version]
+More debug prints:
+- Stage-1 DINO detection summary: total detections, >= min_exec_score count, top-k listing
+- Route decision prints: ROUTE-1 legacy vs ROUTE-2 multi-candidate (and reasons)
+- ROUTE-2 candidate list prints: each candidate stage-1 dino score and geometry
+- ROUTE-2 per-candidate matching prints: match_score/quality/coverage/Kconf
+- Final candidate comparison table before selection + selection reason (or fallback to top DINO)
 """
 
 from __future__ import annotations
@@ -31,6 +42,7 @@ from __future__ import annotations
 from typing import Optional, List, Dict, Any, Tuple
 import math
 import os
+import re
 import json
 import threading
 from datetime import datetime
@@ -123,6 +135,16 @@ SAM2_ID = "facebook/sam2.1-hiera-large"
 SAM2_MASK_THRESHOLD = 0.30
 SAM2_MAX_HOLE_AREA = 100.0
 SAM2_MAX_SPRINKLE_AREA = 50.0
+
+
+# -----------------------------------------------------------------------------
+# Debug prints (more transparency for stage-1 and candidate selection)
+# -----------------------------------------------------------------------------
+DEBUG_STAGE1_DINO_PRINT = True
+DEBUG_STAGE1_DINO_TOPK = 10
+DEBUG_STAGE1_DINO_PRINT_BOXES = True
+DEBUG_ROUTE_PRINT = True
+DEBUG_CAND_TABLE_PRINT = True
 
 
 # -----------------------------------------------------------------------------
@@ -264,7 +286,13 @@ class _LGMatcher:
 
     @staticmethod
     def _bgr_to_tensor_rgb01(img_bgr: np.ndarray, device: str) -> torch.Tensor:
-        img_rgb = img_bgr[:, :, ::-1]  # BGR->RGB
+        """
+        FIX: avoid negative-stride numpy views.
+        torch.from_numpy() does NOT accept negative strides (e.g., img[..., ::-1]).
+        Use cv2.cvtColor + np.ascontiguousarray instead.
+        """
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_rgb = np.ascontiguousarray(img_rgb)
         t = torch.from_numpy(img_rgb).permute(2, 0, 1).contiguous().float() / 255.0
         return t.to(device)
 
@@ -405,26 +433,148 @@ def _draw_matches_image(
 
 
 # -----------------------------------------------------------------------------
-# Aria rgbmask builder (from latest aria *_rgb_rot.png + *_mask_bin.png)
+# Aria rgbmask builder (UPDATED: naming-robust pairing)
 # -----------------------------------------------------------------------------
+def _strip_known_suffix(stem: str, suffixes: List[str]) -> str:
+    s = stem
+    lowered = s.lower()
+    changed = True
+    while changed:
+        changed = False
+        for suf in suffixes:
+            if lowered.endswith(suf):
+                s = s[: -len(suf)]
+                lowered = s.lower()
+                changed = True
+                break
+    return s
+
+
+def _extract_ts_token(name_lower: str) -> Optional[str]:
+    """
+    Extract a plausible timestamp token from filename (>=10 digits).
+    Returns the first match.
+    """
+    m = re.search(r"(\d{10,})", name_lower)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _is_rgb_candidate(p: Path) -> bool:
+    n = p.name.lower()
+    if p.suffix.lower() not in [".png", ".jpg", ".jpeg", ".bmp"]:
+        return False
+    if "mask" in n:
+        return False
+    if "rgb" not in n:
+        return False
+    if "rgbmask" in n:
+        return False
+    return True
+
+
+def _is_mask_candidate(p: Path) -> bool:
+    n = p.name.lower()
+    if p.suffix.lower() not in [".png", ".jpg", ".jpeg", ".bmp", ".npy"]:
+        return False
+    return ("mask" in n) or n.endswith("_mask.npy")
+
+
+def _read_mask_any(path: str) -> Optional[np.ndarray]:
+    """
+    Read mask from .png/.jpg or .npy.
+    Returns uint8 mask array.
+    """
+    try:
+        if path.lower().endswith(".npy"):
+            arr = np.load(path)
+            if arr is None:
+                return None
+            arr = np.asarray(arr)
+            if arr.dtype != np.uint8:
+                # normalize to {0,255} style
+                if arr.max() <= 1:
+                    arr = (arr > 0).astype(np.uint8) * 255
+                else:
+                    arr = np.clip(arr, 0, 255).astype(np.uint8)
+            return arr
+        m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        return m
+    except Exception:
+        return None
+
+
 def _find_latest_aria_pair(aria_dir: str) -> Optional[Tuple[str, str]]:
     """
-    Find the latest (rgb_rot, mask_bin) pair from Aria output dir.
-    Expects filenames like:
-      gaze_sam2_<ts>_rgb_rot.png
-      gaze_sam2_<ts>_mask_bin.png
+    Find the latest (rgb, mask) pair from Aria output dir (naming-robust).
+
+    Pairing strategies (in order):
+    1) Same stem after stripping known rgb/mask suffixes.
+    2) Same timestamp digits (>=10 digits) contained in filenames.
+    3) Fallback: choose latest RGB and the latest MASK (if exists).
     """
     d = Path(aria_dir)
     if not d.exists():
         return None
 
-    rgbs = sorted(d.glob("*_rgb_rot.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for rgbp in rgbs:
-        base = rgbp.name.replace("_rgb_rot.png", "")
-        maskp = d / f"{base}_mask_bin.png"
-        if maskp.exists():
-            return str(rgbp), str(maskp)
-    return None
+    files = [p for p in d.iterdir() if p.is_file()]
+    rgb_files = [p for p in files if _is_rgb_candidate(p)]
+    mask_files = [p for p in files if _is_mask_candidate(p)]
+
+    if not rgb_files or not mask_files:
+        return None
+
+    rgb_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    mask_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    rgb_suffixes = [
+        "_rgb_rot", "_rgbrot", "_rgb", "_rgb8", "_rgb_raw", "_rgb_color",
+        "_rgb_resized", "_rgb_resize", "_rgb_crop", "_rgb_cropped",
+        "_rgb_vis", "_rgb_debug", "_rgb_out",
+    ]
+    mask_suffixes = [
+        "_mask_bin", "_mask", "_mask_binary", "_mask_raw", "_mask_uint8",
+        "_mask_vis", "_mask_debug", "_mask_out",
+    ]
+
+    # Pre-index masks by normalized base
+    mask_by_base: Dict[str, List[Path]] = {}
+    mask_by_ts: Dict[str, List[Path]] = {}
+
+    for mp in mask_files:
+        base = _strip_known_suffix(mp.stem, mask_suffixes)
+        base = base.strip("_- ")
+        mask_by_base.setdefault(base, []).append(mp)
+
+        ts = _extract_ts_token(mp.name.lower())
+        if ts:
+            mask_by_ts.setdefault(ts, []).append(mp)
+
+    # 1) Try base-stem pairing for latest RGB first
+    for rp in rgb_files:
+        base = _strip_known_suffix(rp.stem, rgb_suffixes)
+        base = base.strip("_- ")
+        if base in mask_by_base and mask_by_base[base]:
+            # pick the newest mask among this base
+            mps = sorted(mask_by_base[base], key=lambda p: p.stat().st_mtime, reverse=True)
+            return str(rp), str(mps[0])
+
+        # 2) Try timestamp pairing
+        ts = _extract_ts_token(rp.name.lower())
+        if ts and ts in mask_by_ts and mask_by_ts[ts]:
+            mps = sorted(mask_by_ts[ts], key=lambda p: p.stat().st_mtime, reverse=True)
+            return str(rp), str(mps[0])
+
+        # 3) Try a soft contains search: any mask that contains the base substring
+        if base:
+            cand = [mp for mp in mask_files if base in mp.name]
+            if cand:
+                cand.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                return str(rp), str(cand[0])
+
+    # final fallback: latest rgb + latest mask
+    return str(rgb_files[0]), str(mask_files[0])
 
 
 def _build_rgbmask_blackbg(bgr: np.ndarray, mask_uint8: np.ndarray) -> np.ndarray:
@@ -454,14 +604,15 @@ def _save_aria_rgbmask(aria_dir: str, out_path: str) -> Optional[Dict[str, str]]
     bgr = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
     if bgr is None:
         return None
-    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+    mask = _read_mask_any(mask_path)
     if mask is None:
         return None
 
     rgbmask = _build_rgbmask_blackbg(bgr, mask)
     _ensure_dir(str(Path(out_path).parent))
     cv2.imwrite(out_path, rgbmask)
-    return {"rgb_rot": rgb_path, "mask_bin": mask_path, "aria_rgbmask": out_path}
+    return {"rgb": rgb_path, "mask": mask_path, "aria_rgbmask": out_path}
 
 
 # -----------------------------------------------------------------------------
@@ -635,6 +786,10 @@ class SeeAnythingNode(Node):
         self.create_timer(0.05, self._tick)
         self._frame_count = 0
 
+        # Debug print guards (avoid flooding)
+        self._stage1_dino_printed = False
+        self._route_printed_stage1 = False
+
         ob = self.cfg.offline_bias
         self.get_logger().info(
             f"[seeanything] topic={self.cfg.frames.image_topic}, hover={self.cfg.control.hover_above:.3f}m, "
@@ -706,6 +861,108 @@ class SeeAnythingNode(Node):
         except Exception as ex:
             self.get_logger().warn(f"Read tool yaw failed: {ex}")
             return None
+
+    # ---------- debug: stage-1 DINO summaries ----------
+    def _run_dino_on_rgb_np(self, rgb_np: np.ndarray):
+        """
+        Run GroundingDINO once on an RGB uint8 image (H,W,3).
+        Return boxes(list-like), labels(list-like), scores(np.ndarray float).
+        """
+        from PIL import Image as PILImage
+        pil = PILImage.fromarray(rgb_np)
+        out = self.predictor.predict(
+            pil, self.cfg.dino.text_prompt,
+            box_threshold=self.cfg.dino.box_threshold,
+            text_threshold=self.cfg.dino.text_threshold
+        )
+        if not isinstance(out, tuple) or len(out) < 2:
+            return [], [], np.zeros((0,), dtype=np.float32)
+
+        boxes, labels = out[:2]
+        scores = out[2] if len(out) >= 3 else [None] * len(boxes)
+
+        s = []
+        for x in scores:
+            if x is None:
+                s.append(float("nan"))
+            elif hasattr(x, "detach"):
+                s.append(float(x.detach().cpu().item()))
+            else:
+                s.append(float(x))
+        s = np.asarray(s, dtype=np.float32)
+        return boxes, labels, s
+
+    def _log_stage1_dino_detections(self, rgb_np: np.ndarray, tag: str = "Stage-1"):
+        """
+        Print a clear summary of DINO detections for the current prompt.
+        """
+        if not DEBUG_STAGE1_DINO_PRINT:
+            return
+
+        boxes, labels, s = self._run_dino_on_rgb_np(rgb_np)
+        n_all = int(len(boxes))
+        if n_all == 0:
+            self.get_logger().info(
+                f"[{tag}][DINO] prompt='{self.cfg.dino.text_prompt}' -> 0 detections "
+                f"(box_th={self.cfg.dino.box_threshold:.2f}, text_th={self.cfg.dino.text_threshold:.2f})"
+            )
+            return
+
+        min_exec = float(self.cfg.dino.min_exec_score)
+        n_ge = int(np.sum(np.isfinite(s) & (s >= min_exec)))
+        s_max = float(np.nanmax(s)) if np.any(np.isfinite(s)) else float("nan")
+
+        order = np.argsort(-np.nan_to_num(s, nan=-1e9))
+        topk = int(min(int(DEBUG_STAGE1_DINO_TOPK), n_all))
+
+        self.get_logger().info(
+            f"[{tag}][DINO] prompt='{self.cfg.dino.text_prompt}' | total={n_all} | "
+            f">=min_exec({min_exec:.2f})={n_ge} | max={s_max:.3f} | "
+            f"box_th={self.cfg.dino.box_threshold:.2f} text_th={self.cfg.dino.text_threshold:.2f}"
+        )
+
+        if not DEBUG_STAGE1_DINO_PRINT_BOXES:
+            return
+
+        for rank, bi in enumerate(order[:topk]):
+            sc = float(s[bi]) if np.isfinite(s[bi]) else float("nan")
+            b = boxes[bi].tolist() if hasattr(boxes[bi], "tolist") else boxes[bi]
+            x0, y0, x1, y1 = [float(v) for v in b]
+            u = 0.5 * (x0 + x1)
+            v = 0.5 * (y0 + y1)
+            lab = labels[bi] if isinstance(labels, (list, tuple)) and bi < len(labels) else ""
+            self.get_logger().info(
+                f"[{tag}][DINO] rank={rank:02d} score={sc:.3f} uv=({u:.1f},{v:.1f}) "
+                f"box=({x0:.1f},{y0:.1f},{x1:.1f},{y1:.1f}) label='{lab}'"
+            )
+
+    def _log_candidate_comparison_table(self, title: str, sort_by: str = "match"):
+        """
+        Print a compact comparison table of candidates.
+        sort_by: 'match' or 'dino'
+        """
+        if not DEBUG_CAND_TABLE_PRINT:
+            return
+        if not self._cand_list:
+            return
+
+        if sort_by == "dino":
+            idxs = sorted(range(len(self._cand_list)), key=lambda i: self._cand_list[i].score, reverse=True)
+        else:
+            idxs = sorted(range(len(self._cand_list)), key=lambda i: self._cand_list[i].match_score, reverse=True)
+
+        self.get_logger().info(f"[cand][table] {title} (sorted_by={sort_by})")
+        self.get_logger().info(
+            "[cand][table] rank | dino_score | match_score | quality | coverage | Kconf | "
+            "C_base(x,y,z) | hover_z"
+        )
+        for i in idxs:
+            c = self._cand_list[i]
+            self.get_logger().info(
+                f"[cand][table] {i:4d} | {c.score:9.3f} | {c.match_score:10.3f} | "
+                f"{c.match_quality:7.3f} | {c.match_coverage:8.3f} | {c.match_Kconf:5d} | "
+                f"({c.C[0]:.3f},{c.C[1]:.3f},{c.C[2]:.3f}) | {c.hover_pose.pose.position.z:.3f}"
+            )
 
     # ---------- camera pose at image stamp (unchanged) ----------
     def _calc_camera_pose_at_stamp(self, stamp_msg) -> Optional[Dict[str, Any]]:
@@ -835,7 +1092,6 @@ class SeeAnythingNode(Node):
         Run DINO on the candidate snapshot and pick best box by score.
         Return (xyxy_int, best_score).
         """
-        # Convert BGR->RGB for PIL
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         from PIL import Image as PILImage
         pil = PILImage.fromarray(rgb)
@@ -1055,7 +1311,23 @@ class SeeAnythingNode(Node):
             ))
 
         if len(cand_list) == 0:
+            if DEBUG_STAGE1_DINO_PRINT:
+                self.get_logger().info(
+                    f"[Stage-1][cand] after filter: kept=0 (min_exec_score={min_s:.2f}), raw_total={len(boxes)}"
+                )
             return None
+
+        if DEBUG_STAGE1_DINO_PRINT:
+            self.get_logger().info(
+                f"[Stage-1][cand] after filter: kept={len(cand_list)} (min_exec_score={min_s:.2f}), raw_total={len(boxes)}"
+            )
+            for i, c in enumerate(cand_list):
+                self.get_logger().info(
+                    f"[Stage-1][cand] rank={i} dino_score={c.score:.3f} "
+                    f"C_base=({c.C[0]:.3f},{c.C[1]:.3f},{c.C[2]:.3f}) hover_z={c.hover_pose.pose.position.z:.3f} "
+                    f"box=({c.box_xyxy[0]:.1f},{c.box_xyxy[1]:.1f},{c.box_xyxy[2]:.1f},{c.box_xyxy[3]:.1f})"
+                )
+
         return cand_list
 
     # ---------- image callback ----------
@@ -1077,6 +1349,15 @@ class SeeAnythingNode(Node):
         if not self.motion.is_stationary():
             return
 
+        # Debug: print stage-1 DINO detections once for transparency
+        if self._phase == "wait_detect_stage1" and (not self._stage1_dino_printed):
+            try:
+                rgb_dbg = self._bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
+                self._log_stage1_dino_detections(rgb_dbg, tag="Stage-1")
+                self._stage1_dino_printed = True
+            except Exception:
+                pass
+
         # Stride throttle
         self._frame_count += 1
         if self.cfg.runtime.frame_stride > 1 and (self._frame_count % self.cfg.runtime.frame_stride) != 0:
@@ -1087,10 +1368,18 @@ class SeeAnythingNode(Node):
         # ----------------------------
         if self._phase == "wait_detect_stage1" and ENABLE_MULTI_CANDIDATE:
             cand_list = self._detect_candidates_from_msg(msg)
+
             if cand_list is not None and len(cand_list) >= 2:
+                if DEBUG_ROUTE_PRINT and (not self._route_printed_stage1):
+                    self.get_logger().info(
+                        f"[route] ROUTE-2 (multi-candidate) triggered: candidates={len(cand_list)} >= 2 "
+                        f"(min_exec_score={self.cfg.dino.min_exec_score:.2f}). Need Aria mask for verification."
+                    )
+                    self._route_printed_stage1 = True
+
                 # Prepare aria rgbmask once
                 if not self._ensure_aria_rgbmask_ready():
-                    self.get_logger().warn("[cand] Aria rgbmask not ready, fallback to legacy stage-1 behavior.")
+                    self.get_logger().warn("[route] ROUTE-2 aborted: Aria rgbmask not ready -> fallback to ROUTE-1 legacy.")
                 else:
                     # Cache candidates and start sequential evaluation
                     self._cand_list = cand_list
@@ -1129,8 +1418,17 @@ class SeeAnythingNode(Node):
                         f"[cand] Detected {len(self._cand_list)} candidates (score>={self.cfg.dino.min_exec_score:.2f}). "
                         f"Start close-hover verification..."
                     )
+                    self._log_candidate_comparison_table("Stage-1 candidates (initial, before matching)", sort_by="dino")
+
                     self._phase = "cand_move_next"
                     return
+            else:
+                if DEBUG_ROUTE_PRINT and (not self._route_printed_stage1):
+                    n = 0 if cand_list is None else len(cand_list)
+                    self.get_logger().info(
+                        f"[route] ROUTE-1 (legacy) because candidates_above_min_exec < 2 (got {n})."
+                    )
+                    self._route_printed_stage1 = True
             # if not multi-candidate trigger, fall through to legacy stage-1
 
         # ----------------------------
@@ -1441,8 +1739,15 @@ class SeeAnythingNode(Node):
     # ---------- Candidate selection helpers ----------
     def _select_best_candidate(self) -> int:
         """
-        Choose candidate by highest match score. If all invalid, fallback to best DINO score (index 0).
+        Choose candidate by highest match score. If best < accept, fallback to top DINO (rank-0).
+        Also print a clear comparison summary.
         """
+        if not self._cand_list:
+            return 0
+
+        # Print comparison table (by match) before decision
+        self._log_candidate_comparison_table("Final comparison before selecting", sort_by="match")
+
         best_i = -1
         best_s = -1.0
         for i, c in enumerate(self._cand_list):
@@ -1451,13 +1756,20 @@ class SeeAnythingNode(Node):
                 best_i = i
 
         if best_i < 0:
+            self.get_logger().warn("[cand] No valid match scores. Fallback to top DINO candidate (rank=0).")
             return 0
 
         if best_s < float(MATCH_SCORE_ACCEPT):
             self.get_logger().warn(
-                f"[cand] Best match score {best_s:.3f} < {MATCH_SCORE_ACCEPT:.3f}. Fallback to top DINO candidate."
+                f"[cand] Best match score {best_s:.3f} < MATCH_SCORE_ACCEPT {MATCH_SCORE_ACCEPT:.3f} "
+                f"-> fallback to top DINO candidate (rank=0)."
             )
             return 0
+
+        self.get_logger().info(
+            f"[cand] Selected by matching: best_rank={best_i} best_match_score={best_s:.3f} "
+            f"(MATCH_SCORE_ACCEPT={MATCH_SCORE_ACCEPT:.3f})"
+        )
         return best_i
 
     def _log_candidate_result(self):
@@ -1497,6 +1809,8 @@ class SeeAnythingNode(Node):
         if self._phase == "init_moving":
             if self.motion.is_stationary():
                 self._phase = "wait_detect_stage1"
+                self._stage1_dino_printed = False
+                self._route_printed_stage1 = False
                 self.get_logger().info("INIT reached. Waiting for Stage-1 detection...")
             return
 
@@ -1514,7 +1828,6 @@ class SeeAnythingNode(Node):
                 }
                 self._log_candidate_result()
                 self.get_logger().info(f"[cand] Selected best candidate rank={self._cand_best_idx}.")
-
                 self._phase = "cand_move_best"
                 return
 
@@ -1574,8 +1887,10 @@ class SeeAnythingNode(Node):
                             self._cand_list[idx].match_quality = float(stats["quality"])
                             self._cand_list[idx].match_coverage = float(stats["coverage"])
                             self._cand_list[idx].match_Kconf = int(stats["K_conf"])
+
+                            dino_s = self._cand_list[idx].score if 0 <= idx < len(self._cand_list) else float("nan")
                             self.get_logger().info(
-                                f"[cand] rank={idx} match_score={stats['score']:.3f} "
+                                f"[cand] rank={idx} dino_score={dino_s:.3f} match_score={stats['score']:.3f} "
                                 f"(qual={stats['quality']:.3f}, cov={stats['coverage']:.3f}, Kconf={stats['K_conf']})"
                             )
 
@@ -1617,7 +1932,6 @@ class SeeAnythingNode(Node):
             )
             # also save a best visualization for debugging
             try:
-                # pick best candidate rgbmask for viz if exists
                 rp = self._cand_list[self._cand_best_idx].eval_rgbmask_path
                 if rp and Path(rp).exists() and self._ensure_aria_rgbmask_ready():
                     _ = self._score_pair_lightglue(ARIA_RGBMASK_PATH, rp, save_viz_path=BEST_VIZ_PATH)
