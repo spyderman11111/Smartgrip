@@ -1,7 +1,7 @@
 {
   "note": "Candidate selection via Aria<->wrist matching.",
-  "prompt": "orange triangle .",
-  "created_at": "2026-01-25T17:05:00.924848",
+  "prompt": "orange square .",
+  "created_at": "2026-01-25T17:17:11.523613",
   "aria_dir": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage",
   "aria_files": {
     "rgb": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage/gaze_sam2_rgb_rot.png",
@@ -11,38 +11,38 @@
   "candidates": [
     {
       "rank": 0,
-      "dino_score_stage1": 0.7101070880889893,
+      "dino_score_stage1": 0.7234394550323486,
       "box_xyxy_stage1": [
-        1101.2529296875,
-        242.94625854492188,
-        1357.04296875,
-        476.96337890625
+        414.8679504394531,
+        738.9865112304688,
+        702.3548583984375,
+        961.1259155273438
       ],
       "C_base": [
-        0.40789181127117613,
-        0.5230623256065168,
+        0.3077397712332661,
+        0.4413268507180349,
         0.0
       ],
       "hover_z": 0.3,
       "eval_image_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_01_image.png",
       "eval_rgbmask_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_01_image_rgbmask.png",
-      "match_score": 0.2561258152127266,
-      "match_quality": 0.3415010869503021,
-      "match_coverage": 0.75,
-      "match_Kconf": 15
+      "match_score": 0.0,
+      "match_quality": 0.0,
+      "match_coverage": 0.0,
+      "match_Kconf": 0
     },
     {
       "rank": 1,
-      "dino_score_stage1": 0.6732383966445923,
+      "dino_score_stage1": 0.6667342782020569,
       "box_xyxy_stage1": [
-        414.2540283203125,
-        738.080078125,
-        702.9423217773438,
-        961.7353515625
+        1215.804443359375,
+        928.9742431640625,
+        1427.9564208984375,
+        1123.2230224609375
       ],
       "C_base": [
-        0.30775600610463677,
-        0.4413243882792133,
+        0.4283040729746775,
+        0.42055758519365294,
         0.0
       ],
       "hover_z": 0.3,
@@ -55,16 +55,16 @@
     },
     {
       "rank": 2,
-      "dino_score_stage1": 0.5779452919960022,
+      "dino_score_stage1": 0.5514341592788696,
       "box_xyxy_stage1": [
-        1215.360595703125,
-        928.7334594726562,
-        1428.6212158203125,
-        1123.8118896484375
+        1101.507568359375,
+        242.96575927734375,
+        1356.5772705078125,
+        475.8296813964844
       ],
       "C_base": [
-        0.4283431461805537,
-        0.4205017464349493,
+        0.4078469890755729,
+        0.5231757837807592,
         0.0
       ],
       "hover_z": 0.3,
@@ -78,13 +78,13 @@
   ],
   "selected": {
     "best_rank": 0,
-    "best_match_score": 0.2561258152127266,
-    "best_dino_score": 0.7101070880889893
+    "best_match_score": 0.0,
+    "best_dino_score": 0.7234394550323486
   },
   "thresholds": {
     "min_exec_score": 0.5,
     "cand_max": 6,
     "cand_dwell_sec": 1.5,
-    "match_accept": 0.5
+    "match_accept": 0.25
   }
 }

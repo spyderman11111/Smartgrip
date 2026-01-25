@@ -128,7 +128,7 @@ ENABLE_MULTI_CANDIDATE = True
 # we will evaluate them at close hover and pick best match.
 CAND_MAX = 6                 # evaluate top-N candidates by DINO score
 CAND_DWELL_SEC = 1.5         # pause duration per candidate for snapshot + match
-MATCH_SCORE_ACCEPT = 0.50    # if best match < this, fallback to best DINO candidate
+MATCH_SCORE_ACCEPT = 0.25    # if best match < this, fallback to best DINO candidate
 
 # SAM2 segmentation for candidate snapshots
 SAM2_ID = "facebook/sam2.1-hiera-large"
