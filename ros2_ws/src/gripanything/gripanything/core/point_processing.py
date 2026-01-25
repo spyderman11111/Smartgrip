@@ -17,6 +17,12 @@ Geometry fitting (NO OBB)
   height from table plane to top.
 - Method B (fallback): fit footprint from all object points (convex-hull projection) if A is unstable.
 
+[NEW]
+Top planarity detection:
+- Fit a plane to "top band" points via Open3D RANSAC.
+- If top is NOT planar OR top band is sparse (low fraction / low points),
+  disable Method A footprint and fallback to Method B (use all points), still using table normal as up-axis.
+
 Shapes
 - Cuboid-like: footprint tends to be rectangle (minAreaRect).
 - Cylinder/cone-like: footprint can be circle (algebraic circle fit) if coverage/residual passes checks.
@@ -179,6 +185,17 @@ DEFAULT_SHOW_TABLE_FRAME = False
 DEFAULT_TABLE_FRAME_SIZE_MULT = 8.0
 DEFAULT_TABLE_FRAME_SIZE_MIN = 0.03
 
+# -----------------------------------------------------------------------------
+# [NEW] Top planarity check
+# -----------------------------------------------------------------------------
+DEFAULT_TOP_PLANARITY_CHECK_ENABLE = True
+DEFAULT_TOP_PLANE_RANSAC_DIST_MULT = 1.0        # plane distance threshold = mult * voxel
+DEFAULT_TOP_PLANE_RANSAC_ITERS = 1200
+DEFAULT_TOP_PLANE_INLIER_RATIO_MIN = 0.65       # if inlier ratio below -> treat as non-planar
+DEFAULT_TOP_PLANE_RMSE_MULT_MAX = 1.25          # rmse <= mult*voxel -> planar
+DEFAULT_TOP_PLANE_PARALLEL_COS_MIN = 0.85       # |n_top · n_table| >= cos -> top plane ~ parallel to table
+DEFAULT_TOP_BAND_FRAC_MIN = 0.01                # top band must be at least this fraction of points to be considered "dense"
+
 
 # =============================================================================
 # Config
@@ -291,6 +308,15 @@ class Config:
     show_table_frame: bool = DEFAULT_SHOW_TABLE_FRAME
     table_frame_size_mult: float = DEFAULT_TABLE_FRAME_SIZE_MULT
     table_frame_size_min: float = DEFAULT_TABLE_FRAME_SIZE_MIN
+
+    # [NEW] Top planarity check
+    top_planarity_check_enable: bool = DEFAULT_TOP_PLANARITY_CHECK_ENABLE
+    top_plane_ransac_dist_mult: float = DEFAULT_TOP_PLANE_RANSAC_DIST_MULT
+    top_plane_ransac_iters: int = DEFAULT_TOP_PLANE_RANSAC_ITERS
+    top_plane_inlier_ratio_min: float = DEFAULT_TOP_PLANE_INLIER_RATIO_MIN
+    top_plane_rmse_mult_max: float = DEFAULT_TOP_PLANE_RMSE_MULT_MAX
+    top_plane_parallel_cos_min: float = DEFAULT_TOP_PLANE_PARALLEL_COS_MIN
+    top_band_frac_min: float = DEFAULT_TOP_BAND_FRAC_MIN
 
 
 # =============================================================================
@@ -1115,6 +1141,83 @@ def _estimate_up_axis_from_pca(points: np.ndarray) -> Tuple[np.ndarray, np.ndarr
     e2 = e2 / (float(np.linalg.norm(e2)) + 1e-12)
     return u, e1, e2
 
+def _top_band_planarity_check(
+    P_top: np.ndarray,
+    voxel: float,
+    cfg: Config,
+    u_ref: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    """
+    Fit a plane to top-band points and decide if it's planar.
+    Returns diagnostics:
+      planar(bool), inlier_ratio, rmse, cos_parallel, plane_model(axbyczd)
+    """
+    out: Dict[str, Any] = {
+        "enabled": bool(cfg.top_planarity_check_enable),
+        "planar": False,
+        "inlier_ratio": None,
+        "rmse": None,
+        "cos_parallel": None,
+        "plane_model": None,
+        "n_top": int(P_top.shape[0]),
+        "dist_thr": float(cfg.top_plane_ransac_dist_mult * voxel),
+    }
+    if not bool(cfg.top_planarity_check_enable):
+        return out
+    if P_top.shape[0] < max(80, int(cfg.top_min_points)):
+        return out
+
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(np.ascontiguousarray(P_top, dtype=np.float64))
+
+    dist_thr = float(cfg.top_plane_ransac_dist_mult * voxel)
+    try:
+        plane_model, inliers = pc.segment_plane(
+            distance_threshold=dist_thr,
+            ransac_n=3,
+            num_iterations=int(cfg.top_plane_ransac_iters),
+        )
+    except Exception:
+        return out
+
+    inliers = list(inliers)
+    if len(inliers) <= 0:
+        return out
+
+    inlier_ratio = float(len(inliers) / max(1, P_top.shape[0]))
+    pts = np.asarray(pc.points, dtype=np.float64)
+    dist = plane_distance(tuple(float(x) for x in plane_model), pts)
+    rmse_val = float(np.sqrt(np.mean(dist[inliers] ** 2)))
+
+    a, b, c, d = (float(plane_model[0]), float(plane_model[1]), float(plane_model[2]), float(plane_model[3]))
+    n = np.array([a, b, c], dtype=np.float64)
+    nn = float(np.linalg.norm(n))
+    if nn < 1e-12:
+        return out
+    n = n / nn
+
+    cos_par = None
+    if u_ref is not None:
+        u = np.asarray(u_ref, dtype=np.float64).reshape(3)
+        u = u / (float(np.linalg.norm(u)) + 1e-12)
+        cos_par = float(abs(np.dot(n, u)))
+
+    out.update({
+        "inlier_ratio": inlier_ratio,
+        "rmse": rmse_val,
+        "cos_parallel": cos_par,
+        "plane_model": [a, b, c, d],
+    })
+
+    ok_inlier = inlier_ratio >= float(cfg.top_plane_inlier_ratio_min)
+    ok_rmse = rmse_val <= float(cfg.top_plane_rmse_mult_max) * float(voxel)
+    ok_parallel = True
+    if cos_par is not None:
+        ok_parallel = cos_par >= float(cfg.top_plane_parallel_cos_min)
+
+    out["planar"] = bool(ok_inlier and ok_rmse and ok_parallel)
+    return out
+
 def fit_object_center_and_prism(
     main_clean: o3d.geometry.PointCloud,
     voxel: float,
@@ -1173,13 +1276,44 @@ def fit_object_center_and_prism(
     band = max(float(cfg.top_band_min), float(cfg.top_band_vox_mult) * float(voxel))
     top_mask = z >= (z_q - band)
     n_top = int(np.count_nonzero(top_mask))
+    top_frac = float(n_top / max(1, P.shape[0]))
+
     diag["top_quantile"] = top_q
     diag["top_band_m"] = float(band)
     diag["top_points"] = n_top
+    diag["top_frac"] = top_frac
 
-    if n_top >= int(cfg.top_min_points) and bool(cfg.height_top_use_median_in_band):
-        z_top = float(np.median(z[top_mask]))
-        diag["z_top_from"] = "median(top_band)"
+    # ---- [NEW] planarity detection on top band
+    P_top = P[top_mask] if n_top > 0 else P[:0]
+    top_plan = _top_band_planarity_check(P_top, voxel, cfg, u_ref=u if support_plane is not None else None)
+    diag["top_planarity"] = top_plan
+
+    # Decide if top band is "dense enough"
+    top_dense = (n_top >= int(cfg.top_min_points)) and (top_frac >= float(cfg.top_band_frac_min))
+    diag["top_dense"] = bool(top_dense)
+
+    # Decide z_top source
+    if bool(top_plan.get("planar", False)) and bool(cfg.height_top_use_median_in_band):
+        # If planar: use median of inlier top points along u for robustness
+        try:
+            pc_tmp = o3d.geometry.PointCloud()
+            pc_tmp.points = o3d.utility.Vector3dVector(np.ascontiguousarray(P_top, dtype=np.float64))
+            dist_thr = float(cfg.top_plane_ransac_dist_mult * voxel)
+            plane_model, inliers = pc_tmp.segment_plane(
+                distance_threshold=dist_thr,
+                ransac_n=3,
+                num_iterations=int(cfg.top_plane_ransac_iters),
+            )
+            inliers = np.asarray(inliers, dtype=np.int64)
+            if inliers.size > 0:
+                z_top = float(np.median(z[top_mask][inliers]))
+                diag["z_top_from"] = "median(top_plane_inliers)"
+            else:
+                z_top = float(z_q)
+                diag["z_top_from"] = "percentile"
+        except Exception:
+            z_top = float(z_q)
+            diag["z_top_from"] = "percentile"
     else:
         z_top = float(z_q)
         diag["z_top_from"] = "percentile"
@@ -1197,8 +1331,8 @@ def fit_object_center_and_prism(
     diag["height"] = float(height)
 
     # ---- choose points for footprint (A then B)
-    P_top = P[top_mask] if (n_top > 0) else P
-    use_A = bool(cfg.footprint_use_top_only) and (P_top.shape[0] >= max(20, int(cfg.top_min_points)))
+    # Method A is allowed only when: (user enabled) AND (top is dense) AND (top band looks planar)
+    allow_A = bool(cfg.footprint_use_top_only) and bool(top_dense) and bool(top_plan.get("planar", False))
     use_B = bool(cfg.footprint_fallback_use_all)
 
     # Use a plane-origin near the object for numeric stability
@@ -1212,6 +1346,15 @@ def fit_object_center_and_prism(
         origin_plane = centroid - dist * u_unit
     else:
         origin_plane = p0
+
+    if bool(cfg.top_planarity_check_enable):
+        _print(
+            "TopCheck",
+            f"top_n={n_top} ({_fmt_ratio(n_top, P.shape[0])}) dense={top_dense} "
+            f"planar={bool(top_plan.get('planar', False))} "
+            f"inlier_ratio={top_plan.get('inlier_ratio', None)} rmse={top_plan.get('rmse', None)} "
+            f"cos_par={top_plan.get('cos_parallel', None)} -> use_A={allow_A}"
+        )
 
     def _fit_footprint(points3d: np.ndarray, tag: str) -> Dict[str, Any]:
         pts2 = _project_to_plane_2d(points3d, origin_plane, e1, e2)
@@ -1295,7 +1438,7 @@ def fit_object_center_and_prism(
             "selected_center2": selected_center2,
         }
 
-    fitA = _fit_footprint(P_top, "A_top_band") if use_A else None
+    fitA = _fit_footprint(P_top, "A_top_band") if allow_A else None
     fitB = None
 
     chosen = None
@@ -1316,7 +1459,7 @@ def fit_object_center_and_prism(
         raise RuntimeError("Footprint fitting failed (no valid A/B).")
 
     diag["fitA"] = {
-        "enabled": bool(use_A),
+        "enabled": bool(allow_A),
         "ok": bool(fitA is not None and method_used == "A_top_band"),
         "points2d_n": int(fitA["points2d_n"]) if fitA is not None else 0,
         "circle_ok": bool(fitA["circle_ok"]) if fitA is not None else False,
