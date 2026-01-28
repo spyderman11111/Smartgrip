@@ -39,7 +39,7 @@ class Camera:
 class Dino:
     model_id: str = 'IDEA-Research/grounding-dino-tiny'
     device: str = 'cuda'
-    text_prompt: str = 'blue object.'
+    text_prompt: str = 'red object.'
     box_threshold: float = 0.25
     text_threshold: float = 0.25
     min_exec_score: float = 0.5

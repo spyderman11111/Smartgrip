@@ -1,0 +1,294 @@
+{
+  "note": "Object center and approximating prism corners in VGGT world and base_link. Alignment is estimated from paired camera centers. NO Open3D OBB used.",
+  "inputs": {
+    "ply_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/points.ply",
+    "vggt_cameras_json": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/cameras.json",
+    "robot_shots_json": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ur5camerajointstates.json",
+    "align_method": "sim3",
+    "vggt_pose_is_world_T_cam": true,
+    "aim_gate": {
+      "enable": true,
+      "pose_id_used": 1,
+      "aim_axis_cam": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "aim_invert_axis": false,
+      "perp_radius_m": 0.12,
+      "min_depth_m": 0.02,
+      "min_points_abs": 300,
+      "min_size_ratio": 0.0,
+      "pick_mode": "min_perp_then_depth"
+    }
+  },
+  "alignment_W_to_B": {
+    "model": "p_B = s * R * p_W + t",
+    "scale_s": 0.30585100901053774,
+    "R_W_to_B": [
+      [
+        0.998030602098538,
+        0.0327937859179161,
+        -0.05347415151266442
+      ],
+      [
+        0.006845412357247151,
+        -0.9043106724570772,
+        -0.4268200417153436
+      ],
+      [
+        -0.062354290986978166,
+        0.4256134106033294,
+        -0.9027542119038341
+      ]
+    ],
+    "t_W_to_B": [
+      0.5564632668591474,
+      0.6460152163818137,
+      0.30402706697381526
+    ],
+    "camera_center_rmse_all_m": 0.0021059745238834276,
+    "camera_center_rmse_kept_m": 0.0013835408357582427,
+    "pairs_used_total": 6,
+    "pairs_used_kept": 5,
+    "pair_indices_total": [
+      {
+        "pose_id": 1,
+        "image_k": 1
+      },
+      {
+        "pose_id": 2,
+        "image_k": 2
+      },
+      {
+        "pose_id": 3,
+        "image_k": 3
+      },
+      {
+        "pose_id": 4,
+        "image_k": 4
+      },
+      {
+        "pose_id": 5,
+        "image_k": 5
+      },
+      {
+        "pose_id": 6,
+        "image_k": 6
+      }
+    ],
+    "kept_indices": [
+      0,
+      2,
+      5,
+      1,
+      4
+    ],
+    "per_pair_error_m": [
+      0.0009536977491727314,
+      0.0014784285298641178,
+      0.0012642276666225516,
+      0.004127934828751914,
+      0.0017314203410471341,
+      0.0013709660520647828
+    ]
+  },
+  "support_plane": {
+    "available": true,
+    "plane_axbyczd": [
+      0.06381509775600083,
+      0.5106266120685512,
+      -0.8574311029731692,
+      0.864442727025049
+    ]
+  },
+  "object": {
+    "center": {
+      "vggt_world": [
+        -0.0558022245240751,
+        0.03095524625541587,
+        0.9662129874079263
+      ],
+      "base_link": [
+        0.5239376612901655,
+        0.5112039775543307,
+        0.04234144284439273
+      ]
+    },
+    "prism": {
+      "method_used": "A_top_band",
+      "footprint_model": "rect",
+      "extent_xyz_in_prism_axes": [
+        0.08091859519481659,
+        0.08231646567583084,
+        0.09645441526602916
+      ],
+      "R_prism_axes_in_vggt_world": [
+        [
+          0.0,
+          -0.9979617393950534,
+          0.06381509775600083
+        ],
+        [
+          -0.8591823404885363,
+          0.03265224094228082,
+          0.5106266120685512
+        ],
+        [
+          -0.5116695279090175,
+          -0.05482880504850565,
+          -0.8574311029731692
+        ]
+      ],
+      "corners_8": {
+        "index_order_note": "Order: bottom 4 corners (CCW in plane) then top 4 corners (same order).",
+        "vggt_world": [
+          [
+            -0.056211737153768905,
+            0.055775833534412254,
+            1.0372100934439186
+          ],
+          [
+            -0.0013990229158007115,
+            0.0013033896636947906,
+            1.0088495631772763
+          ],
+          [
+            -0.06154795983358087,
+            -0.043117532309926244,
+            0.9779188970401171
+          ],
+          [
+            -0.11636067407154906,
+            0.011354911560791221,
+            1.0062794273067595
+          ],
+          [
+            -0.05005648921456936,
+            0.10502802482075788,
+            0.9545070777757351
+          ],
+          [
+            0.004756225023398838,
+            0.0505555809500404,
+            0.9261465475090928
+          ],
+          [
+            -0.05539271189438132,
+            0.00613465897641937,
+            0.8952158813719336
+          ],
+          [
+            -0.1102054261323495,
+            0.060607102847136836,
+            0.923576411638576
+          ]
+        ],
+        "base_link": [
+          [
+            0.5229004424911476,
+            0.49506993524181275,
+            0.025977365762209492
+          ],
+          [
+            0.5395494311019593,
+            0.5139531981587206,
+            0.025671691411806696
+          ],
+          [
+            0.5212493807578839,
+            0.5301511892499994,
+            0.029576550378333233
+          ],
+          [
+            0.5046003921470722,
+            0.5112679263330915,
+            0.029882224728736084
+          ],
+          [
+            0.5266259418224473,
+            0.49225676585866207,
+            0.05510633531045228
+          ],
+          [
+            0.5432749304332588,
+            0.5111400287755699,
+            0.054800660960049485
+          ],
+          [
+            0.5249748800891834,
+            0.5273380198668486,
+            0.05870551992657605
+          ],
+          [
+            0.5083258914783718,
+            0.5084547569499408,
+            0.059011194276978846
+          ]
+        ]
+      },
+      "diagnostics": {
+        "n_points": 10870,
+        "voxel": 0.006515367329120636,
+        "support_plane_flipped": true,
+        "support_plane_used": true,
+        "top_quantile": 98.0,
+        "top_band_m": 0.01954610198736191,
+        "top_points": 7139,
+        "top_frac": 0.6567617295308188,
+        "top_planarity": {
+          "enabled": true,
+          "planar": true,
+          "inlier_ratio": 0.8314890040621936,
+          "rmse": 0.002972527883428237,
+          "cos_parallel": 0.997498541689362,
+          "plane_model": [
+            0.006405808629886885,
+            -0.5045563346259424,
+            0.863355008559417,
+            -0.7691545070382354
+          ],
+          "n_top": 7139,
+          "dist_thr": 0.006515367329120636
+        },
+        "top_dense": true,
+        "z_top_from": "median(top_plane_inliers)",
+        "z_bottom_from": "support_plane",
+        "z_bottom": 0.0,
+        "z_top": 0.09645441526602916,
+        "height": 0.09645441526602916,
+        "fitA": {
+          "enabled": true,
+          "ok": true,
+          "points2d_n": 7139,
+          "circle_ok": false
+        },
+        "fitB": {
+          "enabled": true,
+          "ok": false,
+          "points2d_n": 0,
+          "circle_ok": false
+        },
+        "chosen_method": "A_top_band",
+        "footprint_model": "rect",
+        "rect_center2": [
+          -0.008760258555412292,
+          -0.007523633539676666
+        ],
+        "rect_wh": [
+          0.08091859519481659,
+          0.08231646567583084
+        ],
+        "rect_angle_deg": 48.14575958251953,
+        "circle_ok": false,
+        "circle_center2": [
+          -0.009540006795902629,
+          -0.009037467315751729
+        ],
+        "circle_r": 0.047764797309172706,
+        "circle_cov_deg": 299.22996372557213,
+        "circle_norm_rmse": 0.07900820548762534
+      }
+    }
+  }
+}
