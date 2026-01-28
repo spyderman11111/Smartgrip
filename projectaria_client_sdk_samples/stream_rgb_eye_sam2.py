@@ -15,7 +15,7 @@ Outputs (fixed names, PNG):
   3) gaze_sam2_rgb_rot.png
      - rotated RGB (no overlay)
   4) gaze_sam2_debug_gaze_roi.png
-     - debug RGB with gaze dot + ROI box
+     - debug RGB with gaze dot + ROI box + mask contour (blue)
 
 Main-script (seeanything.py) compatibility:
 - Your seeanything.py looks for latest "*_rgb_rot.png" and then the paired "*_mask_bin.png".
@@ -23,14 +23,22 @@ Main-script (seeanything.py) compatibility:
   to avoid race conditions.
 
 Mask semantics:
-- By default, we INVERT the SAM2 mask inside ROI (because your current output tends to be background).
+- Default behavior keeps your old interface: invert_roi_mask=True means we handle the typical
+  "SAM2 returns background" issue. Here we do it more robustly:
+    - If invert_roi_mask is True: AUTO-choose (normal vs invert) inside ROI (no new CLI flags).
+    - If --no-invert-roi-mask: use normal mask (no inversion / no auto).
 - ROI outside is always forced to 0.
-- Use --no-invert-roi-mask to disable inversion.
+
+Fixes in this version:
+- Snapshot + lock at 's' press time (eliminates mask/image drift).
+- auto format defaults to BGR (reduces color swap / bias).
+- optional lightweight mask refinement before saving (close/open + fill holes).
 """
 
 import argparse
 import os
 import sys
+import threading
 from typing import Optional, Tuple
 
 import aria.sdk as aria
@@ -67,6 +75,16 @@ DEFAULT_SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 # Default out dir to match seeanything.py expectation:
 DEFAULT_ARIA_OUT_DIR = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage"
 
+# =========================
+# Mask refinement defaults (no extra CLI needed)
+# =========================
+MASK_REFINE_ENABLE = True
+MASK_CLOSE_KSIZE = 5   # odd
+MASK_OPEN_KSIZE = 3    # odd
+MASK_FILL_HOLES = True
+MASK_ERODE_ITERS = 0   # if boundary is too "fat", set 1
+MASK_DILATE_ITERS = 0  # if boundary is too "thin", set 1
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -101,12 +119,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--fn-rgb-rot", type=str, default="gaze_sam2_rgb_rot.png")
     p.add_argument("--fn-debug", type=str, default="gaze_sam2_debug_gaze_roi.png")
 
-    # default: ON
+    # keep your old interface:
+    # - default True: we will AUTO choose normal/invert (robust)
+    # - pass --no-invert-roi-mask: use normal mask (no inversion / no auto)
     p.add_argument(
         "--no-invert-roi-mask",
         dest="invert_roi_mask",
         action="store_false",
-        help="Disable ROI mask inversion (default is inverted).",
+        help="Disable inversion/auto-invert logic; use SAM2 normal mask in ROI.",
     )
     p.set_defaults(invert_roi_mask=True)
 
@@ -125,12 +145,10 @@ def _atomic_imwrite_png(path: str, img: np.ndarray) -> None:
     d = os.path.dirname(os.path.abspath(path))
     _ensure_dir(d)
 
-    # Make sure image is contiguous and a supported dtype
     if img is None:
         raise RuntimeError("atomic_imwrite_png: img is None")
 
     if img.dtype != np.uint8:
-        # Most of your outputs are uint8 already; keep it safe here
         img = img.astype(np.uint8, copy=False)
 
     img = np.ascontiguousarray(img)
@@ -139,7 +157,7 @@ def _atomic_imwrite_png(path: str, img: np.ndarray) -> None:
     if not ok:
         raise RuntimeError(f"cv2.imencode('.png', ...) failed for: {path}")
 
-    tmp = path + ".tmp"  # extension doesn't matter now
+    tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(buf.tobytes())
 
@@ -263,6 +281,107 @@ def _build_rgbmask_blackbg(rgb_rot_rgb: np.ndarray, mask_bool: np.ndarray) -> np
     return out
 
 
+# =========================
+# Mask auto-select + refine
+# =========================
+
+def _ensure_odd(k: int) -> int:
+    k = int(k)
+    if k <= 1:
+        return 1
+    return k if (k % 2 == 1) else (k + 1)
+
+
+def _fill_holes_u8(mask_u8: np.ndarray) -> np.ndarray:
+    """Fill holes for a 0/255 uint8 mask."""
+    if mask_u8.dtype != np.uint8:
+        mask_u8 = mask_u8.astype(np.uint8)
+    h, w = mask_u8.shape[:2]
+    if h == 0 or w == 0:
+        return mask_u8
+
+    inv = (mask_u8 == 0).astype(np.uint8)  # 1 where background
+    ff = inv.copy()
+    m = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(ff, m, (0, 0), 2)  # mark border-connected background as 2
+    holes = (ff == 1)  # not connected to border => holes
+    out = mask_u8.copy()
+    out[holes] = 255
+    return out
+
+
+def _auto_choose_normal_or_invert(roi_mask_bool: np.ndarray) -> np.ndarray:
+    """
+    Auto choose between normal mask and inverted mask inside ROI.
+    Heuristic prefers:
+    - not too small / not full ROI
+    - fewer border-touch pixels (background mask often touches ROI border heavily)
+    """
+    m0 = roi_mask_bool.astype(bool)
+    m1 = ~m0
+
+    def cost(m: np.ndarray) -> float:
+        area = int(m.sum())
+        h, w = m.shape[:2]
+        if area <= 0:
+            return 1e9
+        frac = area / float(max(1, h * w))
+
+        border = np.zeros_like(m, dtype=bool)
+        border[0, :] = True
+        border[-1, :] = True
+        border[:, 0] = True
+        border[:, -1] = True
+        touch = int((m & border).sum())
+        touch_ratio = touch / float(max(1, area))
+
+        penalty = 0.0
+        if frac < 0.01:
+            penalty += 10.0
+        if frac > 0.90:
+            penalty += 10.0
+        return touch_ratio + 0.3 * abs(frac - 0.25) + penalty
+
+    return m0 if cost(m0) <= cost(m1) else m1
+
+
+def _refine_mask_bool(mask_bool: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns:
+      mask_bool_refined, mask_u8 (0/255)
+    """
+    if not MASK_REFINE_ENABLE:
+        m = mask_bool.astype(bool)
+        u8 = (m.astype(np.uint8) * 255)
+        return m, u8
+
+    mask_u8 = (mask_bool.astype(np.uint8) * 255)
+
+    ck = _ensure_odd(MASK_CLOSE_KSIZE)
+    ok = _ensure_odd(MASK_OPEN_KSIZE)
+
+    if ck > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ck, ck))
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+
+    if ok > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ok, ok))
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+
+    if MASK_FILL_HOLES:
+        mask_u8 = _fill_holes_u8(mask_u8)
+
+    if MASK_ERODE_ITERS > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_u8 = cv2.erode(mask_u8, kernel, iterations=int(MASK_ERODE_ITERS))
+
+    if MASK_DILATE_ITERS > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_u8 = cv2.dilate(mask_u8, kernel, iterations=int(MASK_DILATE_ITERS))
+
+    return (mask_u8 > 0), mask_u8
+
+
 def save_outputs_fixed(
     rgb_rot_rgb: np.ndarray,
     mask_bool: np.ndarray,
@@ -287,16 +406,25 @@ def save_outputs_fixed(
     p_dbg = os.path.join(out_dir, fn_debug)
     p_rgb = os.path.join(out_dir, fn_rgb_rot)
 
+    if mask_bool is None:
+        raise RuntimeError("save_outputs_fixed: mask_bool is None")
+
+    # refine before saving (stabilize boundary + remove tiny artifacts)
+    mask_bool_ref, mask_u8 = _refine_mask_bool(mask_bool)
+
     # 1) binary mask: 0/255 uint8
-    mask_u8 = (mask_bool.astype(np.uint8) * 255)
     _atomic_imwrite_png(p_mask, mask_u8)
 
     # 2) ROI masked color image (black background)
-    roi_rgb = _build_rgbmask_blackbg(rgb_rot_rgb, mask_bool)
+    roi_rgb = _build_rgbmask_blackbg(rgb_rot_rgb, mask_bool_ref)
     _atomic_imwrite_png(p_roi_rgb, cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR))
 
-    # 3) debug
-    _atomic_imwrite_png(p_dbg, dbg_bgr)
+    # 3) debug (add mask contour)
+    dbg_out = dbg_bgr.copy()
+    cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts is not None and len(cnts) > 0:
+        cv2.drawContours(dbg_out, cnts, -1, (255, 0, 0), 2)  # blue contour
+    _atomic_imwrite_png(p_dbg, dbg_out)
 
     # 4) rotated rgb (no overlay) - write LAST to avoid race
     _atomic_imwrite_png(p_rgb, cv2.cvtColor(rgb_rot_rgb, cv2.COLOR_RGB2BGR))
@@ -309,6 +437,10 @@ def save_outputs_fixed(
 
     return roi_rgb
 
+
+# =========================
+# Observer with lock + consistent format
+# =========================
 
 class Observer:
     def __init__(
@@ -327,7 +459,11 @@ class Observer:
         self.rgb_label = rgb_label
         self.depth_m = depth_m
         self.torch_device = torch_device
-        self.fmt = "rgb" if aria_rgb_format == "auto" else aria_rgb_format
+
+        # Key fix: auto defaults to BGR (common for OpenCV pipelines)
+        self.fmt = "bgr" if aria_rgb_format == "auto" else aria_rgb_format
+
+        self.lock = threading.Lock()
 
         self.last_rgb_raw = None
         self.last_eye_raw = None
@@ -346,45 +482,57 @@ class Observer:
             self._on_rgb(image, record)
 
     def _on_eye(self, image: np.ndarray, record: ImageDataRecord) -> None:
-        self.last_eye_raw = image
         img_t = torch.tensor(image, device=self.torch_device)
         with torch.no_grad():
             preds, _, _ = self.model.predict(img_t)
         preds = preds.detach().cpu().numpy()
-        self.yaw = float(preds[0][0])
-        self.pitch = float(preds[0][1])
+        yaw = float(preds[0][0])
+        pitch = float(preds[0][1])
+
+        with self.lock:
+            self.last_eye_raw = image
+            self.yaw = yaw
+            self.pitch = pitch
 
     def _on_rgb(self, image: np.ndarray, record: ImageDataRecord) -> None:
-        self.last_rgb_raw = image
-
         rotated = np.rot90(image, -1)
-        rgb_rot_rgb = to_sam_rgb(rotated, self.fmt)
-        self.rgb_rot_rgb = rgb_rot_rgb
-        self.rgb_rot_shape = rgb_rot_rgb.shape[:2]
+        rgb_rot_rgb = to_sam_rgb(rotated, self.fmt)  # ensure RGB for SAM2
+        h_rot, w_rot = rgb_rot_rgb.shape[:2]
 
-        if self.yaw is None or self.pitch is None:
-            self.gaze_rot_xy = None
+        with self.lock:
+            self.last_rgb_raw = image
+            self.rgb_rot_rgb = rgb_rot_rgb
+            self.rgb_rot_shape = (h_rot, w_rot)
+            yaw = self.yaw
+            pitch = self.pitch
+
+        if yaw is None or pitch is None:
+            with self.lock:
+                self.gaze_rot_xy = None
             return
 
         try:
             eg = EyeGaze()
         except TypeError:
             eg = EyeGaze
-        eg.yaw = self.yaw
-        eg.pitch = self.pitch
+        eg.yaw = yaw
+        eg.pitch = pitch
         eg.depth = self.depth_m
 
         proj = get_gaze_vector_reprojection(
             eg, self.rgb_label, self.dev_calib, self.rgb_calib, self.depth_m
         )
         if proj is None:
-            self.gaze_rot_xy = None
+            with self.lock:
+                self.gaze_rot_xy = None
             return
 
         x_raw, y_raw = float(proj[0]), float(proj[1])
         h_raw, _ = image.shape[:2]
         x_rot, y_rot = rot_cw90_xy(x_raw, y_raw, h_raw)
-        self.gaze_rot_xy = (x_rot, y_rot)
+
+        with self.lock:
+            self.gaze_rot_xy = (x_rot, y_rot)
 
 
 def start_streaming(streaming_interface: str, profile_name: str, device_ip: Optional[str]):
@@ -525,69 +673,92 @@ def main():
     cv2.setWindowProperty(sam_win, cv2.WND_PROP_TOPMOST, 1)
 
     print("[Main] Press 's' to segment & save. Press 'q' or ESC to exit.")
-    print(f"[Main] invert_roi_mask = {args.invert_roi_mask} (disable with --no-invert-roi-mask)")
+    print(f"[Main] invert_roi_mask = {args.invert_roi_mask} (True means auto choose normal/invert; disable with --no-invert-roi-mask)")
+    print(f"[Main] MASK_REFINE_ENABLE={MASK_REFINE_ENABLE}, close={MASK_CLOSE_KSIZE}, open={MASK_OPEN_KSIZE}, fill_holes={MASK_FILL_HOLES}, erode={MASK_ERODE_ITERS}, dilate={MASK_DILATE_ITERS}")
 
     latest_roi_rgb_bgr = None
     graceful_exit = True
 
     try:
         while True:
-            if obs.last_rgb_raw is not None:
-                rotated = np.rot90(obs.last_rgb_raw, -1)
-                fmt = "rgb" if args.aria_rgb_format == "auto" else args.aria_rgb_format
+            # --- Display RGB ---
+            with obs.lock:
+                last_rgb_raw = None if obs.last_rgb_raw is None else obs.last_rgb_raw.copy()
+                gaze_xy_f = None if obs.gaze_rot_xy is None else (float(obs.gaze_rot_xy[0]), float(obs.gaze_rot_xy[1]))
+                shape = None if obs.rgb_rot_shape is None else (int(obs.rgb_rot_shape[0]), int(obs.rgb_rot_shape[1]))
+
+            if last_rgb_raw is not None:
+                rotated = np.rot90(last_rgb_raw, -1)
+                fmt = "bgr" if args.aria_rgb_format == "auto" else args.aria_rgb_format
                 vis = to_display_bgr(rotated, fmt)
 
-                if obs.gaze_rot_xy is not None and obs.rgb_rot_shape is not None:
-                    h, w = obs.rgb_rot_shape
-                    gx, gy = clamp_xy(obs.gaze_rot_xy[0], obs.gaze_rot_xy[1], w, h)
+                if gaze_xy_f is not None and shape is not None:
+                    h, w = shape
+                    gx, gy = clamp_xy(gaze_xy_f[0], gaze_xy_f[1], w, h)
                     cv2.circle(vis, (gx, gy), 12, (0, 255, 0), thickness=-1)
                     x1, y1, x2, y2 = make_roi_box(gx, gy, args.gaze_box_size, w, h)
                     cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), thickness=2)
 
                 cv2.imshow(rgb_win, vis)
 
-            if obs.last_eye_raw is not None:
-                rotated_eye = np.rot90(obs.last_eye_raw, -1)
+            # --- Display Eye ---
+            with obs.lock:
+                last_eye_raw = None if obs.last_eye_raw is None else obs.last_eye_raw.copy()
+
+            if last_eye_raw is not None:
+                rotated_eye = np.rot90(last_eye_raw, -1)
                 eye_bgr = to_display_bgr(rotated_eye, "gray")
                 cv2.imshow(eye_win, eye_bgr)
 
+            # --- Display SAM result ---
             if latest_roi_rgb_bgr is not None:
                 cv2.imshow(sam_win, latest_roi_rgb_bgr)
 
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("s"):
-                if obs.rgb_rot_rgb is None or obs.rgb_rot_shape is None or obs.gaze_rot_xy is None:
+                # ---- freeze a consistent snapshot (critical to remove drift) ----
+                with obs.lock:
+                    rgb_rot_rgb = None if obs.rgb_rot_rgb is None else obs.rgb_rot_rgb.copy()
+                    shape2 = None if obs.rgb_rot_shape is None else (int(obs.rgb_rot_shape[0]), int(obs.rgb_rot_shape[1]))
+                    gaze2 = None if obs.gaze_rot_xy is None else (float(obs.gaze_rot_xy[0]), float(obs.gaze_rot_xy[1]))
+
+                if rgb_rot_rgb is None or shape2 is None or gaze2 is None:
                     print("[SAM2] Missing RGB/gaze.")
                     continue
 
-                h, w = obs.rgb_rot_shape
-                gx, gy = clamp_xy(obs.gaze_rot_xy[0], obs.gaze_rot_xy[1], w, h)
+                h, w = shape2
+                gx, gy = clamp_xy(gaze2[0], gaze2[1], w, h)
 
                 full_mask, score, (x1, y1, x2, y2) = sam2_segment_roi_box(
-                    predictor, obs.rgb_rot_rgb, (gx, gy), args.gaze_box_size
+                    predictor, rgb_rot_rgb, (gx, gy), args.gaze_box_size
                 )
                 if full_mask is None:
                     print("[SAM2] No mask.")
                     continue
 
-                roi_gate = np.zeros_like(full_mask, dtype=bool)
-                roi_gate[y1:y2, x1:x2] = True
+                # ROI-only selection, ROI outside forced 0
+                roi_sel = full_mask[y1:y2, x1:x2].astype(bool)
 
-                # ROI-only mask, optionally inverted (default: inverted)
                 if args.invert_roi_mask:
-                    mask = roi_gate & (~full_mask)
-                else:
-                    mask = roi_gate & full_mask
+                    # robust: auto choose normal vs invert inside ROI
+                    roi_sel = _auto_choose_normal_or_invert(roi_sel)
+                # else: keep normal SAM2 output
 
-                print(f"[SAM2] score={score:.4f}  ROI=({x1},{y1})-({x2},{y2})  mask_pixels={int(mask.sum())}")
+                mask = np.zeros((h, w), dtype=bool)
+                mask[y1:y2, x1:x2] = roi_sel
 
-                dbg = cv2.cvtColor(obs.rgb_rot_rgb, cv2.COLOR_RGB2BGR)
+                print(
+                    f"[SAM2] score={score:.4f} ROI=({x1},{y1})-({x2},{y2}) "
+                    f"mask_pixels={int(mask.sum())} invert_auto={args.invert_roi_mask}"
+                )
+
+                dbg = cv2.cvtColor(rgb_rot_rgb, cv2.COLOR_RGB2BGR)
                 cv2.circle(dbg, (gx, gy), 12, (0, 255, 0), thickness=-1)
                 cv2.rectangle(dbg, (x1, y1), (x2, y2), (0, 255, 0), thickness=2)
 
                 roi_rgb = save_outputs_fixed(
-                    obs.rgb_rot_rgb,
+                    rgb_rot_rgb,
                     mask,
                     dbg,
                     out_dir=args.out_dir,

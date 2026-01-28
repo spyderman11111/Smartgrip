@@ -55,7 +55,9 @@ class LightGlueMatcher:
     def _bgr_to_tensor_rgb01(img_bgr: np.ndarray, device: str) -> torch.Tensor:
         if img_bgr.ndim != 3 or img_bgr.shape[2] != 3:
             raise ValueError(f"Expected BGR uint8 HxWx3, got {img_bgr.shape}")
-        img_rgb = img_bgr[:, :, ::-1]  # BGR->RGB
+        # avoid negative-stride view; use cv2.cvtColor + contiguous
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        img_rgb = np.ascontiguousarray(img_rgb)
         t = torch.from_numpy(img_rgb).permute(2, 0, 1).contiguous().float() / 255.0  # [3,H,W]
         return t.to(device)
 
@@ -86,7 +88,7 @@ class LightGlueMatcher:
 
 
 # =========================
-# Preprocess: object-only crop + resize (recommended)
+# Preprocess: object-only crop + resize
 # =========================
 
 def _read_bgr_uint8(path: str) -> np.ndarray:
@@ -96,19 +98,52 @@ def _read_bgr_uint8(path: str) -> np.ndarray:
     return img
 
 
-def _object_bbox_from_black_bg(img_bgr: np.ndarray, thr: int = 8) -> Optional[Tuple[int, int, int, int]]:
+def _object_bbox_robust(
+    img_bgr: np.ndarray,
+    thr_black: int = 8,
+    border: int = 8,
+    min_area: int = 20,
+) -> Optional[Tuple[int, int, int, int]]:
     """
-    Detect non-black region as object bbox in an object-only image.
+    Robust bbox for object-only images:
+    - auto-detect background: black or white (via border median)
+    - ignore border frame artifacts
+    - keep largest connected component
     Return (x0,y0,x1,y1) inclusive-exclusive.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    mask = (gray > thr).astype(np.uint8)
-    ys, xs = np.where(mask > 0)
-    if xs.size == 0 or ys.size == 0:
+
+    # background estimate from image border
+    bd = np.concatenate([gray[0, :], gray[-1, :], gray[:, 0], gray[:, -1]])
+    bg = float(np.median(bd))
+
+    if bg > 200:  # likely white background cutout
+        mask = (gray < (bg - 10)).astype(np.uint8)
+    else:         # likely black/dark background
+        mask = (gray > int(thr_black)).astype(np.uint8)
+
+    b = int(max(0, border))
+    if b > 0:
+        mask[:b, :] = 0
+        mask[-b:, :] = 0
+        mask[:, :b] = 0
+        mask[:, -b:] = 0
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num <= 1:
         return None
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    return (x0, y0, x1, y1)
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    k = 1 + int(np.argmax(areas))
+    area = int(stats[k, cv2.CC_STAT_AREA])
+    if area < int(min_area):
+        return None
+
+    x = int(stats[k, cv2.CC_STAT_LEFT])
+    y = int(stats[k, cv2.CC_STAT_TOP])
+    w = int(stats[k, cv2.CC_STAT_WIDTH])
+    h = int(stats[k, cv2.CC_STAT_HEIGHT])
+    return (x, y, x + w, y + h)
 
 
 def _crop_pad_resize(
@@ -159,10 +194,11 @@ def preprocess_object_only(
     auto_crop_resize: bool = True,
     out_size: int = 512,
     pad_ratio: float = 0.15,
+    border_ignore: int = 8,
 ) -> np.ndarray:
     if not auto_crop_resize:
         return img_bgr
-    bbox = _object_bbox_from_black_bg(img_bgr)
+    bbox = _object_bbox_robust(img_bgr, thr_black=8, border=border_ignore, min_area=20)
     if bbox is None:
         return cv2.resize(img_bgr, (out_size, out_size), interpolation=cv2.INTER_AREA)
     return _crop_pad_resize(img_bgr, bbox=bbox, out_size=out_size, pad_ratio=pad_ratio)
@@ -217,7 +253,6 @@ class GateResult:
     best_index: int
     best_score: float
 
-    # topM gate fields (when policy=="topm")
     top_m: int
     s_top: float
     avg_threshold: float
@@ -227,7 +262,6 @@ class GateResult:
     selected_indices: List[int]
     selected_paths: List[str]
 
-    # consecutive fields (when policy=="consecutive") - still filled but may be defaults
     consecutive_n: int
     pass_index: int
     pass_threshold: float
@@ -240,7 +274,7 @@ class VerificationResult:
 
 
 # =========================
-# Debug visualization (optional)
+# Debug visualization
 # =========================
 
 def _draw_matches_image(
@@ -273,11 +307,53 @@ def _draw_matches_image(
         cv2.circle(canvas, tuple(p0), 2, (0, 0, 255), -1, cv2.LINE_AA)
         cv2.circle(canvas, tuple(p1), 2, (0, 0, 255), -1, cv2.LINE_AA)
 
-        s = float(scores[idx])
+        s = float(scores[idx]) if scores is not None and scores.size > idx else 0.0
         mid = ((p0 + p1) * 0.5).astype(np.int32)
         cv2.putText(canvas, f"{s:.2f}", tuple(mid), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1, cv2.LINE_AA)
 
     return canvas
+
+
+def _imshow_interactive(bundles: List[Dict[str, Any]], window_name: str = "LightGlue matches", topk: int = 200):
+    """
+    Interactive viewer:
+      - n / SPACE: next
+      - p: previous
+      - q / ESC: quit
+    """
+    if len(bundles) == 0:
+        print("[viz] no bundles to show")
+        return
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    idx = 0
+
+    while True:
+        b = bundles[idx]
+        aria_bgr = b["aria_bgr"]
+        wrist_bgr = b["wrist_bgr"]
+        kpts0 = b["kpts0"]
+        kpts1 = b["kpts1"]
+        matches = b["matches"]
+        scores = b["scores"]
+
+        vis = _draw_matches_image(aria_bgr, wrist_bgr, kpts0, kpts1, matches, scores, topk=topk)
+
+        title = f"{window_name} | {idx+1}/{len(bundles)} | score={b['score']:.3f} | Kconf={b['Kconf']} | n_matches={b['n_matches']}"
+        cv2.setWindowTitle(window_name, title)
+        cv2.imshow(window_name, vis)
+
+        key = cv2.waitKey(0) & 0xFF
+        if key in (27, ord('q')):  # ESC or q
+            break
+        if key in (ord('n'), ord(' ')):  # next
+            idx = (idx + 1) % len(bundles)
+            continue
+        if key == ord('p'):  # prev
+            idx = (idx - 1 + len(bundles)) % len(bundles)
+            continue
+
+    cv2.destroyWindow(window_name)
 
 
 # =========================
@@ -310,7 +386,6 @@ def _gate_consecutive(
     pass_threshold: float,
     consecutive_n: int,
 ) -> int:
-    """Return pass_index (first index where streak satisfied), or -1 if fail."""
     streak = 0
     pass_index = -1
     for i, f in enumerate(per_frame):
@@ -341,20 +416,24 @@ def verify_one_to_many(
     topk_quality: int = 10,
     k_ref: int = 20,
     # decision policy
-    policy: str = "topm",  # "topm" (recommended) or "consecutive"
+    policy: str = "topm",
     # topm gate
     top_m: int = 4,
     avg_threshold: float = 0.40,
     frame_threshold: float = 0.30,
     min_pass_k: int = 3,
-    # consecutive gate (legacy)
+    # consecutive gate
     pass_threshold: float = 0.40,
     consecutive_n: int = 2,
     # misc
     max_frames: Optional[int] = 16,
-    # optional visualization
+    # optional save visualization
     save_best_viz_path: Optional[str] = None,
     viz_topk: int = 200,
+    # NEW: show window visualization
+    show_viz: bool = False,
+    show_each: bool = False,
+    window_name: str = "LightGlue matches",
 ) -> VerificationResult:
     if not Path(aria_path).exists():
         raise FileNotFoundError(f"aria_path not found: {aria_path}")
@@ -377,6 +456,7 @@ def verify_one_to_many(
     feats0 = matcher.extract_features_from_bgr(aria_bgr)
 
     per_frame: List[FrameEval] = []
+    debug_bundles: List[Dict[str, Any]] = []
 
     best_score = -1.0
     best_index = -1
@@ -419,7 +499,27 @@ def verify_one_to_many(
                     "feats1": feats1,
                     "matches": matches,
                     "scores": scores,
+                    "score": fr.score,
+                    "Kconf": fr.K_conf,
+                    "n_matches": fr.n_matches,
+                    "path": wp,
                 }
+
+            if show_viz and show_each:
+                kpts0 = feats0["keypoints"][0].detach().cpu().numpy().astype(np.float32)
+                kpts1 = feats1["keypoints"][0].detach().cpu().numpy().astype(np.float32)
+                debug_bundles.append({
+                    "aria_bgr": aria_bgr,
+                    "wrist_bgr": wrist_bgr,
+                    "kpts0": kpts0,
+                    "kpts1": kpts1,
+                    "matches": matches,
+                    "scores": scores,
+                    "score": fr.score,
+                    "Kconf": fr.K_conf,
+                    "n_matches": fr.n_matches,
+                    "path": wp,
+                })
 
     # ---- Gate decision ----
     selected_indices: List[int] = []
@@ -437,11 +537,9 @@ def verify_one_to_many(
             min_pass_k=min_pass_k,
         )
         selected_paths = [per_frame[i].path for i in selected_indices]
-
     else:
         pass_index = _gate_consecutive(per_frame=per_frame, pass_threshold=pass_threshold, consecutive_n=consecutive_n)
         accepted = pass_index >= 0
-        # for convenience, still output "selected" as the best one if accepted
         if accepted and best_index >= 0:
             selected_indices = [best_index]
             selected_paths = [per_frame[best_index].path]
@@ -466,25 +564,44 @@ def verify_one_to_many(
         pass_threshold=float(pass_threshold),
     )
 
-    # optional: save best visualization
+    # ---- Save best viz image (your original behavior) ----
     if save_best_viz_path is not None and best_bundle is not None:
         kpts0 = best_bundle["feats0"]["keypoints"][0].detach().cpu().numpy().astype(np.float32)
         kpts1 = best_bundle["feats1"]["keypoints"][0].detach().cpu().numpy().astype(np.float32)
-        matches = best_bundle["matches"]
-        scores = best_bundle["scores"]
         vis = _draw_matches_image(
             best_bundle["aria_bgr"], best_bundle["wrist_bgr"],
-            kpts0, kpts1, matches, scores,
+            kpts0, kpts1, best_bundle["matches"], best_bundle["scores"],
             topk=viz_topk,
         )
         os.makedirs(str(Path(save_best_viz_path).parent), exist_ok=True)
         cv2.imwrite(save_best_viz_path, vis)
 
+    # ---- NEW: Show window visualization ----
+    if show_viz and best_bundle is not None:
+        if show_each:
+            # interactive browse all frames
+            _imshow_interactive(debug_bundles, window_name=window_name, topk=viz_topk)
+        else:
+            # show only best
+            kpts0 = best_bundle["feats0"]["keypoints"][0].detach().cpu().numpy().astype(np.float32)
+            kpts1 = best_bundle["feats1"]["keypoints"][0].detach().cpu().numpy().astype(np.float32)
+            vis = _draw_matches_image(
+                best_bundle["aria_bgr"], best_bundle["wrist_bgr"],
+                kpts0, kpts1, best_bundle["matches"], best_bundle["scores"],
+                topk=viz_topk,
+            )
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            title = f"{window_name} | best={best_index+1}/{len(wrist_paths)} | score={best_bundle['score']:.3f} | Kconf={best_bundle['Kconf']} | n_matches={best_bundle['n_matches']}"
+            cv2.setWindowTitle(window_name, title)
+            cv2.imshow(window_name, vis)
+            cv2.waitKey(0)
+            cv2.destroyWindow(window_name)
+
     return VerificationResult(per_frame=per_frame, gate=gate)
 
 
 # =========================
-# Convenience wrapper for main program
+# Convenience wrapper
 # =========================
 
 def cross_view_gate_select(
@@ -493,20 +610,12 @@ def cross_view_gate_select(
     wrist_paths: List[str],
     **kwargs,
 ) -> Tuple[bool, List[str], VerificationResult]:
-    """
-    Main-call-friendly wrapper.
-
-    Returns:
-      accepted: bool
-      selected_paths: List[str]   # (Top-M) paths to feed VGGT if accepted
-      result: VerificationResult  # full diagnostics
-    """
     res = verify_one_to_many(matcher=matcher, aria_path=aria_path, wrist_paths=wrist_paths, **kwargs)
     return res.gate.accepted, res.gate.selected_paths, res
 
 
 # =========================
-# Demo main 
+# Demo main
 # =========================
 
 def _print_summary(res: VerificationResult):
@@ -532,8 +641,8 @@ def _print_summary(res: VerificationResult):
 
 if __name__ == "__main__":
     # ---- Inputs ----
-    ARIA_PATH = "/home/MA_SmartGrip/Smartgrip/ur5_image_input/image3_rgbmask.png"
-    WRIST_GLOB = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/pictures/yellow_cube_30/out_rgb_masks/*.png"
+    ARIA_PATH = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ur5image/pose_1_image.png"
+    WRIST_GLOB = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ur5image/pose_2_image.png"
 
     wrist_paths = sorted(glob.glob(WRIST_GLOB))
     if not Path(ARIA_PATH).exists():
@@ -544,7 +653,6 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     matcher = LightGlueMatcher(feature_type="superpoint", device=device, mp=True)
 
-    # Recommended: topM posterior gate
     res = verify_one_to_many(
         matcher=matcher,
         aria_path=ARIA_PATH,
@@ -565,6 +673,11 @@ if __name__ == "__main__":
         max_frames=16,
         save_best_viz_path="/home/MA_SmartGrip/Smartgrip/tmp/best_match_viz.png",
         viz_topk=200,
+
+        
+        show_viz=True,
+        show_each=True,   # True: browse all frames; False: only show best
+        window_name="LightGlue matches",
     )
 
     _print_summary(res)

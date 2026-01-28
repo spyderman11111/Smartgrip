@@ -1,0 +1,7 @@
+{
+  "note": "Per-image joint positions and camera pose at capture time.",
+  "prompt": "yellow object.",
+  "created_at": "2026-01-28T14:34:36.784849",
+  "joint_names": [],
+  "shots": {}
+}
