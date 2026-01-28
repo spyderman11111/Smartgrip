@@ -1,7 +1,7 @@
 {
   "note": "Per-image joint positions and camera pose at capture time.",
   "prompt": "blue object.",
-  "created_at": "2026-01-28T15:38:57.253975",
+  "created_at": "2026-01-28T16:13:00.870016",
   "joint_names": [],
   "shots": {}
 }
