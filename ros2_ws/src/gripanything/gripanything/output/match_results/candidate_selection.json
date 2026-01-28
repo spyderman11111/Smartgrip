@@ -1,0 +1,90 @@
+{
+  "note": "Candidate selection via Aria<->wrist matching.",
+  "prompt": "orange square.",
+  "created_at": "2026-01-28T17:42:18.936058",
+  "aria_dir": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage",
+  "aria_files": {
+    "rgb": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage/gaze_sam2_rgb_rot.png",
+    "mask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage/gaze_sam2_mask_bin.png",
+    "aria_rgbmask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/aria_rgbmask.png"
+  },
+  "candidates": [
+    {
+      "rank": 0,
+      "dino_score_stage1": 0.7547606825828552,
+      "box_xyxy_stage1": [
+        818.4940185546875,
+        980.9957275390625,
+        1090.038818359375,
+        1197.6572265625
+      ],
+      "C_base": [
+        0.37187908754212523,
+        0.407380024786852,
+        0.0
+      ],
+      "hover_z": 0.3,
+      "eval_image_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_01_image.png",
+      "eval_rgbmask_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_01_image_rgbmask.png",
+      "match_score": 0.0,
+      "match_quality": 0.0,
+      "match_coverage": 0.0,
+      "match_Kconf": 0
+    },
+    {
+      "rank": 1,
+      "dino_score_stage1": 0.6929411292076111,
+      "box_xyxy_stage1": [
+        110.16195678710938,
+        389.1104736328125,
+        355.24078369140625,
+        623.4545288085938
+      ],
+      "C_base": [
+        0.25339981806594514,
+        0.4924666991395984,
+        0.0
+      ],
+      "hover_z": 0.3,
+      "eval_image_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_02_image.png",
+      "eval_rgbmask_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_02_image_rgbmask.png",
+      "match_score": 0.0,
+      "match_quality": 0.0,
+      "match_coverage": 0.0,
+      "match_Kconf": 0
+    },
+    {
+      "rank": 2,
+      "dino_score_stage1": 0.6648930311203003,
+      "box_xyxy_stage1": [
+        1572.5496826171875,
+        684.0523681640625,
+        1810.12744140625,
+        893.2379150390625
+      ],
+      "C_base": [
+        0.48295530421709265,
+        0.4605101857510864,
+        0.0
+      ],
+      "hover_z": 0.3,
+      "eval_image_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_03_image.png",
+      "eval_rgbmask_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_03_image_rgbmask.png",
+      "match_score": 0.0,
+      "match_quality": 0.0,
+      "match_coverage": 0.0,
+      "match_Kconf": 0
+    }
+  ],
+  "selected": {
+    "best_rank": 0,
+    "best_match_score": 0.0,
+    "best_dino_score": 0.7547606825828552
+  },
+  "thresholds": {
+    "min_exec_score": 0.5,
+    "cand_max": 6,
+    "cand_dwell_sec": 1.5,
+    "match_accept": 0.25
+  }
+}

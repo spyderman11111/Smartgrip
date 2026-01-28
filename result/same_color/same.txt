@@ -1,5 +1,18 @@
-1 an orange circle 1
-2 an orange square 1
-3 an orange triangle 0
-4 orange triangle  0
-5 orange square 
+1  orange circle 1
+1  orange circle 1
+2  orange square 1
+3  orange circle 1
+4  orange square 1
+5  orange square 1
+
+3 object
+1 orange triangle 1
+2 orange triangle 1
+3 orange triangle 1
+4 orange circle 1
+5 orange circle 1
+6 orange circle 1
+7 orange square 1
+8 orange square 0
+9 orange square 1
+10 orange square 0

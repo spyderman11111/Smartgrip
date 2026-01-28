@@ -461,7 +461,7 @@ class Observer:
         self.torch_device = torch_device
 
         # Key fix: auto defaults to BGR (common for OpenCV pipelines)
-        self.fmt = "bgr" if aria_rgb_format == "auto" else aria_rgb_format
+        self.fmt = "rgb" if aria_rgb_format == "auto" else aria_rgb_format
 
         self.lock = threading.Lock()
 
@@ -689,7 +689,7 @@ def main():
 
             if last_rgb_raw is not None:
                 rotated = np.rot90(last_rgb_raw, -1)
-                fmt = "bgr" if args.aria_rgb_format == "auto" else args.aria_rgb_format
+                fmt = "rgb" if args.aria_rgb_format == "auto" else args.aria_rgb_format
                 vis = to_display_bgr(rotated, fmt)
 
                 if gaze_xy_f is not None and shape is not None:
@@ -813,7 +813,7 @@ python stream_rgb_eye_sam2.py \
   --profile profile18 \
   --calib_vrs /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs \
   --device cuda \
-  --gaze-box-size 200 \
+  --gaze-box-size 350 \
   --sam2-root /home/MA_SmartGrip/Smartgrip/Grounded-SAM-2 \
   --sam2-ckpt /home/MA_SmartGrip/Smartgrip/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt \
   --sam2-config configs/sam2.1/sam2.1_hiera_l.yaml \

@@ -1,0 +1,68 @@
+{
+  "note": "Candidate selection via Aria<->wrist matching.",
+  "prompt": "orange square.",
+  "created_at": "2026-01-28T17:05:04.866961",
+  "aria_dir": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage",
+  "aria_files": {
+    "rgb": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage/gaze_sam2_rgb_rot.png",
+    "mask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage/gaze_sam2_mask_bin.png",
+    "aria_rgbmask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/aria_rgbmask.png"
+  },
+  "candidates": [
+    {
+      "rank": 0,
+      "dino_score_stage1": 0.7642142176628113,
+      "box_xyxy_stage1": [
+        577.4669189453125,
+        756.3009033203125,
+        859.710693359375,
+        974.6080322265625
+      ],
+      "C_base": [
+        0.3330048874274764,
+        0.4403204683572546,
+        0.0
+      ],
+      "hover_z": 0.3,
+      "eval_image_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_01_image.png",
+      "eval_rgbmask_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_01_image_rgbmask.png",
+      "match_score": 0.0,
+      "match_quality": 0.0,
+      "match_coverage": 0.0,
+      "match_Kconf": 0
+    },
+    {
+      "rank": 1,
+      "dino_score_stage1": 0.7199774980545044,
+      "box_xyxy_stage1": [
+        1474.433349609375,
+        769.3264770507812,
+        1699.484130859375,
+        976.221923828125
+      ],
+      "C_base": [
+        0.46771350969986825,
+        0.4466512888998865,
+        0.0
+      ],
+      "hover_z": 0.3,
+      "eval_image_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_02_image.png",
+      "eval_rgbmask_path": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/match_results/candidates/cand_02_image_rgbmask.png",
+      "match_score": 0.011244010180234909,
+      "match_quality": 0.22488020360469818,
+      "match_coverage": 0.05,
+      "match_Kconf": 1
+    }
+  ],
+  "selected": {
+    "best_rank": 0,
+    "best_match_score": 0.0,
+    "best_dino_score": 0.7642142176628113
+  },
+  "thresholds": {
+    "min_exec_score": 0.5,
+    "cand_max": 6,
+    "cand_dwell_sec": 1.5,
+    "match_accept": 0.25
+  }
+}
