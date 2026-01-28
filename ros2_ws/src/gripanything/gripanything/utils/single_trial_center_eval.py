@@ -1,51 +1,123 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-single_trial_center_eval.py
+batch_center_size_eval.py
 
-Compute one-trial center accuracy + size estimate from:
-  <trial_dir>/output/offline_output/object_in_base_link.json
-(or compatible variants)
+Batch-evaluate center XY errors (mm) and size errors (mm) for 25 yellow + 25 blue trials.
+
+Data sources:
+- Pred center/shape: <trial_dir>/**/object_in_base_link.json
+- GT center (rx,ry) in mm: hard-coded from the user's table
+- GT size (cube edge length, cm):
+    yellow: 3.962 cm
+    blue  : 2.508 cm
+
+Key correction requested by user:
+- Predicted center printed in meters (e.g. 0.405748 m) is about 2 mm smaller than teach pendant GT
+  -> by default, apply +2 mm to x and y: pred_x_mm += 2, pred_y_mm += 2
+  (can be disabled via CLI)
 
 Outputs:
-- center (m): c_x, c_y, c_z in base_link
-- reference center (m): cgt_x, cgt_y, cgt_z in base_link
-- errors: e_xy (mm), e_z (mm) against cgt
-- size: s_x, s_y, s_z (cm)
+- CSV table (default: ./center_size_eval.csv)
+- Console: per-color summary + a compact table
 
-cgt generation (paper-aligned usage):
-- manual: use user-provided --gt_x/--gt_y/--gt_z (meters)
-- random_near_center:
-    cgt is sampled around predicted center c within specified error ranges.
-    Special x-bias model (per user requirement):
-      - 90%: |dx| ~ U(0, 1.5cm)
-      - 10%: |dx| ~ U(2.0, 2.5cm)
-      - P(sign(dx)=+) = 0.95, else negative
-    y-bias default:
-      - |dy| ~ U(0, 1.0cm)
-      - sign(dy) is symmetric (50/50) by default
-    z:
-      - if --gt_z is provided, use it; otherwise set cgt_z = c_z
+Notes:
+- This script compares XY only, since your GT provides rx, ry.
+- Size reading priority:
+    1) object.prism.extent_xyz_in_prism_axes (meters). If align_method=sim3 and alignment_W_to_B.scale_s exists,
+       multiply by scale_s (keeps consistency with your earlier logic).
+    2) object.prism.corners_8.base_link -> derive extents from 8 corners (meters, in base_link).
+
+- Known typo guard:
+    yellow #19: rx is "-46.66" in the provided table (very likely "-466.66").
+    By default we auto-fix that one entry. Disable via --disable_known_fixes.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 
 
 # ---------------------------
-# User defaults (edit if you want)
+# GT centers (mm) from your table
 # ---------------------------
-DEFAULT_TRIAL_DIR = "/home/MA_SmartGrip/Smartgrip/result/120_yellow_solo_5"
+GT_XY_MM = {
+    "yellow": {
+        1: (-398.10, -463.70),
+        2: (-496.70, -492.78),
+        3: (-522.43, -406.66),
+        4: (-474.64, -427.15),
+        5: (-414.43, -493.87),
+        6: (-401.75, -409.80),
+        7: (-348.40, -449.95),
+        8: (-446.20, -507.77),
+        9: (-390.70, -473.75),
+        10: (-318.90, -458.26),
+        11: (-366.20, -535.31),
+        12: (-329.25, -515.32),
+        13: (-332.54, -449.76),
+        14: (-426.26, -541.45),
+        15: (-262.98, -557.12),
+        16: (-440.00, -359.98),
+        17: (-486.01, -495.80),
+        18: (-483.22, -426.53),
+        19: (-466.66,  -366.90),   
+        20: (-508.70, -264.44),
+        21: (-577.01, -370.86),
+        22: (-599.27, -299.35),
+        23: (-594.46, -528.96),
+        24: (-458.20, -474.50),
+        25: (-394.19, -369.47),
+    },
+    "blue": {
+        1: (-383.12, -366.40),
+        2: (-430.86, -456.55),
+        3: (-481.77, -487.90),
+        4: (-455.48, -364.12),
+        5: (-383.00, -495.20),
+        6: (-413.44, -336.44),
+        7: (-515.58, -432.15),
+        8: (-510.64, -508.20),
+        9: (-441.60, -542.05),
+        10: (-356.90, -438.12),
+        11: (-320.55, -395.24),
+        12: (-273.33, -470.80),
+        13: (-383.63, -525.37),
+        14: (-348.88, -470.68),
+        15: (-517.39, -516.02),
+        16: (-463.30, -533.42),
+        17: (-563.00, -551.20),
+        18: (-259.10, -520.90),
+        19: (-300.53, -382.16),
+        20: (-256.75, -365.58),
+        21: (-585.67, -263.35),
+        22: (-636.55, -262.31),
+        23: (-444.34, -380.00),
+        24: (-559.04, -494.00),
+        25: (-558.16, -408.44),
+    },
+}
+
+# Known GT fixes (toggle-able)
+KNOWN_GT_FIXES = {
+    ("yellow", 19): {"rx": -466.66},  # most likely typo
+}
+
+# GT cube edge length (cm)
+GT_SIDE_CM = {
+    "yellow": 3.962,  # 39.62 mm
+    "blue": 2.508,    # 25.08 mm
+}
 
 
 # ---------------------------
-# Helpers
+# JSON parsing helpers
 # ---------------------------
 def _is_num(x: Any) -> bool:
     return isinstance(x, (int, float))
@@ -58,35 +130,19 @@ def _as_vec3(x: Any) -> Optional[np.ndarray]:
 
 
 def _find_object_json(trial_dir: str) -> str:
-    """
-    Try common layouts:
-      A) <trial_dir>/output/offline_output/object_in_base_link.json
-      B) <trial_dir>/offline_output/object_in_base_link.json
-      C) <trial_dir>/object_in_base_link.json
-      D) <trial_dir>/offline_output/object_in_base_link.json (if trial_dir already points to .../output)
-    """
     td = os.path.abspath(trial_dir)
     cand = [
         os.path.join(td, "output", "offline_output", "object_in_base_link.json"),
         os.path.join(td, "offline_output", "object_in_base_link.json"),
         os.path.join(td, "object_in_base_link.json"),
-        os.path.join(td, "offline_output", "object_in_base_link.json"),
     ]
-
     for p in cand:
         if os.path.isfile(p):
             return p
-
-    raise FileNotFoundError(
-        "Cannot find object_in_base_link.json under trial_dir. Tried:\n  - " + "\n  - ".join(cand)
-    )
+    raise FileNotFoundError("Cannot find object_in_base_link.json under:\n  - " + "\n  - ".join(cand))
 
 
-def _read_center_base_link(data: Dict[str, Any]) -> Optional[np.ndarray]:
-    """
-    Preferred: object.center.base_link
-    Fallback: object.center_base / object.center_base_link / object.center_b
-    """
+def _read_center_m(data: Dict[str, Any]) -> Optional[np.ndarray]:
     obj = data.get("object", {})
     if not isinstance(obj, dict):
         return None
@@ -122,10 +178,14 @@ def _read_align_method(data: Dict[str, Any]) -> str:
     return "sim3" if abs(s - 1.0) > 1e-9 else "se3"
 
 
-def _try_read_extent_from_prism(data: Dict[str, Any]) -> Optional[np.ndarray]:
+def _try_read_extent_m(data: Dict[str, Any]) -> Optional[np.ndarray]:
+    """
+    Return extent (sx,sy,sz) in meters if possible.
+    """
     obj = data.get("object", {})
     if not isinstance(obj, dict):
         return None
+
     prism = obj.get("prism", {})
     if not isinstance(prism, dict):
         return None
@@ -134,15 +194,17 @@ def _try_read_extent_from_prism(data: Dict[str, Any]) -> Optional[np.ndarray]:
     if ext3 is None:
         return None
 
-    s = _read_scale_s(data)
+    # Optional scale handling for sim3
     am = _read_align_method(data)
+    s = _read_scale_s(data)
     return ext3 * float(s) if am == "sim3" else ext3
 
 
-def _try_read_corners8_base(data: Dict[str, Any]) -> Optional[np.ndarray]:
+def _try_read_corners8_base_m(data: Dict[str, Any]) -> Optional[np.ndarray]:
     obj = data.get("object", {})
     if not isinstance(obj, dict):
         return None
+
     prism = obj.get("prism", {})
     if not isinstance(prism, dict):
         return None
@@ -161,14 +223,20 @@ def _try_read_corners8_base(data: Dict[str, Any]) -> Optional[np.ndarray]:
         if v is None:
             return None
         out.append(v)
-    return np.stack(out, axis=0)  # (8,3)
+
+    return np.stack(out, axis=0)  # (8,3), meters
 
 
-def _extent_from_corners8(corners8_b: np.ndarray) -> Optional[np.ndarray]:
-    if corners8_b is None or corners8_b.shape != (8, 3):
+def _extent_from_corners8_m(corners8_b_m: np.ndarray) -> Optional[np.ndarray]:
+    """
+    Derive (sx,sy,sz) in meters from 8 corners.
+    Assumes first 4 are bottom, last 4 are top (same convention as your point_processing).
+    """
+    if corners8_b_m is None or corners8_b_m.shape != (8, 3):
         return None
-    btm = corners8_b[:4, :]
-    top = corners8_b[4:, :]
+
+    btm = corners8_b_m[:4, :]
+    top = corners8_b_m[4:, :]
 
     d01 = float(np.linalg.norm(btm[1] - btm[0]))
     d12 = float(np.linalg.norm(btm[2] - btm[1]))
@@ -182,255 +250,254 @@ def _extent_from_corners8(corners8_b: np.ndarray) -> Optional[np.ndarray]:
     return np.array([sx, sy, sz], dtype=float)
 
 
-def _fmt_vec3(v: np.ndarray) -> str:
-    return f"({v[0]:.6f}, {v[1]:.6f}, {v[2]:.6f})"
-
-
-def _sample_sign(rng: np.random.Generator, p_pos: float) -> float:
-    return 1.0 if float(rng.random()) < float(p_pos) else -1.0
-
-
-def _sample_dx_cm_mixture(
-    rng: np.random.Generator,
-    near_max_cm: float,
-    far_min_cm: float,
-    far_max_cm: float,
-    p_far: float,
-    p_pos: float,
-) -> Tuple[float, str, float]:
-    """
-    Return (dx_cm_signed, which_range, sign)
-      - with prob (1-p_far): |dx| ~ U(0, near_max_cm)
-      - with prob p_far:     |dx| ~ U(far_min_cm, far_max_cm)
-      - sign: + with prob p_pos, else -
-    """
-    u = float(rng.random())
-    if u < float(p_far):
-        mag = float(rng.uniform(float(far_min_cm), float(far_max_cm)))
-        which = f"[{far_min_cm:.2f},{far_max_cm:.2f}]cm"
-    else:
-        mag = float(rng.uniform(0.0, float(near_max_cm)))
-        which = f"[0.00,{near_max_cm:.2f}]cm"
-
-    sign = _sample_sign(rng, p_pos)
-    return sign * mag, which, sign
-
-
-def _sample_dy_cm_uniform(
-    rng: np.random.Generator,
-    max_cm: float,
-    p_pos: float = 0.5,
-) -> Tuple[float, str, float]:
-    """
-    Return (dy_cm_signed, range_str, sign)
-      - |dy| ~ U(0, max_cm)
-      - sign: + with prob p_pos (default 0.5), else -
-    """
-    mag = float(rng.uniform(0.0, float(max_cm)))
-    sign = _sample_sign(rng, p_pos)
-    return sign * mag, f"[0.00,{max_cm:.2f}]cm", sign
-
-
-def _build_cgt(
-    center_m: np.ndarray,
-    gt_mode: str,
-    gt_x: Optional[float],
-    gt_y: Optional[float],
-    gt_z: Optional[float],
-    # x mixture config (cm)
-    x_near_max_cm: float,
-    x_far_min_cm: float,
-    x_far_max_cm: float,
-    x_p_far: float,
-    x_p_pos: float,
-    # y config (cm)
-    y_max_cm: float,
-    y_p_pos: float,
-    seed: Optional[int],
-) -> Tuple[np.ndarray, str, Dict[str, float | str]]:
-    """
-    Return (cgt_m, source_str, debug_dict)
-    debug_dict contains dx_cm/dy_cm, ranges, signs, etc.
-    """
-    if gt_mode == "manual":
-        if gt_x is None or gt_y is None or gt_z is None:
-            raise ValueError("gt_mode=manual requires --gt_x --gt_y --gt_z (meters).")
-        cgt = np.array([gt_x, gt_y, gt_z], dtype=float)
-        dbg = {
-            "dx_cm": 0.0,
-            "dy_cm": 0.0,
-            "dx_range": "manual",
-            "dy_range": "manual",
-            "dx_sign": 0.0,
-            "dy_sign": 0.0,
-        }
-        return cgt, "manual (--gt_x/--gt_y/--gt_z)", dbg
-
-    if gt_mode == "random_near_center":
-        rng = np.random.default_rng(seed)
-
-        dx_cm, dx_range, dx_sign = _sample_dx_cm_mixture(
-            rng,
-            near_max_cm=x_near_max_cm,
-            far_min_cm=x_far_min_cm,
-            far_max_cm=x_far_max_cm,
-            p_far=x_p_far,
-            p_pos=x_p_pos,
-        )
-        dy_cm, dy_range, dy_sign = _sample_dy_cm_uniform(
-            rng,
-            max_cm=y_max_cm,
-            p_pos=y_p_pos,
-        )
-
-        dx_m = dx_cm / 100.0
-        dy_m = dy_cm / 100.0
-
-        cgt = center_m.copy()
-        cgt[0] += dx_m
-        cgt[1] += dy_m
-        cgt[2] = float(gt_z) if gt_z is not None else float(center_m[2])
-
-        src = f"random_near_center(seed={seed})"
-        dbg = {
-            "dx_cm": float(dx_cm),
-            "dy_cm": float(dy_cm),
-            "dx_range": str(dx_range),
-            "dy_range": str(dy_range),
-            "dx_sign": float(dx_sign),
-            "dy_sign": float(dy_sign),
-        }
-        return cgt, src, dbg
-
-    raise ValueError(f"Unknown gt_mode: {gt_mode}")
-
-
 # ---------------------------
-# Main
+# Evaluation
 # ---------------------------
-def main():
+def _get_gt_xy_mm(color: str, idx: int, enable_known_fixes: bool) -> Tuple[float, float]:
+    rx, ry = GT_XY_MM[color][idx]
+    if enable_known_fixes:
+        fix = KNOWN_GT_FIXES.get((color, idx), None)
+        if isinstance(fix, dict):
+            if "rx" in fix:
+                rx = float(fix["rx"])
+            if "ry" in fix:
+                ry = float(fix["ry"])
+    return float(rx), float(ry)
+
+
+def _apply_xy_convention(
+    x_mm: float,
+    y_mm: float,
+    swap_xy: bool,
+    flip_x: bool,
+    flip_y: bool,
+    off_x_mm: float,
+    off_y_mm: float,
+) -> Tuple[float, float]:
+    if swap_xy:
+        x_mm, y_mm = y_mm, x_mm
+    if flip_x:
+        x_mm = -x_mm
+    if flip_y:
+        y_mm = -y_mm
+    x_mm += float(off_x_mm)
+    y_mm += float(off_y_mm)
+    return x_mm, y_mm
+
+
+def _safe_float(x: Any, default: float = float("nan")) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--trial_dir",
-        type=str,
-        default=DEFAULT_TRIAL_DIR,
-        help="Path to one trial folder (e.g., /home/.../result/180_red_solo or .../result/180_red_solo/output).",
-    )
 
-    ap.add_argument(
-        "--gt_mode",
-        type=str,
-        default="random_near_center",
-        choices=["manual", "random_near_center"],
-        help="How to set cgt (reference center in base_link).",
-    )
+    ap.add_argument("--yellow_root", type=str, default="/home/MA_SmartGrip/Smartgrip/result/single/y",
+                    help="Folder containing y1..y25")
+    ap.add_argument("--blue_root", type=str, default="/home/MA_SmartGrip/Smartgrip/result/single/b",
+                    help="Folder containing b1..b25")
+    ap.add_argument("--n", type=int, default=25, help="Number of trials per color.")
 
-    # manual GT (meters)
-    ap.add_argument("--gt_x", type=float, default=None, help="GT center x in base_link (meters). (manual mode)")
-    ap.add_argument("--gt_y", type=float, default=None, help="GT center y in base_link (meters). (manual mode)")
-    ap.add_argument("--gt_z", type=float, default=None, help="GT center z in base_link (meters). (manual mode / optional in random mode)")
+    # Center XY correction (your requested +2 mm default)
+    ap.add_argument("--offset_x_mm", type=float, default=2.0, help="Additive offset applied to predicted x (mm).")
+    ap.add_argument("--offset_y_mm", type=float, default=2.0, help="Additive offset applied to predicted y (mm).")
+    ap.add_argument("--swap_xy", action="store_true", help="Swap predicted x and y before eval.")
+    ap.add_argument("--flip_x", action="store_true", help="Flip sign of predicted x before eval.")
+    ap.add_argument("--flip_y", action="store_true", help="Flip sign of predicted y before eval.")
 
-    # random seed
-    ap.add_argument("--seed", type=int, default=None, help="Random seed for reproducible cgt sampling.")
+    ap.add_argument("--disable_known_fixes", action="store_true",
+                    help="Disable built-in fixes for known GT typos (e.g., yellow#19).")
 
-    # x mixture config (defaults exactly as your requirement)
-    ap.add_argument("--x_near_max_cm", type=float, default=1.5, help="90%: |dx| ~ U(0, x_near_max_cm) (cm).")
-    ap.add_argument("--x_far_min_cm", type=float, default=2.0, help="10%: |dx| ~ U(x_far_min_cm, x_far_max_cm) (cm).")
-    ap.add_argument("--x_far_max_cm", type=float, default=2.5, help="10%: |dx| ~ U(x_far_min_cm, x_far_max_cm) (cm).")
-    ap.add_argument("--x_p_far", type=float, default=0.10, help="Probability of sampling dx from FAR range.")
-    ap.add_argument("--x_p_pos", type=float, default=0.95, help="Probability that dx is positive (+x).")
-
-    # y config (keep your original: 0~1cm, symmetric sign by default)
-    ap.add_argument("--y_max_cm", type=float, default=1.0, help="|dy| ~ U(0, y_max_cm) (cm).")
-    ap.add_argument("--y_p_pos", type=float, default=0.50, help="Probability that dy is positive (+y).")
-
-    ap.add_argument("--trial_id", type=int, default=1, help="Trial index for LaTeX row (just a label).")
+    ap.add_argument("--out_csv", type=str, default="center_size_eval.csv", help="Output CSV path.")
     args = ap.parse_args()
 
-    trial_dir = os.path.abspath(args.trial_dir)
-    obj_json = _find_object_json(trial_dir)
+    enable_known_fixes = not bool(args.disable_known_fixes)
 
-    with open(obj_json, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    rows: List[Dict[str, Any]] = []
 
-    center = _read_center_base_link(data)
-    if center is None:
-        raise RuntimeError(f"Center not found in JSON: {obj_json}")
+    for color, root, prefix in [("yellow", args.yellow_root, "y"), ("blue", args.blue_root, "b")]:
+        gt_side_cm = float(GT_SIDE_CM[color])
 
-    # Build reference/GT center cgt
-    cgt, cgt_src, dbg = _build_cgt(
-        center_m=center,
-        gt_mode=args.gt_mode,
-        gt_x=args.gt_x,
-        gt_y=args.gt_y,
-        gt_z=args.gt_z,
-        x_near_max_cm=args.x_near_max_cm,
-        x_far_min_cm=args.x_far_min_cm,
-        x_far_max_cm=args.x_far_max_cm,
-        x_p_far=args.x_p_far,
-        x_p_pos=args.x_p_pos,
-        y_max_cm=args.y_max_cm,
-        y_p_pos=args.y_p_pos,
-        seed=args.seed,
-    )
+        for idx in range(1, int(args.n) + 1):
+            trial_dir = os.path.join(os.path.abspath(root), f"{prefix}{idx}")
 
-    # Errors
-    dxy = center[:2] - cgt[:2]
-    e_xy_mm = float(np.linalg.norm(dxy) * 1000.0)
-    e_z_mm = float(abs(center[2] - cgt[2]) * 1000.0)
+            # Defaults for a row (even if missing)
+            row = {
+                "color": color,
+                "trial": idx,
+                "trial_dir": trial_dir,
+                "json_path": "",
+                "align_method": "",
+                "scale_s": float("nan"),
 
-    # Size estimate
-    extent_m = _try_read_extent_from_prism(data)
-    extent_src = "prism.extent_xyz_in_prism_axes (+scale_s if sim3)"
-    if extent_m is None:
-        c8 = _try_read_corners8_base(data)
-        if c8 is not None:
-            extent_m = _extent_from_corners8(c8)
-            extent_src = "prism.corners_8.base_link (fallback)"
-    extent_cm = None if extent_m is None else extent_m * 100.0
+                # pred center (mm, after convention)
+                "pred_x_mm": float("nan"),
+                "pred_y_mm": float("nan"),
+                "pred_z_mm": float("nan"),
+                
 
-    # Print (include sampled offsets and chosen ranges)
-    print(f"[trial] TRIAL_DIR     : {trial_dir}")
-    print(f"[trial] object_json   : {obj_json}")
-    print(f"[trial] center c (m)  : {_fmt_vec3(center)}")
-    print(f"[trial] cgt (m)       : {_fmt_vec3(cgt)} | src={cgt_src}")
+                # gt center (mm)
+                "gt_x_mm": float("nan"),
+                "gt_y_mm": float("nan"),
 
-    if args.gt_mode == "random_near_center":
-        dx_cm = float(dbg["dx_cm"])
-        dy_cm = float(dbg["dy_cm"])
-        dx_range = str(dbg["dx_range"])
-        dy_range = str(dbg["dy_range"])
-        dx_sign = "+" if float(dbg["dx_sign"]) > 0 else "-"
-        dy_sign = "+" if float(dbg["dy_sign"]) > 0 else "-"
+                # center errors (mm)
+                "dx_mm": float("nan"),
+                "dy_mm": float("nan"),
+                "e_xy_mm": float("nan"),
 
-        print(
-            f"[trial] sampled dx   : {dx_cm:+.3f} cm (range {dx_range}, sign {dx_sign}, P(dx>0)={args.x_p_pos:.2f})"
-        )
-        print(
-            f"[trial] sampled dy   : {dy_cm:+.3f} cm (range {dy_range}, sign {dy_sign}, P(dy>0)={args.y_p_pos:.2f})"
-        )
+                # predicted size (cm)
+                "pred_sx_cm": float("nan"),
+                "pred_sy_cm": float("nan"),
+                "pred_sz_cm": float("nan"),
+                "pred_side_cm_med": float("nan"),
 
-    print(f"[trial] e_xy (mm)     : {e_xy_mm:.2f}")
-    print(f"[trial] e_z  (mm)     : {e_z_mm:.2f}")
+                # gt size (cm)
+                "gt_side_cm": gt_side_cm,
 
-    if extent_cm is None:
-        print(f"[trial] size (cm)    : (N/A) | src={extent_src}")
-    else:
-        print(
-            f"[trial] size (cm)    : ({extent_cm[0]:.2f}, {extent_cm[1]:.2f}, {extent_cm[2]:.2f}) | src={extent_src}"
-        )
+                # size errors (mm)
+                "err_sx_mm": float("nan"),
+                "err_sy_mm": float("nan"),
+                "err_sz_mm": float("nan"),
+                "err_side_mm_med": float("nan"),
+            }
 
-    # LaTeX rows
-    print("\n% ---- paste into LaTeX table (center + errors) ----")
-    print(
-        f"{int(args.trial_id)} & {center[0]:.4f} & {center[1]:.4f} & {center[2]:.4f} & {e_xy_mm:.1f} & {e_z_mm:.1f} \\\\"
-    )
+            # GT center
+            rx, ry = _get_gt_xy_mm(color, idx, enable_known_fixes)
+            row["gt_x_mm"] = rx
+            row["gt_y_mm"] = ry
 
-    print("\n% ---- paste into LaTeX table (size) ----")
-    if extent_cm is None:
-        print(f"{int(args.trial_id)} & TODO & TODO & TODO \\\\  % size not found in JSON")
-    else:
-        print(f"{int(args.trial_id)} & {extent_cm[0]:.2f} & {extent_cm[1]:.2f} & {extent_cm[2]:.2f} \\\\")
+            # Load JSON
+            try:
+                obj_json = _find_object_json(trial_dir)
+                row["json_path"] = obj_json
+                with open(obj_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                row["json_path"] = f"MISSING ({e})"
+                rows.append(row)
+                continue
+
+            # Alignment info
+            row["align_method"] = str(_read_align_method(data))
+            row["scale_s"] = float(_read_scale_s(data))
+
+            # Pred center
+            c_m = _read_center_m(data)
+            if c_m is not None:
+                pred_x_mm = float(c_m[0] * 1000.0)
+                pred_y_mm = float(c_m[1] * 1000.0)
+                pred_z_mm = float(c_m[2] * 1000.0)
+
+                pred_x_mm = -pred_x_mm
+                pred_y_mm = -pred_y_mm
+
+                pred_x_mm, pred_y_mm = _apply_xy_convention(
+                    pred_x_mm, pred_y_mm,
+                    swap_xy=bool(args.swap_xy),
+                    flip_x=bool(args.flip_x),
+                    flip_y=bool(args.flip_y),
+                    off_x_mm=float(args.offset_x_mm),
+                    off_y_mm=float(args.offset_y_mm),
+                )
+
+                row["pred_x_mm"] = pred_x_mm
+                row["pred_y_mm"] = pred_y_mm
+                row["pred_z_mm"] = pred_z_mm
+
+                # Errors
+                dx = pred_x_mm - rx
+                dy = pred_y_mm - ry
+                row["dx_mm"] = dx
+                row["dy_mm"] = dy
+                row["e_xy_mm"] = float(np.hypot(dx, dy))
+
+            # Pred size
+            extent_m = _try_read_extent_m(data)
+            if extent_m is None:
+                c8 = _try_read_corners8_base_m(data)
+                if c8 is not None:
+                    extent_m = _extent_from_corners8_m(c8)
+
+            if extent_m is not None:
+                extent_cm = extent_m * 100.0
+                row["pred_sx_cm"] = float(extent_cm[0])
+                row["pred_sy_cm"] = float(extent_cm[1])
+                row["pred_sz_cm"] = float(extent_cm[2])
+
+                pred_side_cm_med = float(np.median(extent_cm))
+                row["pred_side_cm_med"] = pred_side_cm_med
+
+                # size errors (mm): (cm diff) * 10
+                row["err_sx_mm"] = float((row["pred_sx_cm"] - gt_side_cm) * 10.0)
+                row["err_sy_mm"] = float((row["pred_sy_cm"] - gt_side_cm) * 10.0)
+                row["err_sz_mm"] = float((row["pred_sz_cm"] - gt_side_cm) * 10.0)
+                row["err_side_mm_med"] = float((pred_side_cm_med - gt_side_cm) * 10.0)
+
+            rows.append(row)
+
+    # Write CSV
+    out_csv = os.path.abspath(args.out_csv)
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+
+    fieldnames = list(rows[0].keys()) if rows else []
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+    # Console summary
+    def _summarize(color: str):
+        es = [r["e_xy_mm"] for r in rows if r["color"] == color and np.isfinite(r["e_xy_mm"])]
+        dxs = [r["dx_mm"] for r in rows if r["color"] == color and np.isfinite(r["dx_mm"])]
+        dys = [r["dy_mm"] for r in rows if r["color"] == color and np.isfinite(r["dy_mm"])]
+        ss = [r["err_side_mm_med"] for r in rows if r["color"] == color and np.isfinite(r["err_side_mm_med"])]
+
+        if not es:
+            return
+
+        def q(a, p):  # quantile
+            return float(np.quantile(np.asarray(a, dtype=float), p))
+
+        print(f"\n=== {color.upper()} summary (valid rows: {len(es)}) ===")
+        print(f"center e_xy_mm: mean={np.mean(es):.2f}, median={np.median(es):.2f}, p90={q(es,0.90):.2f}, max={np.max(es):.2f}")
+        print(f"dx_mm: mean={np.mean(dxs):+.2f}, dy_mm: mean={np.mean(dys):+.2f}")
+        if ss:
+            print(f"size err_side_mm_med: mean={np.mean(ss):+.2f}, median={np.median(ss):+.2f}, p90={q(ss,0.90):+.2f}, max={np.max(ss):+.2f}")
+        else:
+            print("size: N/A (no size fields found in JSON)")
+
+    _summarize("yellow")
+    _summarize("blue")
+
+    # Compact table print (first 10 rows per color)
+    def _print_compact(color: str, k: int = 10):
+        print(f"\n--- {color.upper()} first {k} rows ---")
+        print("trial  pred_x  pred_y   gt_x   gt_y   dx    dy   e_xy  side(cm,med)  side_err(mm)")
+        cnt = 0
+        for r in rows:
+            if r["color"] != color:
+                continue
+            if cnt >= k:
+                break
+            print(
+                f"{int(r['trial']):>5d} "
+                f"{_safe_float(r['pred_x_mm']):>7.1f} {_safe_float(r['pred_y_mm']):>7.1f} "
+                f"{_safe_float(r['gt_x_mm']):>6.1f} {_safe_float(r['gt_y_mm']):>6.1f} "
+                f"{_safe_float(r['dx_mm']):>6.1f} {_safe_float(r['dy_mm']):>6.1f} "
+                f"{_safe_float(r['e_xy_mm']):>6.1f} "
+                f"{_safe_float(r['pred_side_cm_med']):>11.3f} "
+                f"{_safe_float(r['err_side_mm_med']):>11.2f}"
+            )
+            cnt += 1
+
+    _print_compact("yellow", 10)
+    _print_compact("blue", 10)
+
+    print(f"\nSaved CSV: {out_csv}")
 
 
 if __name__ == "__main__":

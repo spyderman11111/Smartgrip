@@ -198,7 +198,7 @@ def inspect_point_cloud(ply_path: str,
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ply", type=str, required=False,
-                    default="/home/MA_SmartGrip/Smartgrip/result/60_red_solo/output/offline_output/main_cluster_clean.ply",
+                    default="/home/MA_SmartGrip/Smartgrip/result/single/y/y1/output/offline_output/main_cluster_clean.ply",
                     help="Path to input .ply point cloud.")
     ap.add_argument("--show-cylinder", dest="show_cylinder", action="store_true", help="Show ray-cylinder at startup.")
     ap.add_argument("--no-cylinder", dest="show_cylinder", action="store_false", help="Hide ray-cylinder at startup.")

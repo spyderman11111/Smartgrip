@@ -1923,13 +1923,20 @@ class SeeAnythingNode(Node):
             if not self.motion.is_stationary():
                 return
             # finalize orbit center from selected candidate
-            bestC = self._cand_list[self._cand_best_idx].C
-            self._circle_center = bestC.copy()
-            self._ring_z = float(self._cand_list[self._cand_best_idx].hover_pose.pose.position.z)
-            self._phase = "hover_to_center"
-            self.get_logger().info(
-                f"[cand] Best candidate hover reached. Orbit center=({bestC[0]:.3f},{bestC[1]:.3f},{bestC[2]:.3f})."
-            )
+            # bestC = self._cand_list[self._cand_best_idx].C
+            # self._circle_center = bestC.copy()
+            # self._ring_z = float(self._cand_list[self._cand_best_idx].hover_pose.pose.position.z)
+            # self._phase = "hover_to_center"
+            # self.get_logger().info(
+            #     f"[cand] Best candidate hover reached. Orbit center=({bestC[0]:.3f},{bestC[1]:.3f},{bestC[2]:.3f})."
+            self._fixed_hover = None
+            self._circle_center = None
+            self._ring_z = None
+            
+            self.get_logger().info("[cand] Best hover reached. Running Stage-2 refine detection before orbit...")
+            self._phase = "wait_detect_stage2"
+
+            
             # also save a best visualization for debugging
             try:
                 rp = self._cand_list[self._cand_best_idx].eval_rgbmask_path
