@@ -108,7 +108,7 @@ class Circle:
     num_turns: int = 1
     poly_dir: str = 'ccw'
     start_dir_offset_deg: float = -90.0
-    radius: float = 0.05
+    radius: float = 0.08
     orient_mode: str = 'radial_in'
     tool_z_sign: str = '-'
     dwell_time: float = 1.0
