@@ -1,0 +1,39 @@
+used_pairs: 28
+skipped: 0
+dict_locked: DICT_4X4_50
+T_gripper_cam:
+- - 0.9996085365175449
+  - 0.027445235246981066
+  - -0.005434407372461237
+  - -0.06635243685969598
+- - -0.01808970471634162
+  - 0.7821800863938504
+  - 0.6227897518683047
+  - -0.0648213404084122
+- - 0.021343296477525694
+  - -0.6224476455985248
+  - 0.7823703676548119
+  - 0.15038971196340464
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+board_consistency:
+  T_base_board_translation_mean_m:
+  - 0.3587886575722342
+  - 0.37594377585326316
+  - -0.15203674892322286
+  T_base_board_translation_std_m:
+  - 0.007640708723931103
+  - 0.009851069000671422
+  - 0.006007897884141371
+  T_base_board_rotation_angle_mean_rad: 0.027373875066827397
+  T_base_board_rotation_angle_std_rad: 0.02215608455528595
+board:
+  squares_x: 8
+  squares_y: 11
+  square_mm: 15.0
+  marker_mm: 11.0
+  min_charuco_corners: 10
+method: tsai
+intrinsics_yaml: /home/MA_SmartGrip/Smartgrip/calib_result/ost.yaml

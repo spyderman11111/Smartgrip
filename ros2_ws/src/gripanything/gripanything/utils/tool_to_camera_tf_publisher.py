@@ -11,28 +11,30 @@ class ToolToCameraTFPublisher(Node):
     """
     Publish a static transform: tool0 -> camera_optical.
 
-    Notes:
-    - Frame names must match your URDF / driver frames.
-    - Quaternion order is (x, y, z, w).
+    Quaternion order is (x, y, z, w).
     """
 
     def __init__(self):
-        super().__init__("tool_to_camera_tf_publisher")
+        super().__init__("tool_to_camera_tf_publisher_new_handeye")
         self._br = StaticTransformBroadcaster(self)
 
-        # ---- Fill your hand-eye extrinsics here (tool0 -> camera_optical) ----
+        # ---- New hand-eye extrinsics (tool0 -> camera_optical) ----
+        # From your T_gripper_cam (Tsai):
+        # t = [-0.06635243685969598, -0.0648213404084122, 0.15038971196340464]
+        # R converted to quaternion (xyzw):
+        # q = [-0.3297946569387602, -0.0070919447650312, -0.0120596898117427, 0.9439490235957437]
         t_tool_cam_xyz = (
-            -0.000006852374024,
-            -0.059182661943126947,
-            -0.00391824813032688,
+            -0.06635243685969598,
+            -0.06482134040841220,
+             0.15038971196340464,
         )
         q_tool_cam_xyzw = (
-            -0.0036165657530785695,
-            -0.000780788838366878,
-            0.7078681983794892,
-            0.7063348529868249,
+            -0.3297946569387602,
+            -0.0070919447650312,
+            -0.0120596898117427,
+             0.9439490235957437,
         )
-        # --------------------------------------------------------------------
+        # ----------------------------------------------------------
 
         msg = TransformStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
@@ -50,7 +52,9 @@ class ToolToCameraTFPublisher(Node):
 
         self._br.sendTransform(msg)
         self.get_logger().info(
-            f"Static TF published: {msg.header.frame_id} -> {msg.child_frame_id}"
+            f"Static TF published: {msg.header.frame_id} -> {msg.child_frame_id}\n"
+            f"t = {t_tool_cam_xyz}\n"
+            f"q(xyzw) = {q_tool_cam_xyzw}"
         )
 
 
