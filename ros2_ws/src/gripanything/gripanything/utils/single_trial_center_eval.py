@@ -17,6 +17,16 @@ Key correction requested by user:
   -> by default, apply +2 mm to x and y: pred_x_mm += 2, pred_y_mm += 2
   (can be disabled via CLI)
 
+[NEW] Small-angle rotation error analysis (in XY plane):
+- Decompose XY error e=(dx,dy) into:
+    e_rad_mm: radial component (along GT position vector)
+    e_tan_mm: tangential component (perpendicular to GT vector), corresponds to yaw-like rotation around origin
+- Estimate equivalent small yaw angle (deg):
+    theta_deg ~= e_tan / r
+  More precisely:
+    theta_rad = (-gt_y*dx + gt_x*dy) / (gt_x^2 + gt_y^2)
+    theta_deg = theta_rad * 180/pi
+
 Outputs:
 - CSV table (default: ./center_size_eval.csv)
 - Console: per-color summary + a compact table
@@ -67,7 +77,7 @@ GT_XY_MM = {
         16: (-440.00, -359.98),
         17: (-486.01, -495.80),
         18: (-483.22, -426.53),
-        19: (-466.66,  -366.90),   
+        19: (-466.66,  -366.90),
         20: (-508.70, -264.44),
         21: (-577.01, -370.86),
         22: (-599.27, -299.35),
@@ -251,6 +261,36 @@ def _extent_from_corners8_m(corners8_b_m: np.ndarray) -> Optional[np.ndarray]:
 
 
 # ---------------------------
+# Small-angle rotation analysis (XY)
+# ---------------------------
+def _theta_deg_from_xy(dx_mm: float, dy_mm: float, gt_x_mm: float, gt_y_mm: float, eps: float = 1e-9) -> float:
+    """
+    Equivalent small yaw angle around origin that best explains tangential error.
+    theta_rad = (-gt_y*dx + gt_x*dy) / (gt_x^2 + gt_y^2)
+    """
+    r2 = float(gt_x_mm * gt_x_mm + gt_y_mm * gt_y_mm)
+    if r2 < eps:
+        return float("nan")
+    theta_rad = float((-gt_y_mm * dx_mm + gt_x_mm * dy_mm) / r2)
+    return float(theta_rad * (180.0 / np.pi))
+
+
+def _decompose_err_rad_tan_mm(dx_mm: float, dy_mm: float, gt_x_mm: float, gt_y_mm: float, eps: float = 1e-9) -> Tuple[float, float]:
+    """
+    Decompose XY error e=(dx,dy) into:
+      e_rad: along GT vector
+      e_tan: perpendicular (tangential)
+    """
+    r2 = float(gt_x_mm * gt_x_mm + gt_y_mm * gt_y_mm)
+    if r2 < eps:
+        return float("nan"), float("nan")
+    r = float(np.sqrt(r2))
+    e_rad = float((dx_mm * gt_x_mm + dy_mm * gt_y_mm) / r)
+    e_tan = float((-dx_mm * gt_y_mm + dy_mm * gt_x_mm) / r)
+    return e_rad, e_tan
+
+
+# ---------------------------
 # Evaluation
 # ---------------------------
 def _get_gt_xy_mm(color: str, idx: int, enable_known_fixes: bool) -> Tuple[float, float]:
@@ -337,7 +377,6 @@ def main() -> None:
                 "pred_x_mm": float("nan"),
                 "pred_y_mm": float("nan"),
                 "pred_z_mm": float("nan"),
-                
 
                 # gt center (mm)
                 "gt_x_mm": float("nan"),
@@ -347,6 +386,12 @@ def main() -> None:
                 "dx_mm": float("nan"),
                 "dy_mm": float("nan"),
                 "e_xy_mm": float("nan"),
+
+                # [NEW] rotation-style metrics (XY plane)
+                "gt_r_mm": float("nan"),
+                "e_rad_mm": float("nan"),
+                "e_tan_mm": float("nan"),
+                "theta_deg": float("nan"),
 
                 # predicted size (cm)
                 "pred_sx_cm": float("nan"),
@@ -391,6 +436,7 @@ def main() -> None:
                 pred_y_mm = float(c_m[1] * 1000.0)
                 pred_z_mm = float(c_m[2] * 1000.0)
 
+                # Your current convention (keep as-is)
                 pred_x_mm = -pred_x_mm
                 pred_y_mm = -pred_y_mm
 
@@ -413,6 +459,13 @@ def main() -> None:
                 row["dx_mm"] = dx
                 row["dy_mm"] = dy
                 row["e_xy_mm"] = float(np.hypot(dx, dy))
+
+                # [NEW] rotation-style metrics
+                row["gt_r_mm"] = float(np.hypot(rx, ry))
+                e_rad, e_tan = _decompose_err_rad_tan_mm(dx, dy, rx, ry)
+                row["e_rad_mm"] = e_rad
+                row["e_tan_mm"] = e_tan
+                row["theta_deg"] = _theta_deg_from_xy(dx, dy, rx, ry)
 
             # Pred size
             extent_m = _try_read_extent_m(data)
@@ -456,6 +509,11 @@ def main() -> None:
         dys = [r["dy_mm"] for r in rows if r["color"] == color and np.isfinite(r["dy_mm"])]
         ss = [r["err_side_mm_med"] for r in rows if r["color"] == color and np.isfinite(r["err_side_mm_med"])]
 
+        thetas = [r["theta_deg"] for r in rows if r["color"] == color and np.isfinite(r["theta_deg"])]
+        etans = [r["e_tan_mm"] for r in rows if r["color"] == color and np.isfinite(r["e_tan_mm"])]
+        erads = [r["e_rad_mm"] for r in rows if r["color"] == color and np.isfinite(r["e_rad_mm"])]
+        rs = [r["gt_r_mm"] for r in rows if r["color"] == color and np.isfinite(r["gt_r_mm"])]
+
         if not es:
             return
 
@@ -465,6 +523,19 @@ def main() -> None:
         print(f"\n=== {color.upper()} summary (valid rows: {len(es)}) ===")
         print(f"center e_xy_mm: mean={np.mean(es):.2f}, median={np.median(es):.2f}, p90={q(es,0.90):.2f}, max={np.max(es):.2f}")
         print(f"dx_mm: mean={np.mean(dxs):+.2f}, dy_mm: mean={np.mean(dys):+.2f}")
+
+        if thetas and etans and erads and rs:
+            abs_t = np.abs(np.asarray(thetas, dtype=float))
+            abs_et = np.abs(np.asarray(etans, dtype=float))
+            abs_er = np.abs(np.asarray(erads, dtype=float))
+            print(f"gt_r_mm: median={np.median(rs):.1f} (used for tan/rad + theta)")
+            print(
+                "theta_deg (small-yaw eq.): "
+                f"median={np.median(thetas):+.3f}, |median|={np.median(abs_t):.3f}, p90|.|={q(abs_t,0.90):.3f}, max|.|={np.max(abs_t):.3f}"
+            )
+            print(f"|e_tan_mm|: median={np.median(abs_et):.2f}, p90={q(abs_et,0.90):.2f}")
+            print(f"|e_rad_mm|: median={np.median(abs_er):.2f}, p90={q(abs_er,0.90):.2f}")
+
         if ss:
             print(f"size err_side_mm_med: mean={np.mean(ss):+.2f}, median={np.median(ss):+.2f}, p90={q(ss,0.90):+.2f}, max={np.max(ss):+.2f}")
         else:
@@ -476,7 +547,7 @@ def main() -> None:
     # Compact table print (first 10 rows per color)
     def _print_compact(color: str, k: int = 10):
         print(f"\n--- {color.upper()} first {k} rows ---")
-        print("trial  pred_x  pred_y   gt_x   gt_y   dx    dy   e_xy  side(cm,med)  side_err(mm)")
+        print("trial  pred_x  pred_y   gt_x   gt_y   dx    dy   e_xy   theta(deg)  e_tan  e_rad  side(cm,med)  side_err(mm)")
         cnt = 0
         for r in rows:
             if r["color"] != color:
@@ -489,6 +560,9 @@ def main() -> None:
                 f"{_safe_float(r['gt_x_mm']):>6.1f} {_safe_float(r['gt_y_mm']):>6.1f} "
                 f"{_safe_float(r['dx_mm']):>6.1f} {_safe_float(r['dy_mm']):>6.1f} "
                 f"{_safe_float(r['e_xy_mm']):>6.1f} "
+                f"{_safe_float(r['theta_deg']):>10.3f} "
+                f"{_safe_float(r['e_tan_mm']):>6.1f} "
+                f"{_safe_float(r['e_rad_mm']):>6.1f} "
                 f"{_safe_float(r['pred_side_cm_med']):>11.3f} "
                 f"{_safe_float(r['err_side_mm_med']):>11.2f}"
             )
