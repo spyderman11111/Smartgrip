@@ -5,42 +5,25 @@ batch_center_size_eval.py
 
 Batch-evaluate center XY errors (mm) and size errors (mm) for 25 yellow + 25 blue trials.
 
-Data sources:
-- Pred center/shape: <trial_dir>/**/object_in_base_link.json
-- GT center (rx,ry) in mm: hard-coded from the user's table
+Rules (per user request):
+- GT center (rx,ry) in mm: from user's table (hard-coded below)
+- Pred center (x,y,z) in meters: read from each trial's object_in_base_link.json
+  -> convert to mm, then apply your sign convention:
+       pred_x_mm = -x_mm
+       pred_y_mm = -y_mm
+  -> IMPORTANT: JSON x/y are always ~2 mm smaller => apply +2 mm to BOTH x and y by default.
+
+Size evaluation:
+- Pred size from JSON prism extent or corners_8
 - GT size (cube edge length, cm):
     yellow: 3.962 cm
     blue  : 2.508 cm
 
-Key correction requested by user:
-- Predicted center printed in meters (e.g. 0.405748 m) is about 2 mm smaller than teach pendant GT
-  -> by default, apply +2 mm to x and y: pred_x_mm += 2, pred_y_mm += 2
-  (can be disabled via CLI)
-
-[NEW] Small-angle rotation error analysis (in XY plane):
-- Decompose XY error e=(dx,dy) into:
-    e_rad_mm: radial component (along GT position vector)
-    e_tan_mm: tangential component (perpendicular to GT vector), corresponds to yaw-like rotation around origin
-- Estimate equivalent small yaw angle (deg):
-    theta_deg ~= e_tan / r
-  More precisely:
-    theta_rad = (-gt_y*dx + gt_x*dy) / (gt_x^2 + gt_y^2)
-    theta_deg = theta_rad * 180/pi
+Rotation-style XY error analysis:
+- Decompose error into radial/tangential, estimate small yaw angle.
 
 Outputs:
 - CSV table (default: ./center_size_eval.csv)
-- Console: per-color summary + a compact table
-
-Notes:
-- This script compares XY only, since your GT provides rx, ry.
-- Size reading priority:
-    1) object.prism.extent_xyz_in_prism_axes (meters). If align_method=sim3 and alignment_W_to_B.scale_s exists,
-       multiply by scale_s (keeps consistency with your earlier logic).
-    2) object.prism.corners_8.base_link -> derive extents from 8 corners (meters, in base_link).
-
-- Known typo guard:
-    yellow #19: rx is "-46.66" in the provided table (very likely "-466.66").
-    By default we auto-fix that one entry. Disable via --disable_known_fixes.
 """
 
 from __future__ import annotations
@@ -55,75 +38,67 @@ import numpy as np
 
 
 # ---------------------------
-# GT centers (mm) from your table
+# GT centers (mm): from your latest table (rx, ry)
 # ---------------------------
-GT_XY_MM = {
+GT_XY_MM: Dict[str, Dict[int, Tuple[float, float]]] = {
     "yellow": {
-        1: (-398.10, -463.70),
-        2: (-496.70, -492.78),
+        1: (-398.1,  -463.7),
+        2: (-496.7,  -492.78),
         3: (-522.43, -406.66),
         4: (-474.64, -427.15),
         5: (-414.43, -493.87),
-        6: (-401.75, -409.80),
-        7: (-348.40, -449.95),
-        8: (-446.20, -507.77),
-        9: (-390.70, -473.75),
-        10: (-318.90, -458.26),
-        11: (-366.20, -535.31),
+        6: (-424.92, -497.75),
+        7: (-348.4,  -449.95),
+        8: (-446.2,  -507.77),
+        9: (-390.7,  -473.75),
+        10: (-318.9,  -458.26),
+        11: (-366.2,  -535.31),
         12: (-329.25, -515.32),
         13: (-332.54, -449.76),
         14: (-426.26, -541.45),
         15: (-262.98, -557.12),
-        16: (-440.00, -359.98),
-        17: (-486.01, -495.80),
+        16: (-440.0,  -359.98),
+        17: (-486.01, -495.8),
         18: (-483.22, -426.53),
-        19: (-466.66,  -366.90),
-        20: (-508.70, -264.44),
+        19: (-466.6,  -366.9),
+        20: (-592.72, -456.41),
         21: (-577.01, -370.86),
         22: (-599.27, -299.35),
-        23: (-594.46, -528.96),
-        24: (-458.20, -474.50),
+        23: (-467.93, -342.12),
+        24: (-458.2,  -474.5),
         25: (-394.19, -369.47),
     },
     "blue": {
-        1: (-383.12, -366.40),
+        1: (-383.12, -366.4),
         2: (-430.86, -456.55),
-        3: (-481.77, -487.90),
+        3: (-533.25, -459.33),
         4: (-455.48, -364.12),
-        5: (-383.00, -495.20),
+        5: (-383.0,  -495.2),
         6: (-413.44, -336.44),
         7: (-515.58, -432.15),
-        8: (-510.64, -508.20),
-        9: (-441.60, -542.05),
-        10: (-356.90, -438.12),
-        11: (-320.55, -395.24),
-        12: (-273.33, -470.80),
+        8: (-510.64, -508.2),
+        9: (-441.6,  -542.05),
+        10: (-356.9,  -438.12),
+        11: (-434.17, -462.29),
+        12: (-273.33, -470.8),
         13: (-383.63, -525.37),
         14: (-348.88, -470.68),
         15: (-517.39, -516.02),
-        16: (-463.30, -533.42),
-        17: (-563.00, -551.20),
-        18: (-259.10, -520.90),
+        16: (-463.3,  -533.42),
+        17: (-567.77, -511.92),
+        18: (-259.1,  -520.9),
         19: (-300.53, -382.16),
         20: (-256.75, -365.58),
         21: (-585.67, -263.35),
         22: (-636.55, -262.31),
-        23: (-444.34, -380.00),
-        24: (-559.04, -494.00),
+        23: (-444.34, -380.0),
+        24: (-559.04, -494.0),
         25: (-558.16, -408.44),
     },
 }
 
-# Known GT fixes (toggle-able)
-KNOWN_GT_FIXES = {
-    ("yellow", 19): {"rx": -466.66},  # most likely typo
-}
-
 # GT cube edge length (cm)
-GT_SIDE_CM = {
-    "yellow": 3.962,  # 39.62 mm
-    "blue": 2.508,    # 25.08 mm
-}
+GT_SIDE_CM = {"yellow": 3.962, "blue": 2.508}
 
 
 # ---------------------------
@@ -153,6 +128,13 @@ def _find_object_json(trial_dir: str) -> str:
 
 
 def _read_center_m(data: Dict[str, Any]) -> Optional[np.ndarray]:
+    """
+    Return center in meters as np.array([x,y,z]) if possible.
+    Priority:
+      object.center.base_link
+    Fallback:
+      object.center_base / center_base_link / center_b
+    """
     obj = data.get("object", {})
     if not isinstance(obj, dict):
         return None
@@ -189,13 +171,9 @@ def _read_align_method(data: Dict[str, Any]) -> str:
 
 
 def _try_read_extent_m(data: Dict[str, Any]) -> Optional[np.ndarray]:
-    """
-    Return extent (sx,sy,sz) in meters if possible.
-    """
     obj = data.get("object", {})
     if not isinstance(obj, dict):
         return None
-
     prism = obj.get("prism", {})
     if not isinstance(prism, dict):
         return None
@@ -204,7 +182,6 @@ def _try_read_extent_m(data: Dict[str, Any]) -> Optional[np.ndarray]:
     if ext3 is None:
         return None
 
-    # Optional scale handling for sim3
     am = _read_align_method(data)
     s = _read_scale_s(data)
     return ext3 * float(s) if am == "sim3" else ext3
@@ -214,37 +191,27 @@ def _try_read_corners8_base_m(data: Dict[str, Any]) -> Optional[np.ndarray]:
     obj = data.get("object", {})
     if not isinstance(obj, dict):
         return None
-
     prism = obj.get("prism", {})
     if not isinstance(prism, dict):
         return None
-
     c8 = prism.get("corners_8", None)
     if not isinstance(c8, dict):
         return None
-
     pts = c8.get("base_link", None)
     if not isinstance(pts, list) or len(pts) != 8:
         return None
-
     out = []
     for p in pts:
         v = _as_vec3(p)
         if v is None:
             return None
         out.append(v)
-
-    return np.stack(out, axis=0)  # (8,3), meters
+    return np.stack(out, axis=0)
 
 
 def _extent_from_corners8_m(corners8_b_m: np.ndarray) -> Optional[np.ndarray]:
-    """
-    Derive (sx,sy,sz) in meters from 8 corners.
-    Assumes first 4 are bottom, last 4 are top (same convention as your point_processing).
-    """
     if corners8_b_m is None or corners8_b_m.shape != (8, 3):
         return None
-
     btm = corners8_b_m[:4, :]
     top = corners8_b_m[4:, :]
 
@@ -256,18 +223,13 @@ def _extent_from_corners8_m(corners8_b_m: np.ndarray) -> Optional[np.ndarray]:
     sx = 0.5 * (d01 + d23)
     sy = 0.5 * (d12 + d30)
     sz = float(np.mean([np.linalg.norm(top[i] - btm[i]) for i in range(4)]))
-
     return np.array([sx, sy, sz], dtype=float)
 
 
 # ---------------------------
-# Small-angle rotation analysis (XY)
+# Error decomposition
 # ---------------------------
 def _theta_deg_from_xy(dx_mm: float, dy_mm: float, gt_x_mm: float, gt_y_mm: float, eps: float = 1e-9) -> float:
-    """
-    Equivalent small yaw angle around origin that best explains tangential error.
-    theta_rad = (-gt_y*dx + gt_x*dy) / (gt_x^2 + gt_y^2)
-    """
     r2 = float(gt_x_mm * gt_x_mm + gt_y_mm * gt_y_mm)
     if r2 < eps:
         return float("nan")
@@ -276,11 +238,6 @@ def _theta_deg_from_xy(dx_mm: float, dy_mm: float, gt_x_mm: float, gt_y_mm: floa
 
 
 def _decompose_err_rad_tan_mm(dx_mm: float, dy_mm: float, gt_x_mm: float, gt_y_mm: float, eps: float = 1e-9) -> Tuple[float, float]:
-    """
-    Decompose XY error e=(dx,dy) into:
-      e_rad: along GT vector
-      e_tan: perpendicular (tangential)
-    """
     r2 = float(gt_x_mm * gt_x_mm + gt_y_mm * gt_y_mm)
     if r2 < eps:
         return float("nan"), float("nan")
@@ -288,21 +245,6 @@ def _decompose_err_rad_tan_mm(dx_mm: float, dy_mm: float, gt_x_mm: float, gt_y_m
     e_rad = float((dx_mm * gt_x_mm + dy_mm * gt_y_mm) / r)
     e_tan = float((-dx_mm * gt_y_mm + dy_mm * gt_x_mm) / r)
     return e_rad, e_tan
-
-
-# ---------------------------
-# Evaluation
-# ---------------------------
-def _get_gt_xy_mm(color: str, idx: int, enable_known_fixes: bool) -> Tuple[float, float]:
-    rx, ry = GT_XY_MM[color][idx]
-    if enable_known_fixes:
-        fix = KNOWN_GT_FIXES.get((color, idx), None)
-        if isinstance(fix, dict):
-            if "rx" in fix:
-                rx = float(fix["rx"])
-            if "ry" in fix:
-                ry = float(fix["ry"])
-    return float(rx), float(ry)
 
 
 def _apply_xy_convention(
@@ -325,13 +267,9 @@ def _apply_xy_convention(
     return x_mm, y_mm
 
 
-def _safe_float(x: Any, default: float = float("nan")) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
+# ---------------------------
+# Main
+# ---------------------------
 def main() -> None:
     ap = argparse.ArgumentParser()
 
@@ -341,20 +279,15 @@ def main() -> None:
                     help="Folder containing b1..b25")
     ap.add_argument("--n", type=int, default=25, help="Number of trials per color.")
 
-    # Center XY correction (your requested +2 mm default)
+    # IMPORTANT: JSON x/y are ~2mm smaller => default +2mm to pred x/y
     ap.add_argument("--offset_x_mm", type=float, default=2.0, help="Additive offset applied to predicted x (mm).")
     ap.add_argument("--offset_y_mm", type=float, default=2.0, help="Additive offset applied to predicted y (mm).")
     ap.add_argument("--swap_xy", action="store_true", help="Swap predicted x and y before eval.")
     ap.add_argument("--flip_x", action="store_true", help="Flip sign of predicted x before eval.")
     ap.add_argument("--flip_y", action="store_true", help="Flip sign of predicted y before eval.")
 
-    ap.add_argument("--disable_known_fixes", action="store_true",
-                    help="Disable built-in fixes for known GT typos (e.g., yellow#19).")
-
     ap.add_argument("--out_csv", type=str, default="center_size_eval.csv", help="Output CSV path.")
     args = ap.parse_args()
-
-    enable_known_fixes = not bool(args.disable_known_fixes)
 
     rows: List[Dict[str, Any]] = []
 
@@ -364,8 +297,7 @@ def main() -> None:
         for idx in range(1, int(args.n) + 1):
             trial_dir = os.path.join(os.path.abspath(root), f"{prefix}{idx}")
 
-            # Defaults for a row (even if missing)
-            row = {
+            row: Dict[str, Any] = {
                 "color": color,
                 "trial": idx,
                 "trial_dir": trial_dir,
@@ -373,12 +305,12 @@ def main() -> None:
                 "align_method": "",
                 "scale_s": float("nan"),
 
-                # pred center (mm, after convention)
+                # Pred from JSON center (mm)
                 "pred_x_mm": float("nan"),
                 "pred_y_mm": float("nan"),
                 "pred_z_mm": float("nan"),
 
-                # gt center (mm)
+                # GT from table (mm)
                 "gt_x_mm": float("nan"),
                 "gt_y_mm": float("nan"),
 
@@ -387,7 +319,7 @@ def main() -> None:
                 "dy_mm": float("nan"),
                 "e_xy_mm": float("nan"),
 
-                # [NEW] rotation-style metrics (XY plane)
+                # rotation-style metrics
                 "gt_r_mm": float("nan"),
                 "e_rad_mm": float("nan"),
                 "e_tan_mm": float("nan"),
@@ -409,37 +341,41 @@ def main() -> None:
                 "err_side_mm_med": float("nan"),
             }
 
-            # GT center
-            rx, ry = _get_gt_xy_mm(color, idx, enable_known_fixes)
-            row["gt_x_mm"] = rx
-            row["gt_y_mm"] = ry
+            # ---- GT from table ----
+            if color not in GT_XY_MM or idx not in GT_XY_MM[color]:
+                row["json_path"] = "NO_GT_ENTRY"
+                rows.append(row)
+                continue
+            gt_x_mm, gt_y_mm = GT_XY_MM[color][idx]
+            row["gt_x_mm"] = float(gt_x_mm)
+            row["gt_y_mm"] = float(gt_y_mm)
 
-            # Load JSON
+            # ---- Load JSON ----
             try:
                 obj_json = _find_object_json(trial_dir)
                 row["json_path"] = obj_json
                 with open(obj_json, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception as e:
-                row["json_path"] = f"MISSING ({e})"
+                row["json_path"] = f"MISSING_JSON ({e})"
                 rows.append(row)
                 continue
 
-            # Alignment info
             row["align_method"] = str(_read_align_method(data))
             row["scale_s"] = float(_read_scale_s(data))
 
-            # Pred center
+            # ---- Pred center from JSON ----
             c_m = _read_center_m(data)
             if c_m is not None:
-                pred_x_mm = float(c_m[0] * 1000.0)
-                pred_y_mm = float(c_m[1] * 1000.0)
-                pred_z_mm = float(c_m[2] * 1000.0)
+                x_mm = float(c_m[0] * 1000.0)
+                y_mm = float(c_m[1] * 1000.0)
+                z_mm = float(c_m[2] * 1000.0)
 
-                # Your current convention (keep as-is)
-                pred_x_mm = -pred_x_mm
-                pred_y_mm = -pred_y_mm
+                # keep your convention: negate x/y
+                pred_x_mm = -x_mm
+                pred_y_mm = -y_mm
 
+                # apply swap/flip/offset (+2mm default)
                 pred_x_mm, pred_y_mm = _apply_xy_convention(
                     pred_x_mm, pred_y_mm,
                     swap_xy=bool(args.swap_xy),
@@ -449,25 +385,23 @@ def main() -> None:
                     off_y_mm=float(args.offset_y_mm),
                 )
 
-                row["pred_x_mm"] = pred_x_mm
-                row["pred_y_mm"] = pred_y_mm
-                row["pred_z_mm"] = pred_z_mm
+                row["pred_x_mm"] = float(pred_x_mm)
+                row["pred_y_mm"] = float(pred_y_mm)
+                row["pred_z_mm"] = float(z_mm)
 
-                # Errors
-                dx = pred_x_mm - rx
-                dy = pred_y_mm - ry
+                dx = float(pred_x_mm - gt_x_mm)
+                dy = float(pred_y_mm - gt_y_mm)
                 row["dx_mm"] = dx
                 row["dy_mm"] = dy
                 row["e_xy_mm"] = float(np.hypot(dx, dy))
 
-                # [NEW] rotation-style metrics
-                row["gt_r_mm"] = float(np.hypot(rx, ry))
-                e_rad, e_tan = _decompose_err_rad_tan_mm(dx, dy, rx, ry)
-                row["e_rad_mm"] = e_rad
-                row["e_tan_mm"] = e_tan
-                row["theta_deg"] = _theta_deg_from_xy(dx, dy, rx, ry)
+                row["gt_r_mm"] = float(np.hypot(gt_x_mm, gt_y_mm))
+                e_rad, e_tan = _decompose_err_rad_tan_mm(dx, dy, gt_x_mm, gt_y_mm)
+                row["e_rad_mm"] = float(e_rad)
+                row["e_tan_mm"] = float(e_tan)
+                row["theta_deg"] = float(_theta_deg_from_xy(dx, dy, gt_x_mm, gt_y_mm))
 
-            # Pred size
+            # ---- Pred size from JSON (best effort) ----
             extent_m = _try_read_extent_m(data)
             if extent_m is None:
                 c8 = _try_read_corners8_base_m(data)
@@ -483,7 +417,6 @@ def main() -> None:
                 pred_side_cm_med = float(np.median(extent_cm))
                 row["pred_side_cm_med"] = pred_side_cm_med
 
-                # size errors (mm): (cm diff) * 10
                 row["err_sx_mm"] = float((row["pred_sx_cm"] - gt_side_cm) * 10.0)
                 row["err_sy_mm"] = float((row["pred_sy_cm"] - gt_side_cm) * 10.0)
                 row["err_sz_mm"] = float((row["pred_sz_cm"] - gt_side_cm) * 10.0)
@@ -491,7 +424,7 @@ def main() -> None:
 
             rows.append(row)
 
-    # Write CSV
+    # ---- Write CSV ----
     out_csv = os.path.abspath(args.out_csv)
     os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
 
@@ -502,76 +435,7 @@ def main() -> None:
         for r in rows:
             w.writerow(r)
 
-    # Console summary
-    def _summarize(color: str):
-        es = [r["e_xy_mm"] for r in rows if r["color"] == color and np.isfinite(r["e_xy_mm"])]
-        dxs = [r["dx_mm"] for r in rows if r["color"] == color and np.isfinite(r["dx_mm"])]
-        dys = [r["dy_mm"] for r in rows if r["color"] == color and np.isfinite(r["dy_mm"])]
-        ss = [r["err_side_mm_med"] for r in rows if r["color"] == color and np.isfinite(r["err_side_mm_med"])]
-
-        thetas = [r["theta_deg"] for r in rows if r["color"] == color and np.isfinite(r["theta_deg"])]
-        etans = [r["e_tan_mm"] for r in rows if r["color"] == color and np.isfinite(r["e_tan_mm"])]
-        erads = [r["e_rad_mm"] for r in rows if r["color"] == color and np.isfinite(r["e_rad_mm"])]
-        rs = [r["gt_r_mm"] for r in rows if r["color"] == color and np.isfinite(r["gt_r_mm"])]
-
-        if not es:
-            return
-
-        def q(a, p):  # quantile
-            return float(np.quantile(np.asarray(a, dtype=float), p))
-
-        print(f"\n=== {color.upper()} summary (valid rows: {len(es)}) ===")
-        print(f"center e_xy_mm: mean={np.mean(es):.2f}, median={np.median(es):.2f}, p90={q(es,0.90):.2f}, max={np.max(es):.2f}")
-        print(f"dx_mm: mean={np.mean(dxs):+.2f}, dy_mm: mean={np.mean(dys):+.2f}")
-
-        if thetas and etans and erads and rs:
-            abs_t = np.abs(np.asarray(thetas, dtype=float))
-            abs_et = np.abs(np.asarray(etans, dtype=float))
-            abs_er = np.abs(np.asarray(erads, dtype=float))
-            print(f"gt_r_mm: median={np.median(rs):.1f} (used for tan/rad + theta)")
-            print(
-                "theta_deg (small-yaw eq.): "
-                f"median={np.median(thetas):+.3f}, |median|={np.median(abs_t):.3f}, p90|.|={q(abs_t,0.90):.3f}, max|.|={np.max(abs_t):.3f}"
-            )
-            print(f"|e_tan_mm|: median={np.median(abs_et):.2f}, p90={q(abs_et,0.90):.2f}")
-            print(f"|e_rad_mm|: median={np.median(abs_er):.2f}, p90={q(abs_er,0.90):.2f}")
-
-        if ss:
-            print(f"size err_side_mm_med: mean={np.mean(ss):+.2f}, median={np.median(ss):+.2f}, p90={q(ss,0.90):+.2f}, max={np.max(ss):+.2f}")
-        else:
-            print("size: N/A (no size fields found in JSON)")
-
-    _summarize("yellow")
-    _summarize("blue")
-
-    # Compact table print (first 10 rows per color)
-    def _print_compact(color: str, k: int = 10):
-        print(f"\n--- {color.upper()} first {k} rows ---")
-        print("trial  pred_x  pred_y   gt_x   gt_y   dx    dy   e_xy   theta(deg)  e_tan  e_rad  side(cm,med)  side_err(mm)")
-        cnt = 0
-        for r in rows:
-            if r["color"] != color:
-                continue
-            if cnt >= k:
-                break
-            print(
-                f"{int(r['trial']):>5d} "
-                f"{_safe_float(r['pred_x_mm']):>7.1f} {_safe_float(r['pred_y_mm']):>7.1f} "
-                f"{_safe_float(r['gt_x_mm']):>6.1f} {_safe_float(r['gt_y_mm']):>6.1f} "
-                f"{_safe_float(r['dx_mm']):>6.1f} {_safe_float(r['dy_mm']):>6.1f} "
-                f"{_safe_float(r['e_xy_mm']):>6.1f} "
-                f"{_safe_float(r['theta_deg']):>10.3f} "
-                f"{_safe_float(r['e_tan_mm']):>6.1f} "
-                f"{_safe_float(r['e_rad_mm']):>6.1f} "
-                f"{_safe_float(r['pred_side_cm_med']):>11.3f} "
-                f"{_safe_float(r['err_side_mm_med']):>11.2f}"
-            )
-            cnt += 1
-
-    _print_compact("yellow", 10)
-    _print_compact("blue", 10)
-
-    print(f"\nSaved CSV: {out_csv}")
+    print(f"[OK] Saved CSV: {out_csv}")
 
 
 if __name__ == "__main__":
