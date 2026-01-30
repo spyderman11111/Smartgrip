@@ -13,7 +13,7 @@ class GroundingDinoPredictor:
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
 
-        # 记录后处理函数及其签名（用于参数名兼容）
+        
         self._post = getattr(self.processor, "post_process_grounded_object_detection", None)
         if self._post is None:
             raise RuntimeError("This processor has no 'post_process_grounded_object_detection' method.")
