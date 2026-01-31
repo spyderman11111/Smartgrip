@@ -641,8 +641,8 @@ def _print_summary(res: VerificationResult):
 
 if __name__ == "__main__":
     # ---- Inputs ----
-    ARIA_PATH = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ur5image/pose_1_image.png"
-    WRIST_GLOB = "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ur5image/pose_2_image.png"
+    ARIA_PATH = "/home/MA_SmartGrip/Smartgrip/result/aria_image/1/ariaimage0/gaze_sam2_roi_mask_rgb.png"
+    WRIST_GLOB = "/home/MA_SmartGrip/Smartgrip/result/aria_image/1/match_results/candidates/cand_02_image_rgbmask.png"
 
     wrist_paths = sorted(glob.glob(WRIST_GLOB))
     if not Path(ARIA_PATH).exists():
