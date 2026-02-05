@@ -573,7 +573,7 @@ def inspect_point_cloud(ply_path: str,
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ply", type=str, default="/home/MA_SmartGrip/Smartgrip/result/single/b/b17/output/offline_output/main_cluster_clean.ply",
+    ap.add_argument("--ply", type=str, default="/home/MA_SmartGrip/Smartgrip/result/210_red_solo/output/offline_output/main_cluster_clean.ply",
                     help="Path to input .ply point cloud.")
     ap.add_argument("--json", type=str, default=None,
                     help="Path to object_in_base_link.json. If omitted, auto-guess from --ply directory.")

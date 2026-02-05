@@ -1,0 +1,36 @@
+{
+  "status": "ok",
+  "prompt": "blue cube .",
+  "device": "cuda",
+  "ur5_image": "/home/MA_SmartGrip/Smartgrip/2026-02-06_00-23.png",
+  "output_dir": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/matching_inputs/20260206_002445",
+  "dino": {
+    "box_xyxy": [
+      463,
+      153,
+      595,
+      319
+    ],
+    "label": "blue cube",
+    "score": 0.8848159313201904,
+    "box_threshold": 0.25,
+    "text_threshold": 0.25,
+    "select_method": "best_score"
+  },
+  "sam2": {
+    "mask_threshold": 0.3,
+    "max_hole_area": 100.0,
+    "max_sprinkle_area": 50.0
+  },
+  "ur5_mask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/matching_inputs/20260206_002445/ur5_mask.png",
+  "ur5_rgbmask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/matching_inputs/20260206_002445/ur5_rgbmask.png",
+  "aria": {
+    "dir": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage",
+    "latest_cutout": null,
+    "latest_mask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage/gaze_sam2_mask_bin.png",
+    "latest_rgb": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage/gaze_sam2_rgb_rot.png",
+    "snapshot_cutout": null,
+    "snapshot_mask": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/matching_inputs/20260206_002445/aria_mask_bin.png",
+    "snapshot_rgb": "/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/matching_inputs/20260206_002445/aria_rgb_rot.png"
+  }
+}

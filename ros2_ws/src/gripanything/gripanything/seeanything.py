@@ -380,7 +380,7 @@ def _preprocess_object_only(img_bgr: np.ndarray, out_size: int = 512, pad_ratio:
     return _crop_pad_resize(img_bgr, bbox=bbox, out_size=out_size, pad_ratio=pad_ratio)
 
 
-def _compute_object_match_score(scores: np.ndarray, score_th: float = 0.20, topk: int = 10, k_ref: int = 20) -> Dict[str, Any]:
+def _compute_object_match_score(scores: np.ndarray, score_th: float = 0.01, topk: int = 10, k_ref: int = 20) -> Dict[str, Any]:
     if scores is None:
         return {"score": 0.0, "quality": 0.0, "coverage": 0.0, "K_conf": 0}
 
@@ -1197,7 +1197,7 @@ class SeeAnythingNode(Node):
             matches = matches[order]
             scores = scores[order]
 
-        stats = _compute_object_match_score(scores, score_th=0.20, topk=10, k_ref=20)
+        stats = _compute_object_match_score(scores, score_th=0.01, topk=10, k_ref=20)
 
         if save_viz_path is not None:
             try:

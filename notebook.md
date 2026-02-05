@@ -1,4 +1,5 @@
 source /home/MA_SmartGrip/Smartgrip/aria/bin/activate
+cd /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples
 
 需要修改源码/home/MA_SmartGrip/Smartgrip/projectaria_eyetracking/projectaria_eyetracking/inference/model/model_utils.py
 line 203 model_buffer = torch.load(chkpt_path, map_location=map_location, weights_only=False)
@@ -24,8 +25,6 @@ source install/setup.bash
 ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
 
 export SETUPTOOLS_USE_DISTUTILS=stdlib
-
-ros2 control list_controllers
 
 source /opt/ros/humble/setup.bash
 source ~/Smartgrip/py310/bin/activate

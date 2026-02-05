@@ -39,7 +39,7 @@ class Camera:
 class Dino:
     model_id: str = 'IDEA-Research/grounding-dino-tiny'
     device: str = 'cuda'
-    text_prompt: str = 'red object.'
+    text_prompt: str = 'yellow object.'
     box_threshold: float = 0.25
     text_threshold: float = 0.25
     min_exec_score: float = 0.5
@@ -58,6 +58,7 @@ class Bias:
 
 
 @dataclass
+
 class OfflineBias:
     """
     Offline bias applied AFTER reconstruction + alignment (VGGT -> base_link).
@@ -65,7 +66,7 @@ class OfflineBias:
     coordinates (center and OBB corners) used by downstream motion.
     """
     enable: bool = True
-    ox: float = -0.015
+    ox: float = 0.0
     oy: float = 0.015
     oz: float = 0.00
 
