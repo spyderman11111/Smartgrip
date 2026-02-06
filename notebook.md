@@ -60,18 +60,3 @@ python3 -m pip install -r requirements.txt
 python gaze_stream.py --interface usb --update_iptables
 
 
-python3 -m pip install projectaria_client_sdk --no-cache-dir
-
-ros2 run gripanything publish_object_points_tf \
-  --ros-args \
-  -p object_json:=/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/object_in_base_link.json \
-  -p parent_frame:=base_link \
-  -p prefix:=obj \
-  -p report_tool0:=true \
-  -p report_target:=center
-
-ros2 run gripanything goto_point_from_object_json \
-  --ros-args \
-  -p object_json:=/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/offline_output/object_in_base_link.json\
-  -p use_point:=center \
-  -p z_offset:=0.20

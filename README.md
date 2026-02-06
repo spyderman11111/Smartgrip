@@ -23,57 +23,91 @@ It supports:
 
 ## Quickstart
 
-### 1) Create Python venv (Python 3.10)
+### Create Python venv (Python 3.10)
 
 ```bash
 python3.10 -m venv ~/Smartgrip/py310 --system-site-packages
 source ~/Smartgrip/py310/bin/activate
 python -m pip install -U pip setuptools wheel
-2) Initialize git submodules
-git submodule update --init --recursive
-3) Build ROS 2 workspace
-From your ROS 2 workspace root:
+```
 
+### Initialize git submodules
+
+```bash
+git submodule update --init --recursive
+```
+
+### Build ROS 2 workspace
+
+```bash
 cd ~/Smartgrip/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
-Installation Details
-A) Install Grounded-SAM-2 (GroundingDINO + SAM2)
+```
+
+---
+
+## Installation
+
+### Grounded-SAM-2 (GroundingDINO + SAM2)
+
+```bash
 cd Grounded-SAM-2
 pip install torch torchvision torchaudio
 pip install -e .
 pip install --no-build-isolation -e grounding_dino
 pip install transformers
-Download checkpoints
+```
+
+Download checkpoints:
+
+```bash
 cd checkpoints
 bash download_ckpts.sh
-
 cd gdino_checkpoints
 bash download_ckpts.sh
-(Optional) Add PYTHONPATH
+```
+
+(Optional) add PYTHONPATH:
+
+```bash
 echo 'export PYTHONPATH=$PYTHONPATH:~/Smartgrip/Grounded-SAM-2' >> ~/.bashrc
 source ~/.bashrc
-B) Install LightGlue
+```
+
+---
+
+### LightGlue
+
+```bash
 cd LightGlue
 pip install -e .
-Patch for AMP compatibility (if needed)
-Edit lightglue/lightglue.py:
+```
 
+If AMP causes errors, edit `lightglue/lightglue.py`:
+
+```python
 try:
-    AMP_CUSTOM_FWD_F32 = torch.amp.custom_fwd(
-        cast_inputs=torch.float32, device_type="cuda"
-    )
+    AMP_CUSTOM_FWD_F32 = torch.amp.custom_fwd(cast_inputs=torch.float32, device_type="cuda")
 except AttributeError:
-    AMP_CUSTOM_FWD_F32 = torch.cuda.amp.custom_fwd(
-        cast_inputs=torch.float32
-    )
-C) Install VGGT
+    AMP_CUSTOM_FWD_F32 = torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+```
+
+---
+
+### VGGT
+
+```bash
 cd vggt
 pip install -r requirements.txt
 pip install trimesh pycolmap
-VGGT is used in the offline reconstruction stage after multi-view capture.
+```
 
-Repository Layout
+---
+
+## Repository Layout
+
+```text
 gripanything/
 ├── gripanything
 │   ├── core/
@@ -112,85 +146,111 @@ gripanything/
 ├── resource/
 ├── setup.cfg
 └── setup.py
-Main Pipeline (seeanything.py)
-seeanything.py implements an online perception–control routine followed by offline reconstruction.
+```
 
-Online stage (ROS 2 runtime)
-Move robot to INIT pose.
+---
 
-Stage-1 detection (coarse)
-Capture wrist image, run GroundingDINO, convert detection to target point C1 in base_link,
-update XY position and move.
+## Main Pipeline (`seeanything.py`)
 
-Stage-2 detection (fine)
-Detect again from closer view, compute refined target C2, move to a hover pose above C2.
+Online stage:
 
-Active scan path generation
-Generate a polygon or circular path around the target center.
+1. Move robot to INIT pose.
+2. Stage-1 coarse detection (DINO) → target `C1` in `base_link`.
+3. Stage-2 fine detection → refined target `C2` and hover pose.
+4. Generate polygon/circular scan path.
+5. Capture loop: move → dwell → save image → log joint state and camera pose.
 
-Capture loop
-At each waypoint: move, dwell, save image, and log joint state and base-to-camera pose.
+Offline stage:
 
-Offline stage
-VGGT reconstruction (core/vggtreconstruction.py)
-Input: output/ur5image/*.png
-Output: output/offline_output/points.ply, cameras.json, optional cameras_lines.ply.
+6. VGGT reconstruction → `points.ply`, `cameras.json`.
+7. Point-cloud post-processing and alignment → `object_in_base_link.json`.
+8. Return robot to INIT and exit.
 
-Point-cloud post-processing (core/point_processing.py)
-Produces cleaned object cluster, removes table plane, and aligns the object to base_link.
+---
 
-Robot returns to INIT pose and exits.
+## Outputs
 
-Outputs
-All experiment artifacts are stored under gripanything/output/:
+- `output/ur5image/pose_k_image.png`: captured scan images.
+- `output/ur5camerajointstates.json`: joint states and camera poses.
+- `output/offline_output/points.ply`: reconstructed point cloud.
+- `output/offline_output/object_in_base_link.json`: final object estimate.
 
-ur5image/pose_k_image.png
-Images captured at each scan waypoint.
+---
 
-ur5camerajointstates.json
-Per-image joint states and base-to-camera poses at capture time.
+## Notes
 
-offline_output/points.ply
-Reconstructed point cloud (VGGT world).
+- Importable modules belong in `gripanything/core/`.
+- Utility scripts belong in `gripanything/utils/`.
+- Outputs stay under `gripanything/output/` for reproducibility.
 
-offline_output/object_in_base_link.json
-Final object center and geometry in base_link.
+## Aria Eye-Gaze Mask (Project Aria) — Setup and Run
 
-Core Modules to Edit
-core/config.py: topics, frames, thresholds, scan parameters.
+This project uses an additional script to generate **Aria eye-gaze conditioned masks** (Aria RGB + EyeTrack → gaze ROI → SAM2 mask).
+The output masks are saved to `gripanything/output/ariaimage/` and can be used for downstream verification/matching.
 
-core/vision_geom.py: image-to-3D geometry and frame transforms.
+### 1) Activate the Aria Python environment
 
-core/ik_and_traj.py: IK calls and trajectory publishing.
+```bash
+source /home/MA_SmartGrip/Smartgrip/aria/bin/activate
+cd /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples
+```
 
-core/polygon_path.py: active scan trajectory generation.
+### 2) Required source patch (Torch checkpoint loading)
 
-core/point_processing.py: point-cloud filtering and object center estimation.
+You must modify the following file to avoid checkpoint loading issues:
 
-Utilities
-utils/tool_to_camera_tf_publisher.py: publish static camera TF.
+- File:
+  `/home/MA_SmartGrip/Smartgrip/projectaria_eyetracking/projectaria_eyetracking/inference/model/model_utils.py`
+- Line ~203:
+  Change to:
 
-utils/ur5e_charuco_handeye_ros2.py: hand–eye calibration.
+```python
+model_buffer = torch.load(chkpt_path, map_location=map_location, weights_only=False)
+```
 
-utils/publish_object_points_tf.py: publish object frames for RViz.
+### 3) Run Aria gaze→mask script
 
-utils/goto_point_from_object_json.py: move robot to final object pose.
+The script below is responsible for running **Aria streaming** and saving **eye-gaze masks**:
 
-utils/vs.py: point-cloud visualization.
+- Script:
+  `/home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/stream_rgb_eye_sam2.py`
 
-Troubleshooting
-Check camera topic
-ros2 topic list | grep image
-ros2 topic echo -n 1 /<camera_topic>/image_raw
-Check TF chain
-ros2 run tf2_ros tf2_echo base_link tool0
-ros2 run tf2_ros tf2_echo tool0 camera_optical
-Verify outputs after a run
-ls -lh gripanything/output/ur5image
-ls -lh gripanything/output/offline_output
-Notes on Naming and Imports
-Reusable modules should live under gripanything/core/.
+All outputs will be written into:
 
-One-off scripts belong in gripanything/utils/.
+- Output directory:
+  `/home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage`
 
-Outputs remain under gripanything/output/ to keep runs reproducible.
+#### USB mode
+
+```bash
+python /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/stream_rgb_eye_sam2.py \
+  --interface usb \
+  --calib-vrs /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs \
+  --output-dir /home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage
+```
+
+#### WiFi mode
+
+```bash
+python /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/stream_rgb_eye_sam2.py \
+  --interface wifi \
+  --device-ip 192.168.0.102 \
+  --calib-vrs /home/MA_SmartGrip/Smartgrip/projectaria_client_sdk_samples/Gaze_tracking_attempts_1.vrs \
+  --update_iptables \
+  --output-dir /home/MA_SmartGrip/Smartgrip/ros2_ws/src/gripanything/gripanything/output/ariaimage
+```
+
+> Notes:
+> - `--calib-vrs` points to a recorded calibration VRS file used by the eye-tracking inference.
+> - In WiFi mode, `--update_iptables` is used to update system rules for streaming.
+> - Make sure the output directory exists and is writable.
+
+## UR5 Wrist Camera (Basler / pylon_ros2_camera_wrapper)
+
+Start the wrist camera node with `pylon_ros2_camera_wrapper`.
+This should be launched from the ROS 2 workspace, and **do not** activate the `py310` environment for this step.
+
+```bash
+cd ~/Smartgrip/ros2_ws
+source install/setup.bash
+ros2 launch pylon_ros2_camera_wrapper pylon_ros2_camera.launch.py
